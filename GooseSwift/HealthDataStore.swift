@@ -26,13 +26,23 @@ final class HealthDataStore: ObservableObject {
   let heartRateSeriesStore = HeartRateSeriesStore.shared
   var attemptedCatalogLoad = false
   var previewMissingData = false
-  var packetInputReports: [String: [String: Any]] = [:]
+  var packetInputReports: [String: [String: Any]] = [:] {
+    // whoop-lab: derived values (frame counts, filtered metric rows) are memoised per revision.
+    didSet { packetInputReportsRevision &+= 1 }
+  }
+  var packetInputReportsRevision = 0
+  var whoopLabEvidenceFrameCountCache: (revision: Int, count: Int)?
+  var whoopLabDailyRecoveryMetricsCache: (revision: Int, metrics: [[String: Any]])?
   var packetScoreReports: [String: [String: Any]] = [:]
   var referenceComparisonReports: [String: [String: Any]] = [:]
   var packetInputRefreshWorkItem: DispatchWorkItem?
   var packetInputRunID: UUID?
   var packetInputIsRunning = false
   var lastPacketInputRunAt: Date?
+  var packetInputsDirty = false
+  static let whoopLabSummaryCacheLifetime: TimeInterval = 30
+  var whoopLabStressAlgorithmSummaryCache: [String: (computedAt: Date, summary: StressAlgorithmSummary)] = [:]
+  var whoopLabEnergyBankAlgorithmSummaryCache: [String: (computedAt: Date, summary: EnergyBankAlgorithmSummary)] = [:]
   var heartRateTimelineRefreshID: UUID?
   var heartRateSeriesUpdateObserver: NSObjectProtocol?
   let packetInputQueue = DispatchQueue(label: "com.goose.swift.health.packet-inputs", qos: .utility)
@@ -116,10 +126,17 @@ final class HealthDataStore: ObservableObject {
   /// so new history shows up without relaunching the app.
   static let packetInputStaleInterval: TimeInterval = 10 * 60
 
+  /// whoop-lab: minimum spacing between extractions triggered by history syncs.
+  static let packetInputAfterSyncMinInterval: TimeInterval = 5 * 60
+
   func refreshPacketInputsIfNeeded() {
     let neverRun = packetInputReports.isEmpty && packetInputStatus == "No run"
     let stale = lastPacketInputRunAt.map { Date().timeIntervalSince($0) >= Self.packetInputStaleInterval } ?? true
-    guard neverRun || stale else {
+    guard neverRun || stale || packetInputsDirty else {
+      return
+    }
+    guard UIApplication.shared.applicationState != .background else {
+      packetInputsDirty = true
       return
     }
     runPacketInputs()
@@ -160,6 +177,17 @@ final class HealthDataStore: ObservableObject {
   }
 
   func refreshPacketInputsAfterCapture() {
+    // whoop-lab: extraction is CPU-heavy; in the background iOS kills apps above 80 % CPU over
+    // 60 s. Defer it to the next foreground, and space sync-triggered runs out.
+    guard UIApplication.shared.applicationState != .background else {
+      packetInputsDirty = true
+      return
+    }
+    if let lastRun = lastPacketInputRunAt,
+       Date().timeIntervalSince(lastRun) < Self.packetInputAfterSyncMinInterval {
+      packetInputsDirty = true
+      return
+    }
     packetInputRefreshWorkItem?.cancel()
     let workItem = DispatchWorkItem { [weak self] in
       self?.runPacketInputs()
@@ -232,6 +260,7 @@ final class HealthDataStore: ObservableObject {
         case .success(let reports):
           self.packetInputReports = reports
           self.lastPacketInputRunAt = Date()
+          self.packetInputsDirty = false
           self.packetInputStatus = "Bridge packet-derived inputs extracted"
         case .failure(let error):
           self.packetInputStatus = "Bridge input extraction blocked: \(HealthDataStore.shortError(error))"

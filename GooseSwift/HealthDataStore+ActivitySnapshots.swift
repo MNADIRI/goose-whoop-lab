@@ -5,8 +5,13 @@ import UIKit
 
 extension HealthDataStore {
   func dailyRecoveryMetrics() -> [[String: Any]] {
-    Self.array(packetInputReports["daily_recovery"]?["metrics"])
+    if let cache = whoopLabDailyRecoveryMetricsCache, cache.revision == packetInputReportsRevision {
+      return cache.metrics
+    }
+    let metrics = Self.array(packetInputReports["daily_recovery"]?["metrics"])
       .filter { Self.localHealthMetricRowIsDisplaySafe($0) }
+    whoopLabDailyRecoveryMetricsCache = (packetInputReportsRevision, metrics)
+    return metrics
   }
 
   func dailyRecoveryMetricsWithRestingHR() -> [[String: Any]] {

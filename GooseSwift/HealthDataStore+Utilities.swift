@@ -196,12 +196,42 @@ extension HealthDataStore {
     return array
   }
 
+  /// whoop-lab: the forbidden-source scan parses and normalises every string of a metric row,
+  /// including its JSON columns. It ran on the main thread for every row on every SwiftUI render,
+  /// which tripped the 10 s watchdog once provenance listed thousands of input ids. Rows are
+  /// immutable per (id, updated_at), so the verdict is cached.
+  private static let displaySafetyCacheLock = NSLock()
+  nonisolated(unsafe) private static var displaySafetyCache: [String: Bool] = [:]
+
   static func localHealthMetricRowIsDisplaySafe(_ metric: [String: Any]) -> Bool {
     guard let rawSourceKind = metric["source_kind"] as? String,
           MetricSourceKind(rawValue: rawSourceKind) != nil else {
       return false
     }
-    return !localHealthMetricValueContainsForbiddenSourceMarker(metric)
+    let identity = (metric["daily_metric_id"] ?? metric["hourly_metric_id"] ?? metric["metric_id"]) as? String
+    guard let identity, let updatedAt = metric["updated_at"] as? String else {
+      return !localHealthMetricValueContainsForbiddenSourceMarker(metric)
+    }
+    let cacheKey = "\(identity)|\(updatedAt)|\(rawSourceKind)"
+    displaySafetyCacheLock.lock()
+    let cached = displaySafetyCache[cacheKey]
+    displaySafetyCacheLock.unlock()
+    if let cached {
+      return cached
+    }
+    let safe = !localHealthMetricValueContainsForbiddenSourceMarker(metric)
+    displaySafetyCacheLock.lock()
+    if displaySafetyCache.count > 4_096 {
+      displaySafetyCache.removeAll(keepingCapacity: true)
+    }
+    displaySafetyCache[cacheKey] = safe
+    displaySafetyCacheLock.unlock()
+    return safe
+  }
+
+  /// whoop-lab: identifier lists (frame/evidence/input ids) never carry source markers.
+  static func localHealthMetricKeyHoldsIdentifiers(_ key: String) -> Bool {
+    key.hasSuffix("_ids") || key.hasSuffix("_id")
   }
 
   static func localHealthMetricValueContainsForbiddenSourceMarker(_ value: Any?) -> Bool {
@@ -218,6 +248,9 @@ extension HealthDataStore {
       for (key, nestedValue) in dictionary {
         if localHealthMetricTextContainsForbiddenSourceMarker(key) {
           return true
+        }
+        if localHealthMetricKeyHoldsIdentifiers(key) {
+          continue
         }
         if localHealthMetricValueContainsForbiddenSourceMarker(nestedValue) {
           return true
@@ -579,17 +612,26 @@ extension HealthDataStore {
     return formatter.date(from: text)
   }
 
-  static func timeLabel(_ date: Date) -> String {
+  // whoop-lab: DateFormatter creation is expensive and these run per chart point on the main thread.
+  private static let timeLabelFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.timeStyle = .short
     formatter.dateStyle = .none
-    return formatter.string(from: date)
+    return formatter
+  }()
+
+  private static let dateLabelFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "dd/MM/yyyy"
+    return formatter
+  }()
+
+  static func timeLabel(_ date: Date) -> String {
+    timeLabelFormatter.string(from: date)
   }
 
   static func dateLabel(_ date: Date) -> String {
-    let formatter = DateFormatter()
-    formatter.dateFormat = "dd/MM/yyyy"
-    return formatter.string(from: date)
+    dateLabelFormatter.string(from: date)
   }
 
   static func algorithmRows(from value: Any) -> [[String: Any]] {

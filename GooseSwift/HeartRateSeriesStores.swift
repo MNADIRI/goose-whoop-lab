@@ -72,6 +72,11 @@ final class HeartRateSeriesStore {
   private var samples: [HeartRateSamplePoint]
   private var pendingWrite: DispatchWorkItem?
   private var lastNotificationAt = Date.distantPast
+  /// whoop-lab: bumped whenever `samples` changes. Day queries filtered and sorted up to 100k
+  /// samples on each call, many times per SwiftUI render; results are cached per (day, revision).
+  private var revision = 0
+  private var daySamplesCache: (start: Date, end: Date, revision: Int, samples: [HeartRateSamplePoint])?
+  private var restingEstimateCache: (dayStart: Date, minimumSamples: Int, revision: Int, computedAt: Date, estimate: HeartRateRestingEstimate?)?
 
   init(url: URL = HeartRateSeriesStore.defaultURL()) {
     self.url = url
@@ -93,6 +98,7 @@ final class HeartRateSeriesStore {
     }
 
     samples.append(HeartRateSamplePoint(bpm: bpm, source: source, capturedAt: capturedAt))
+    revision &+= 1
     prune(relativeTo: capturedAt)
     schedulePersist()
     let shouldPostUpdate = markUpdateNotificationIfNeeded()
@@ -160,9 +166,14 @@ final class HeartRateSeriesStore {
   func samples(from start: Date, to end: Date) -> [HeartRateSamplePoint] {
     stateLock.lock()
     defer { stateLock.unlock() }
-    return samples
+    if let cache = daySamplesCache, cache.start == start, cache.end == end, cache.revision == revision {
+      return cache.samples
+    }
+    let result = samples
       .filter { $0.capturedAt >= start && $0.capturedAt < end }
       .sorted { $0.capturedAt < $1.capturedAt }
+    daySamplesCache = (start, end, revision, result)
+    return result
   }
 
   func summary(forDayContaining date: Date = Date(), calendar: Calendar = .current) -> String {
@@ -189,6 +200,24 @@ final class HeartRateSeriesStore {
     stateLock.lock()
     defer { stateLock.unlock() }
     let dayStart = calendar.startOfDay(for: date)
+    // A low-quartile estimate over a day barely moves with one more sample: reuse it for 30 s even
+    // though live HR bumps the revision every second.
+    let now = Date()
+    if let cache = restingEstimateCache,
+       cache.dayStart == dayStart, cache.minimumSamples == minimumSamples,
+       cache.revision == revision || now.timeIntervalSince(cache.computedAt) < 30 {
+      return cache.estimate
+    }
+    let estimate = restingEstimateLocked(dayStart: dayStart, calendar: calendar, minimumSamples: minimumSamples)
+    restingEstimateCache = (dayStart, minimumSamples, revision, now, estimate)
+    return estimate
+  }
+
+  private func restingEstimateLocked(
+    dayStart: Date,
+    calendar: Calendar,
+    minimumSamples: Int
+  ) -> HeartRateRestingEstimate? {
     let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart.addingTimeInterval(24 * 60 * 60)
     let daySamples = samples.filter { $0.capturedAt >= dayStart && $0.capturedAt < dayEnd }
     let candidateSamples: [HeartRateSamplePoint]
@@ -253,6 +282,7 @@ final class HeartRateSeriesStore {
   }
 
   private func prune(relativeTo date: Date) {
+    let countBefore = samples.count
     let cutoff = date.addingTimeInterval(-Self.retention)
     if let firstKept = samples.firstIndex(where: { $0.capturedAt >= cutoff }), firstKept > 0 {
       samples.removeFirst(firstKept)
@@ -261,6 +291,9 @@ final class HeartRateSeriesStore {
     }
     if samples.count > Self.maxSamples {
       samples.removeFirst(samples.count - Self.maxSamples)
+    }
+    if samples.count != countBefore {
+      revision &+= 1
     }
   }
 

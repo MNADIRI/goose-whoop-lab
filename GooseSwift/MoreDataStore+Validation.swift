@@ -448,8 +448,11 @@ extension MoreDataStore {
     return directory
   }
 
+  // whoop-lab: a formatter was created per call from SwiftUI bodies (2 s of main thread per minute).
+  nonisolated(unsafe) private static let iso8601Formatter = ISO8601DateFormatter()
+
   static func parseISO8601(_ text: String) -> Date? {
-    ISO8601DateFormatter().date(from: text)
+    iso8601Formatter.date(from: text)
   }
 
   static func unixMilliseconds(_ date: Date) -> Int64 {

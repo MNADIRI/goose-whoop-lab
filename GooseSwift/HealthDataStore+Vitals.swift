@@ -512,6 +512,15 @@ extension HealthDataStore {
   }
 
   func packetEvidenceFrameCount() -> Int {
+    if let cache = whoopLabEvidenceFrameCountCache, cache.revision == packetInputReportsRevision {
+      return cache.count
+    }
+    let count = computePacketEvidenceFrameCount()
+    whoopLabEvidenceFrameCountCache = (packetInputReportsRevision, count)
+    return count
+  }
+
+  func computePacketEvidenceFrameCount() -> Int {
     let reportCounts = packetInputReports.values.flatMap { report in
       [
         "decoded_frame_count",

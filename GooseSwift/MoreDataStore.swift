@@ -294,8 +294,20 @@ final class MoreDataStore: ObservableObject {
     storageNextAction
   }
 
+  // whoop-lab: evaluated several times per render; a file-system check every time is wasteful.
+  private static let databaseExistsCacheLock = NSLock()
+  nonisolated(unsafe) private static var databaseExistsCache: (path: String, checkedAt: Date, exists: Bool)?
+
   var databaseExists: Bool {
-    FileManager.default.fileExists(atPath: databasePath)
+    let now = Date()
+    Self.databaseExistsCacheLock.lock()
+    defer { Self.databaseExistsCacheLock.unlock() }
+    if let cache = Self.databaseExistsCache, cache.path == databasePath, now.timeIntervalSince(cache.checkedAt) < 5 {
+      return cache.exists
+    }
+    let exists = FileManager.default.fileExists(atPath: databasePath)
+    Self.databaseExistsCache = (databasePath, now, exists)
+    return exists
   }
 
   func runStorageCheck() {

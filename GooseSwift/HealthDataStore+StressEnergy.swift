@@ -4,7 +4,28 @@ import SwiftUI
 import UIKit
 
 extension HealthDataStore {
+  /// whoop-lab: SwiftUI recomputed this for every card on every render (27 s of main-thread time in
+  /// 40 s on device). The summary covers a whole day, so a 30 s cache per day is fresh enough; it is
+  /// invalidated when packet inputs are re-extracted.
   func stressAlgorithmSummary(
+    for date: Date = Date(),
+    calendar: Calendar = .current,
+    allowLiveFallbacks: Bool = true
+  ) -> StressAlgorithmSummary {
+    let key = "\(calendar.startOfDay(for: date).timeIntervalSince1970)|\(allowLiveFallbacks)|\(previewMissingData)|\(lastPacketInputRunAt?.timeIntervalSince1970 ?? 0)"
+    let now = Date()
+    if let cached = whoopLabStressAlgorithmSummaryCache[key], now.timeIntervalSince(cached.computedAt) < Self.whoopLabSummaryCacheLifetime {
+      return cached.summary
+    }
+    let summary = computeStressAlgorithmSummary(for: date, calendar: calendar, allowLiveFallbacks: allowLiveFallbacks)
+    if whoopLabStressAlgorithmSummaryCache.count > 16 {
+      whoopLabStressAlgorithmSummaryCache.removeAll()
+    }
+    whoopLabStressAlgorithmSummaryCache[key] = (now, summary)
+    return summary
+  }
+
+  func computeStressAlgorithmSummary(
     for date: Date = Date(),
     calendar: Calendar = .current,
     allowLiveFallbacks: Bool = true
@@ -126,7 +147,28 @@ extension HealthDataStore {
     )
   }
 
+  /// whoop-lab: SwiftUI recomputed this for every card on every render (27 s of main-thread time in
+  /// 40 s on device). The summary covers a whole day, so a 30 s cache per day is fresh enough; it is
+  /// invalidated when packet inputs are re-extracted.
   func energyBankAlgorithmSummary(
+    for date: Date = Date(),
+    calendar: Calendar = .current,
+    allowLiveFallbacks: Bool = true
+  ) -> EnergyBankAlgorithmSummary {
+    let key = "\(calendar.startOfDay(for: date).timeIntervalSince1970)|\(allowLiveFallbacks)|\(previewMissingData)|\(lastPacketInputRunAt?.timeIntervalSince1970 ?? 0)"
+    let now = Date()
+    if let cached = whoopLabEnergyBankAlgorithmSummaryCache[key], now.timeIntervalSince(cached.computedAt) < Self.whoopLabSummaryCacheLifetime {
+      return cached.summary
+    }
+    let summary = computeEnergyBankAlgorithmSummary(for: date, calendar: calendar, allowLiveFallbacks: allowLiveFallbacks)
+    if whoopLabEnergyBankAlgorithmSummaryCache.count > 16 {
+      whoopLabEnergyBankAlgorithmSummaryCache.removeAll()
+    }
+    whoopLabEnergyBankAlgorithmSummaryCache[key] = (now, summary)
+    return summary
+  }
+
+  func computeEnergyBankAlgorithmSummary(
     for date: Date = Date(),
     calendar: Calendar = .current,
     allowLiveFallbacks: Bool = true
