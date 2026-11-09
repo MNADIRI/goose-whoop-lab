@@ -156,6 +156,15 @@ extension GooseBLEClient: CBPeripheralDelegate {
            V5PacketType.metadata,
            V5PacketType.puffinMetadata:
         return true
+      // goose#24: historical bodies must reach handleHistoricalSyncValue during a sync,
+      // otherwise the sync counter stays at 0 and the backfill fails after 3 attempts.
+      // Live streams keep the off-main fast path.
+      case V5PacketType.historicalData,
+           V5PacketType.historicalIMUDataStream:
+        if isHistoricalSyncing {
+          return true
+        }
+        continue
       default:
         continue
       }

@@ -20,7 +20,8 @@ extension GooseAppModel {
         self.handleEmptyNotificationIngestResult(result)
         return
       }
-      guard captureImportActive else {
+      // whoop-lab: historical frames are always persisted, even without an active capture session.
+      guard captureImportActive || result.frames.contains(where: { Self.isHistoricalFrameHex($0.hex) }) else {
         self.handleNotificationIngestResultWithoutCapture(result, parseContext: parseContext)
         return
       }
@@ -161,12 +162,27 @@ extension GooseAppModel {
     }
   }
 
-  func importCapturedFrames(_ frames: [NotificationFrame], event: GooseNotificationEvent) {
-    guard activeHealthPacketCapture != nil || activeActivityPersistence != nil else {
-      return
+  /// whoop-lab: packet type sits at byte 8 of a V5 frame (hex chars 16..<18).
+  /// 47 = historical data (R18/R20/R21/R26…), 52 = historical IMU stream.
+  static func isHistoricalFrameHex(_ hex: String) -> Bool {
+    guard hex.count >= 18 else {
+      return false
     }
+    let start = hex.index(hex.startIndex, offsetBy: 16)
+    let type = hex[start..<hex.index(start, offsetBy: 2)].lowercased()
+    return type == "2f" || type == "34"
+  }
 
-    let framesToWrite = frames.filter { _ in shouldWriteCapturedFrame(at: event.capturedAt) }
+  func importCapturedFrames(_ frames: [NotificationFrame], event: GooseNotificationEvent) {
+    let captureActive = activeHealthPacketCapture != nil || activeActivityPersistence != nil
+    // whoop-lab: history arrives in bursts; the walk-mode 0.1 s throttle would drop most of it,
+    // so historical frames bypass both the capture-session gate and the throttle.
+    let framesToWrite = frames.filter { frame in
+      if Self.isHistoricalFrameHex(frame.hex) {
+        return true
+      }
+      return captureActive && shouldWriteCapturedFrame(at: event.capturedAt)
+    }
     guard !framesToWrite.isEmpty else {
       return
     }
@@ -312,7 +328,11 @@ extension GooseAppModel {
   static func captureEvidenceID(for frame: NotificationFrame, event: GooseNotificationEvent, index: Int) -> String {
     let milliseconds = Int((event.capturedAt.timeIntervalSince1970 * 1000).rounded())
     let prefix = String(frame.hex.prefix(16))
-    return "ios.\(event.deviceID.uuidString).\(milliseconds).\(index).\(prefix)"
+    // whoop-lab: history bursts deliver several same-header frames within one millisecond,
+    // each as index 0 of its own notification; the frame's trailing CRC32 keeps their IDs distinct
+    // (otherwise raw_evidence rejects them as duplicates and the records are lost).
+    let crc = String(frame.hex.suffix(8))
+    return "ios.\(event.deviceID.uuidString).\(milliseconds).\(index).\(prefix).\(crc)"
   }
 
   func schedulePacketImportRevisionPublish() {
