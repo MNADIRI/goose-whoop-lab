@@ -32,6 +32,7 @@ final class HealthDataStore: ObservableObject {
   var packetInputRefreshWorkItem: DispatchWorkItem?
   var packetInputRunID: UUID?
   var packetInputIsRunning = false
+  var lastPacketInputRunAt: Date?
   var heartRateTimelineRefreshID: UUID?
   var heartRateSeriesUpdateObserver: NSObjectProtocol?
   let packetInputQueue = DispatchQueue(label: "com.goose.swift.health.packet-inputs", qos: .utility)
@@ -111,8 +112,14 @@ final class HealthDataStore: ObservableObject {
     refreshBridgeCatalogs()
   }
 
+  /// whoop-lab: also re-run when the last extraction is older than `packetInputStaleInterval`,
+  /// so new history shows up without relaunching the app.
+  static let packetInputStaleInterval: TimeInterval = 10 * 60
+
   func refreshPacketInputsIfNeeded() {
-    guard packetInputReports.isEmpty, packetInputStatus == "No run" else {
+    let neverRun = packetInputReports.isEmpty && packetInputStatus == "No run"
+    let stale = lastPacketInputRunAt.map { Date().timeIntervalSince($0) >= Self.packetInputStaleInterval } ?? true
+    guard neverRun || stale else {
       return
     }
     runPacketInputs()
@@ -224,6 +231,7 @@ final class HealthDataStore: ObservableObject {
         switch result {
         case .success(let reports):
           self.packetInputReports = reports
+          self.lastPacketInputRunAt = Date()
           self.packetInputStatus = "Bridge packet-derived inputs extracted"
         case .failure(let error):
           self.packetInputStatus = "Bridge input extraction blocked: \(HealthDataStore.shortError(error))"

@@ -17,6 +17,16 @@ struct AppShellView: View {
         .tag(tab)
       }
     }
+    // whoop-lab: keep packet-derived metrics current instead of computing them once per launch.
+    .onAppear {
+      healthStore.refreshPacketInputsIfNeeded()
+    }
+    .onReceive(model.ble.$lastHistoricalSyncCompletedAt.compactMap { $0 }) { _ in
+      healthStore.refreshPacketInputsAfterCapture()
+    }
+    .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+      healthStore.refreshPacketInputsIfNeeded()
+    }
   }
 
   private var tabSelection: Binding<GooseAppTab> {

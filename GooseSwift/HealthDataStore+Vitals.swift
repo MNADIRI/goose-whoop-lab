@@ -112,6 +112,9 @@ extension HealthDataStore {
     ) {
       return stored
     }
+    if let waiting = whoopLabWaitingSnapshot(base: snapshot, metricID: "skin_temperature_delta_c") {
+      return waiting
+    }
     if let unavailable = preferredDailyRecoveryUnavailableMetric(metricID: "skin_temperature_delta_c") {
       return unavailablePacketSnapshot(
         base: snapshot,
@@ -336,6 +339,9 @@ extension HealthDataStore {
     ) {
       return stored
     }
+    if let waiting = whoopLabWaitingSnapshot(base: snapshot, metricID: "hrv_rmssd_ms") {
+      return waiting
+    }
     guard let report = packetInputReports["hrv"] else {
       if let unavailable = preferredDailyRecoveryUnavailableMetric(metricID: "hrv_rmssd_ms") {
         return unavailablePacketSnapshot(
@@ -531,6 +537,36 @@ extension HealthDataStore {
 
   func latestSkinTemperatureInput() -> [String: Any]? {
     Self.array(packetInputReports["vital_event"]?["skin_temperature_inputs"]).last
+  }
+
+  /// whoop-lab: when the R18 path is decoding the metric but lacks enough sleep data yet, say so
+  /// instead of goose's generic "semantics pending" / "unavailable" blockers.
+  func whoopLabWaitingSnapshot(base snapshot: HealthMetricSnapshot, metricID: String) -> HealthMetricSnapshot? {
+    let statuses = Self.array(packetInputReports["recovery_sensor_rollup"]?["statuses"])
+    guard let status = statuses.first(where: { $0["metric_id"] as? String == metricID }) else {
+      return nil
+    }
+    let blockers = (status["blocker_reasons"] as? [String]) ?? []
+    switch metricID {
+    case "hrv_rmssd_ms" where blockers.contains("whoop_lab_k18_not_enough_rest_beats"):
+      return unavailablePacketSnapshot(
+        base: snapshot,
+        status: "Waiting for rest",
+        freshness: "Needs still or sleep beats",
+        provenance: "whoop_lab.k18_sleep_rr_rmssd",
+        sourceDetail: "RMSSD over successive R18 beats while the band reports STILL or SLEEP (≥100 differences)"
+      )
+    case "skin_temperature_delta_c" where blockers.contains("whoop_lab_k18_sleep_baseline_building"):
+      return unavailablePacketSnapshot(
+        base: snapshot,
+        status: "Baseline building",
+        freshness: "Needs 4 nights of sleep",
+        provenance: "whoop_lab.k18_sleep_skin_temperature_delta",
+        sourceDetail: "Sleep skin temperature (R18 byte 73) vs median of ≥3 previous nights"
+      )
+    default:
+      return nil
+    }
   }
 
   func unavailablePacketSnapshot(

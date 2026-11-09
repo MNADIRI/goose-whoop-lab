@@ -4,6 +4,14 @@ import SwiftUI
 import UIKit
 
 extension HealthDataStore {
+  /// whoop-lab: start of the step-ingest window (48 h ago), in the raw_evidence.captured_at format.
+  nonisolated static func whoopLabStepIngestStart(now: Date = Date()) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    formatter.timeZone = TimeZone(identifier: "UTC")
+    return formatter.string(from: now.addingTimeInterval(-48 * 3_600))
+  }
+
   nonisolated static func packetInputBridgeReports(databasePath: String) -> Result<[String: [String: Any]], Error> {
     let bridge = GooseRustBridge()
     let baseArgs: [String: Any] = [
@@ -15,6 +23,12 @@ extension HealthDataStore {
     ]
     do {
       var reports: [String: [String: Any]] = [:]
+      // whoop-lab: expose R18 fields (steps, R-R, skin temperature, band state) on history decoded
+      // by earlier parser versions. Idempotent: only frames without `r18` are re-parsed.
+      reports["whoop_lab_reparse"] = try bridge.request(
+        method: "whoop_lab.reparse_r18_history",
+        args: ["database_path": databasePath]
+      )
       reports["readiness"] = try bridge.request(
         method: "metrics.input_readiness",
         args: [
@@ -31,9 +45,14 @@ extension HealthDataStore {
         method: "metrics.step_packet_discovery",
         args: baseArgs.merging(["max_candidate_fields": 100]) { _, new in new }
       )
+      // whoop-lab: R18 yields two step fields per second (count + activity), so 1,000 fields covered
+      // only ~8 minutes. Ingest the last 48 h (idempotent) with room for every record in it.
       reports["step_counter_ingest"] = try bridge.request(
         method: "metrics.step_counter_ingest",
-        args: baseArgs.merging(["max_candidate_fields": 1_000]) { _, new in new }
+        args: baseArgs.merging([
+          "start": Self.whoopLabStepIngestStart(),
+          "max_candidate_fields": 400_000,
+        ]) { _, new in new }
       )
       reports["heart_rate"] = try bridge.request(method: "metrics.heart_rate_features", args: baseArgs)
       reports["vital_event"] = try bridge.request(method: "metrics.vital_event_features", args: baseArgs)
