@@ -890,6 +890,11 @@ pub struct DebugEventRow {
 impl GooseStore {
     pub fn open(path: &Path) -> GooseResult<Self> {
         let conn = Connection::open(path)?;
+        // whoop-lab: the app writes frames continuously while metric extraction and exports read
+        // large windows. In rollback-journal mode those readers blocked frame writes (and vice
+        // versa); WAL lets them run concurrently, and the busy timeout absorbs short write overlaps.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -3042,9 +3047,9 @@ impl GooseStore {
                 input.average_cadence_spm,
                 input.source_kind,
                 input.confidence,
-                input.inputs_json,
+                compact_metric_json(input.inputs_json),
                 input.quality_flags_json,
-                input.provenance_json,
+                compact_metric_json(input.provenance_json),
             ],
         )?;
         Ok(changed > 0)
@@ -3266,9 +3271,9 @@ impl GooseStore {
                 input.average_cadence_spm,
                 input.source_kind,
                 input.confidence,
-                input.inputs_json,
+                compact_metric_json(input.inputs_json),
                 input.quality_flags_json,
-                input.provenance_json,
+                compact_metric_json(input.provenance_json),
             ],
         )?;
         Ok(changed > 0)
@@ -3490,9 +3495,9 @@ impl GooseStore {
                 input.skin_temperature_delta_c,
                 input.source_kind,
                 input.confidence,
-                input.inputs_json,
+                compact_metric_json(input.inputs_json),
                 input.quality_flags_json,
-                input.provenance_json,
+                compact_metric_json(input.provenance_json),
             ],
         )?;
         Ok(changed > 0)
@@ -3665,9 +3670,9 @@ impl GooseStore {
                 input.source_kind,
                 input.source_detail,
                 input.confidence,
-                input.inputs_json,
+                compact_metric_json(input.inputs_json),
                 input.quality_flags_json,
-                input.provenance_json,
+                compact_metric_json(input.provenance_json),
             ],
         )?;
         Ok(changed > 0)
@@ -3861,6 +3866,17 @@ impl GooseStore {
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(GooseError::from)
+    }
+
+    /// whoop-lab: remove R18 step samples dated by reception time (written before samples carried
+    /// `timestamp_basis`). Returns the number of rows removed.
+    pub fn delete_legacy_r18_step_samples(&self) -> GooseResult<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM step_counter_samples
+             WHERE json_path = '$.body_summary.r18.step_count'
+               AND instr(provenance_json, '\"timestamp_basis\"') = 0",
+            [],
+        )?)
     }
 
     pub fn insert_step_counter_sample(
@@ -7115,6 +7131,49 @@ fn validate_metric_debug_feature_input(input: &MetricDebugFeatureInput<'_>) -> G
     validate_json("quality_flags_json", input.quality_flags_json)?;
     validate_json_object("provenance_json", input.provenance_json)?;
     Ok(())
+}
+
+/// whoop-lab: metric rows listed every contributing frame id (over 1 MB per daily row once full
+/// history is kept), and the app re-parses these columns while rendering. Long `*_ids` arrays keep
+/// their first and last 25 entries plus a `<key>_count`.
+const METRIC_JSON_MAX_IDS: usize = 50;
+
+fn compact_metric_json(json: &str) -> String {
+    if json.len() < 4_096 {
+        return json.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(json) else {
+        return json.to_string();
+    };
+    compact_id_arrays(&mut value);
+    serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
+}
+
+fn compact_id_arrays(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let mut counts = Vec::new();
+            for (key, nested) in map.iter_mut() {
+                if key.ends_with("_ids") {
+                    if let Value::Array(items) = nested {
+                        if items.len() > METRIC_JSON_MAX_IDS {
+                            counts.push((format!("{key}_count"), items.len()));
+                            let tail = items.split_off(items.len() - METRIC_JSON_MAX_IDS / 2);
+                            items.truncate(METRIC_JSON_MAX_IDS / 2);
+                            items.extend(tail);
+                        }
+                        continue;
+                    }
+                }
+                compact_id_arrays(nested);
+            }
+            for (key, count) in counts {
+                map.entry(key).or_insert(Value::from(count));
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(compact_id_arrays),
+        _ => {}
+    }
 }
 
 /// whoop-lab: step sample provenance records the ingest window (`start`/`end`) and the database

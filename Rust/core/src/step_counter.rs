@@ -23,6 +23,10 @@ pub const STEP_COUNTER_HOURLY_ROLLUP_REPORT_SCHEMA: &str =
 pub const ACTIVITY_UNAVAILABLE_DAILY_STATUS_REPORT_SCHEMA: &str =
     "goose.activity-unavailable-daily-status-report.v1";
 pub const GOOSE_STEPS_DEVICE_COUNTER_V0_ID: &str = "goose.steps.device_counter.v0";
+/// whoop-lab: device timestamps before 2020 are treated as unset.
+const DEVICE_TIMESTAMP_MIN_PLAUSIBLE_SECONDS: u32 = 1_577_836_800;
+/// whoop-lab: an unchanged counter is still sampled every 5 minutes.
+const STEP_SAMPLE_CHECKPOINT_MS: i64 = 5 * 60 * 1000;
 pub const GOOSE_STEPS_DEVICE_COUNTER_V0_VERSION: &str = "0.1.0";
 pub const GOOSE_ACTIVITY_UNAVAILABLE_STATUS_V0_ID: &str = "goose.activity.unavailable_status.v0";
 pub const GOOSE_ACTIVITY_UNAVAILABLE_STATUS_V0_VERSION: &str = "0.1.0";
@@ -257,6 +261,11 @@ pub fn persist_step_counter_discovery(
     let mut idempotent_sample_count = 0;
     let mut rejected_sample_count = 0;
 
+    // whoop-lab: R18 samples written before device timestamps were used are dated by reception
+    // time; drop them once so they do not interleave with device-dated samples.
+    store.delete_legacy_r18_step_samples()?;
+    let mut last_kept: BTreeMap<String, (i64, i64, Option<String>)> = BTreeMap::new();
+
     for candidate in discovery
         .candidate_fields
         .iter()
@@ -271,7 +280,14 @@ pub fn persist_step_counter_discovery(
             ));
             continue;
         };
-        let Some(sample_time_unix_ms) = parse_rfc3339_utc_unix_ms(&candidate.captured_at) else {
+        // whoop-lab: prefer the record's own device timestamp (history arrives in bursts).
+        let device_time_unix_ms = candidate
+            .device_timestamp_seconds
+            .filter(|seconds| *seconds >= DEVICE_TIMESTAMP_MIN_PLAUSIBLE_SECONDS)
+            .map(|seconds| i64::from(seconds) * 1000);
+        let Some(sample_time_unix_ms) =
+            device_time_unix_ms.or_else(|| parse_rfc3339_utc_unix_ms(&candidate.captured_at))
+        else {
             rejected_sample_count += 1;
             issues.push(format!(
                 "step_counter_candidate_unparseable_time:{}:{}",
@@ -279,6 +295,7 @@ pub fn persist_step_counter_discovery(
             ));
             continue;
         };
+        let timestamp_basis = if device_time_unix_ms.is_some() { "device" } else { "captured_at" };
         let sample_id = step_counter_sample_id(
             &candidate.frame_id,
             &candidate.json_path,
@@ -299,6 +316,19 @@ pub fn persist_step_counter_discovery(
         if activity_state.is_some() {
             activity_state_sample_count += 1;
         }
+        // whoop-lab: a 1 Hz counter is mostly unchanged. Keep a sample when the count or activity
+        // changes, plus one checkpoint every 5 minutes, instead of 86,400 rows a day.
+        if let Some((kept_time, kept_value, kept_activity)) = last_kept.get(&candidate.json_path) {
+            let unchanged = *kept_value == counter_value && *kept_activity == activity_state;
+            let recent = (sample_time_unix_ms - kept_time).abs() < STEP_SAMPLE_CHECKPOINT_MS;
+            if unchanged && recent {
+                continue;
+            }
+        }
+        last_kept.insert(
+            candidate.json_path.clone(),
+            (sample_time_unix_ms, counter_value, activity_state.clone()),
+        );
         let mut sample_quality_flags = Vec::new();
         if cadence_candidate.is_some() && cadence_spm.is_none() {
             sample_quality_flags.push("cadence_unparseable".to_string());
@@ -330,6 +360,7 @@ pub fn persist_step_counter_discovery(
             "cadence_json_path": cadence_candidate.map(|candidate| candidate.json_path.as_str()),
             "activity_state_source_kind": activity_state_candidate.map(|candidate| candidate.source_kind_inference.as_str()),
             "activity_state_json_path": activity_state_candidate.map(|candidate| candidate.json_path.as_str()),
+            "timestamp_basis": timestamp_basis,
         })
         .to_string();
         let inserted = store.insert_step_counter_sample(StepCounterSampleInput {

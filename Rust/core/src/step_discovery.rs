@@ -72,6 +72,10 @@ pub struct StepPacketDiscoveryCandidate {
     pub match_kind: String,
     pub source_kind_inference: String,
     pub reason: String,
+    /// whoop-lab: device Unix-seconds timestamp of the record when the payload carries one. History
+    /// arrives in bursts, so `captured_at` (reception time) does not say when the steps happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_timestamp_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +171,7 @@ struct FrameContext<'a> {
     domain: Option<String>,
     body_summary_kind: Option<String>,
     packet_family: String,
+    device_timestamp_seconds: Option<u32>,
 }
 
 struct FieldMatch {
@@ -427,12 +432,18 @@ fn frame_context<'a>(row: &'a DecodedFrameRow, payload: &Value) -> FrameContext<
         body_summary_kind.as_deref(),
     );
 
+    let device_timestamp_seconds = payload
+        .get("timestamp_seconds")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+
     FrameContext {
         row,
         packet_k,
         domain,
         body_summary_kind,
         packet_family,
+        device_timestamp_seconds,
     }
 }
 
@@ -655,6 +666,7 @@ fn candidate_from_match(
         match_kind: field_match.match_kind.to_string(),
         source_kind_inference: field_match.source_kind_inference.to_string(),
         reason: field_match.reason.to_string(),
+        device_timestamp_seconds: context.device_timestamp_seconds,
     }
 }
 
