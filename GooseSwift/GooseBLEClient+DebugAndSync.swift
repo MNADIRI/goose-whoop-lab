@@ -364,7 +364,7 @@ extension GooseBLEClient {
     return true
   }
 
-  func scheduleHistoricalIdleCompletion(reason: String) {
+  func scheduleHistoricalIdleCompletion(reason: String, delay: TimeInterval = 12) {
     historicalIdleWorkItem?.cancel()
     let runID = historicalSyncRunID
     let workItem = DispatchWorkItem { [weak self] in
@@ -383,7 +383,7 @@ extension GooseBLEClient {
       self.completeHistoricalSync(reason: reason)
     }
     historicalIdleWorkItem = workItem
-    DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: workItem)
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
   }
 
   func retryHistoricalTransferAfterIdleIfNeeded(reason: String) -> Bool {

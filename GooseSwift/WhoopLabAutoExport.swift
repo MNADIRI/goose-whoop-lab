@@ -13,7 +13,7 @@ import SQLite3
 @MainActor
 final class WhoopLabAutoExport: ObservableObject {
   static let autoHistoricalSyncKey = "whoopLab.autoHistoricalSync"
-  static let syncInterval: TimeInterval = 30 * 60
+  static let syncInterval: TimeInterval = 5 * 60
   static let exportInterval: TimeInterval = 10 * 60
   nonisolated static let maxRowsPerChunk = 200_000
 
@@ -43,7 +43,8 @@ final class WhoopLabAutoExport: ObservableObject {
     }
   }
 
-  /// Starts the periodic check: history sync every 30 min while connected, export every 10 min.
+  /// Starts the periodic check: history sync every 5 min while connected (small, quick bursts
+  /// instead of a large backlog at launch), export every 10 min.
   /// BLE notifications keep the app running in the background (bluetooth-central), so the timer keeps firing.
   func start(ble: GooseBLEClient) {
     self.ble = ble

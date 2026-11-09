@@ -32,12 +32,16 @@ extension GooseBLEClient {
         terminal: false,
         failed: false
       )
-      record(
-        level: .debug,
-        source: "ble.sync",
-        title: "historical_sync.packet",
-        body: "\(characteristic.uuid.uuidString) count=\(historicalPacketsReceivedThisSync)"
-      )
+      // whoop-lab: one log line per packet (6,500 an hour) was written to disk and pushed to the
+      // in-app message list on the main thread; keep one every 100 packets.
+      if historicalPacketsReceivedThisSync == 1 || historicalPacketsReceivedThisSync.isMultiple(of: 100) {
+        record(
+          level: .debug,
+          source: "ble.sync",
+          title: "historical_sync.packet",
+          body: "\(characteristic.uuid.uuidString) count=\(historicalPacketsReceivedThisSync)"
+        )
+      }
     case V5PacketType.metadata, V5PacketType.puffinMetadata:
       handleHistoricalMetadata(payload)
     default:
@@ -572,6 +576,9 @@ extension GooseBLEClient {
     case .historyComplete:
       historyCompleteReceived = true
       guard !historyEndAckSentThisBurst else {
+        // whoop-lab: the strap reports COMPLETE after the last burst was acknowledged; waiting the
+        // generic 12 s idle window made every sync ~10 s longer. A new burst starts within ~0.5 s.
+        scheduleHistoricalIdleCompletion(reason: "history_complete", delay: 3)
         return
       }
       guard pendingHistoryEndAckPayload != nil else {

@@ -19,7 +19,7 @@ private struct WhoopLabExportSection: View {
     Section("whoop-lab") {
       LabeledContent("Folder", value: export.folderName ?? "None")
       LabeledContent("Export", value: export.status)
-      Toggle("Auto history sync (30 min)", isOn: $export.autoHistoricalSync)
+      Toggle("Continuous history sync (5 min)", isOn: $export.autoHistoricalSync)
       Button(export.folderName == nil ? "Choose Export Folder…" : "Change Export Folder…") {
         pickingFolder = true
       }

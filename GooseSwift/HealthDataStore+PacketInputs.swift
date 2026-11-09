@@ -4,19 +4,41 @@ import SwiftUI
 import UIKit
 
 extension HealthDataStore {
-  /// whoop-lab: start of the step-ingest window (48 h ago), in the raw_evidence.captured_at format.
-  nonisolated static func whoopLabStepIngestStart(now: Date = Date()) -> String {
+  nonisolated static let whoopLabStepIngestCursorKey = "whoopLab.stepIngestCursor"
+
+  nonisolated static func whoopLabCapturedAtString(_ date: Date) -> String {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     formatter.timeZone = TimeZone(identifier: "UTC")
-    return formatter.string(from: now.addingTimeInterval(-48 * 3_600))
+    return formatter.string(from: date)
+  }
+
+  /// whoop-lab: feature extractors used "0000"..."9999", i.e. every decoded frame ever stored. With
+  /// full 1 Hz history that grows by ~86k frames a day and pegged the CPU until iOS killed the app.
+  /// The cards show today (and yesterday for context); daily rollups keep their own day windows.
+  nonisolated static func whoopLabFeatureWindowStart(now: Date = Date()) -> String {
+    let calendar = Calendar.autoupdatingCurrent
+    let startOfToday = calendar.startOfDay(for: now)
+    let startOfYesterday = calendar.date(byAdding: .day, value: -1, to: startOfToday) ?? startOfToday
+    return whoopLabCapturedAtString(startOfYesterday)
+  }
+
+  /// whoop-lab: step ingest is incremental. It resumes 15 min before the previous run (late frames)
+  /// and never reaches back more than 48 h; re-ingested samples are idempotent.
+  nonisolated static func whoopLabStepIngestStart(now: Date = Date()) -> String {
+    let floor = now.addingTimeInterval(-48 * 3_600)
+    let cursor = UserDefaults.standard.object(forKey: whoopLabStepIngestCursorKey) as? Date
+    let start = max(floor, (cursor ?? floor).addingTimeInterval(-15 * 60))
+    return whoopLabCapturedAtString(start)
   }
 
   nonisolated static func packetInputBridgeReports(databasePath: String) -> Result<[String: [String: Any]], Error> {
     let bridge = GooseRustBridge()
+    let runStartedAt = Date()
+    let featureWindowStart = whoopLabFeatureWindowStart(now: runStartedAt)
     let baseArgs: [String: Any] = [
       "database_path": databasePath,
-      "start": "0000",
+      "start": featureWindowStart,
       "end": "9999",
       "min_owned_captures": 2,
       "require_trusted_evidence": false,
@@ -33,7 +55,7 @@ extension HealthDataStore {
         method: "metrics.input_readiness",
         args: [
           "database_path": databasePath,
-          "start": "0000",
+          "start": featureWindowStart,
           "end": "9999",
           "min_owned_captures": 2,
           "require_owned_captures": false,
@@ -46,14 +68,15 @@ extension HealthDataStore {
         args: baseArgs.merging(["max_candidate_fields": 100]) { _, new in new }
       )
       // whoop-lab: R18 yields two step fields per second (count + activity), so 1,000 fields covered
-      // only ~8 minutes. Ingest the last 48 h (idempotent) with room for every record in it.
+      // only ~8 minutes. Ingest incrementally with room for 48 h of records.
       reports["step_counter_ingest"] = try bridge.request(
         method: "metrics.step_counter_ingest",
         args: baseArgs.merging([
-          "start": Self.whoopLabStepIngestStart(),
+          "start": Self.whoopLabStepIngestStart(now: runStartedAt),
           "max_candidate_fields": 400_000,
         ]) { _, new in new }
       )
+      UserDefaults.standard.set(runStartedAt, forKey: Self.whoopLabStepIngestCursorKey)
       reports["heart_rate"] = try bridge.request(method: "metrics.heart_rate_features", args: baseArgs)
       reports["vital_event"] = try bridge.request(method: "metrics.vital_event_features", args: baseArgs)
       reports["hrv"] = try bridge.request(
@@ -405,12 +428,27 @@ extension HealthDataStore {
     var calendar = inputCalendar
     calendar.locale = Locale(identifier: "en_US_POSIX")
     let start = calendar.startOfDay(for: date)
+    return metricDateKeyFormatter(for: calendar).string(from: start)
+  }
+
+  // whoop-lab: one cached formatter per calendar/time zone instead of one per call.
+  private static let metricDateKeyFormatterLock = NSLock()
+  nonisolated(unsafe) private static var metricDateKeyFormatters: [String: DateFormatter] = [:]
+
+  static func metricDateKeyFormatter(for calendar: Calendar) -> DateFormatter {
+    let key = "\(calendar.identifier)|\(calendar.timeZone.identifier)"
+    metricDateKeyFormatterLock.lock()
+    defer { metricDateKeyFormatterLock.unlock() }
+    if let formatter = metricDateKeyFormatters[key] {
+      return formatter
+    }
     let formatter = DateFormatter()
     formatter.calendar = calendar
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = calendar.timeZone
     formatter.dateFormat = "yyyy-MM-dd"
-    return formatter.string(from: start)
+    metricDateKeyFormatters[key] = formatter
+    return formatter
   }
 
   nonisolated static func nonisolatedDoubleValue(_ value: Any?) -> Double? {
