@@ -53,6 +53,7 @@ final class GooseAppModel: ObservableObject {
   @Published var overnightGuardCanExportLastSession = false
 
   let ble: GooseBLEClient
+  let whoopLabExport = WhoopLabAutoExport()
   let packetMonitor = PacketMonitorModel()
   let activitySession = ActivitySessionModel()
   let activityLocationTracker = ActivityLocationTracker()
@@ -394,8 +395,10 @@ final class GooseAppModel: ObservableObject {
     ble.onHistoricalSyncProgress = { [weak self] progress in
       Task { @MainActor in
         self?.handleHistoricalSyncProgress(progress)
+        self?.whoopLabExport.historicalSyncFinished(progress)
       }
     }
+    whoopLabExport.start(ble: ble)
     ble.onHistoricalRangeTelemetry = { [weak self] telemetry in
       self?.persistOvernightHistoricalRangeTelemetry(telemetry)
     }

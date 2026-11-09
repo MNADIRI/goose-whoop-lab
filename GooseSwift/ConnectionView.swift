@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ConnectionView: View {
   @EnvironmentObject private var model: GooseAppModel
@@ -6,6 +7,32 @@ struct ConnectionView: View {
   var body: some View {
     ConnectionContentView(ble: model.ble)
       .environmentObject(model)
+  }
+}
+
+/// whoop-lab: export folder, auto-sync toggle and manual export.
+private struct WhoopLabExportSection: View {
+  @ObservedObject var export: WhoopLabAutoExport
+  @State private var pickingFolder = false
+
+  var body: some View {
+    Section("whoop-lab") {
+      LabeledContent("Folder", value: export.folderName ?? "None")
+      LabeledContent("Export", value: export.status)
+      Toggle("Auto history sync (30 min)", isOn: $export.autoHistoricalSync)
+      Button(export.folderName == nil ? "Choose Export Folder…" : "Change Export Folder…") {
+        pickingFolder = true
+      }
+      Button("Export Now") {
+        export.exportNow(reason: "manual")
+      }
+      .disabled(export.folderName == nil)
+    }
+    .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+      if case .success(let url) = result {
+        export.setFolder(url)
+      }
+    }
   }
 }
 
@@ -26,6 +53,8 @@ private struct ConnectionContentView: View {
         LabeledContent("Rust", value: model.rustStatus)
         LabeledContent("Hello", value: model.helloSummary)
       }
+
+      WhoopLabExportSection(export: model.whoopLabExport)
 
       Section("Actions") {
         Button("Request Bluetooth") {

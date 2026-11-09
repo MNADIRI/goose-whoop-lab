@@ -106,7 +106,10 @@ final class GooseBLEClient: NSObject, ObservableObject {
   }()
   let autoHistoricalSyncOnReady: Bool = {
     let processInfo = ProcessInfo.processInfo
-    return processInfo.arguments.contains("--goose-auto-historical-sync")
+    // whoop-lab: also on by default through a persisted setting (toggle in Connection → whoop-lab).
+    let persisted = UserDefaults.standard.object(forKey: WhoopLabAutoExport.autoHistoricalSyncKey) as? Bool ?? true
+    return persisted
+      || processInfo.arguments.contains("--goose-auto-historical-sync")
       || processInfo.environment["GOOSE_AUTO_HISTORICAL_SYNC"] == "1"
   }()
   let diagnosticLoggingEnabled: Bool = {
