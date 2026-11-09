@@ -2466,6 +2466,10 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(timeline_from_decoded_frames_bridge)
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "whoop_lab.reparse_r18_history" => request_args::<StorageCheckArgs>(&request)
+            .and_then(reparse_r18_history_bridge)
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "storage.check" => request_args::<StorageCheckArgs>(&request)
             .and_then(storage_check_bridge)
             .map(|value| bridge_ok(&request.request_id, value))
@@ -2752,6 +2756,15 @@ fn timeline_from_decoded_frames_bridge(args: TimelineArgs) -> GooseResult<serde_
     let rows = packet_timeline_from_decoded_frames(&args.decoded_frames)?;
     serde_json::to_value(rows)
         .map_err(|error| GooseError::message(format!("cannot serialize timeline rows: {error}")))
+}
+
+fn reparse_r18_history_bridge(args: StorageCheckArgs) -> GooseResult<serde_json::Value> {
+    if args.database_path.trim().is_empty() {
+        return Err(GooseError::message("database_path is required"));
+    }
+    let store = GooseStore::open(Path::new(&args.database_path))?;
+    let (examined, updated) = store.reparse_r18_history_frames()?;
+    Ok(json!({ "examined": examined, "updated": updated }))
 }
 
 fn storage_check_bridge(args: StorageCheckArgs) -> GooseResult<serde_json::Value> {

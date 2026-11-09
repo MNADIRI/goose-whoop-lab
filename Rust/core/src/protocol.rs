@@ -132,6 +132,9 @@ pub enum DataPacketBodySummary {
         hr_present: Option<bool>,
         marker_offset: Option<usize>,
         marker_value: Option<u8>,
+        /// whoop-lab: fields of a complete WHOOP 5.0 R18 biometric summary (124-byte frame).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r18: Option<R18HistoryFields>,
     },
     R17OpticalOrLabradorFiltered {
         flags: Option<u16>,
@@ -154,6 +157,73 @@ pub enum DataPacketBodySummary {
         axes: Vec<I16SeriesSummary>,
         warnings: Vec<String>,
     },
+}
+
+/// whoop-lab: R18 layout per the NOOP WHOOP 5.0 sensor contract (docs/PROTOCOL_SENSORS.md, R18).
+/// Offsets below are payload offsets (frame offset minus 8). Field names are chosen so the step
+/// discovery recognises `step_count` (device counter) and `activity_class` (activity state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R18HistoryFields {
+    /// Frame 22.
+    pub heart_rate_bpm: u8,
+    /// Frame 23 count, frame 24 + 2i words in 1/1024 s, converted with (ticks * 1000 + 512) / 1024.
+    pub rr_intervals_ms: Vec<u16>,
+    /// Hardware pedometer count: frame 57, or frame 61 while the software override is active.
+    pub step_count: u16,
+    /// Frame 64 == 0x10: software counter override active.
+    pub counter_override_active: bool,
+    /// Frame 63: 0 still, 1 walk, 2 run; other values are not surfaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_class: Option<String>,
+    /// Frame 73 raw/100 °C, kept as hundredths; only 5–45 °C is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin_temperature_centi_c: Option<u16>,
+    /// Frame 81 bits 4–5: band motion/rest state (wake, still, sleep, up). Not a sleep stage.
+    pub band_state: String,
+}
+
+pub const R18_MIN_PAYLOAD_LEN: usize = 112;
+
+pub fn parse_r18_history_fields(payload: &[u8]) -> Option<R18HistoryFields> {
+    if payload.get(1).copied() != Some(18) || payload.len() < R18_MIN_PAYLOAD_LEN {
+        return None;
+    }
+    let heart_rate_bpm = *payload.get(14)?;
+    let rr_count = usize::from(*payload.get(15)?).min(4);
+    let rr_intervals_ms = (0..rr_count)
+        .filter_map(|index| read_u16_le(payload, 16 + index * 2))
+        .filter(|ticks| *ticks > 0)
+        .map(|ticks| ((u32::from(ticks) * 1000 + 512) / 1024) as u16)
+        .collect();
+    let counter_override_active = payload.get(56).copied() == Some(0x10);
+    let step_count = if counter_override_active {
+        read_u16_le(payload, 53)?
+    } else {
+        read_u16_le(payload, 49)?
+    };
+    let activity_class = match payload.get(55).copied() {
+        Some(0) => Some("still".to_string()),
+        Some(1) => Some("walk".to_string()),
+        Some(2) => Some("run".to_string()),
+        _ => None,
+    };
+    let skin_temperature_centi_c = read_u16_le(payload, 65).filter(|raw| (500..=4500).contains(raw));
+    let band_state = match (payload.get(73)? >> 4) & 3 {
+        0 => "wake",
+        1 => "still",
+        2 => "sleep",
+        _ => "up",
+    }
+    .to_string();
+    Some(R18HistoryFields {
+        heart_rate_bpm,
+        rr_intervals_ms,
+        step_count,
+        counter_override_active,
+        activity_class,
+        skin_temperature_centi_c,
+        band_state,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +595,7 @@ fn parse_data_packet_body_summary(
                 hr_present: hr_present_marker.map(|marker| marker != 0),
                 marker_offset: hr_marker_offset,
                 marker_value: hr_present_marker,
+                r18: parse_r18_history_fields(payload),
             }),
             Vec::new(),
         ),

@@ -16,6 +16,7 @@ use crate::{
         OFFICIAL_WHOOP_LABEL_POLICY, official_label_policy_issue_action,
         official_label_policy_issues,
     },
+    whoop_lab_k18,
 };
 
 pub const RESTING_HEART_RATE_DAILY_ROLLUP_REPORT_SCHEMA: &str =
@@ -34,6 +35,8 @@ pub const GOOSE_RECOVERY_UNAVAILABLE_STATUS_V0_VERSION: &str = "0.1.0";
 pub const GOOSE_RECOVERY_SENSOR_DEVICE_SENSOR_V0_ID: &str =
     "goose.recovery_sensor.device_sensor.v0";
 pub const GOOSE_RECOVERY_SENSOR_DEVICE_SENSOR_V0_VERSION: &str = "0.1.0";
+/// whoop-lab: confidence for R18-derived recovery values (no official labels to validate against).
+const WHOOP_LAB_K18_CONFIDENCE: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RestingHeartRateDailyRollupOptions<'a> {
@@ -822,19 +825,53 @@ fn recovery_sensor_daily_metric_status_for_widget(
     end_time_unix_ms: i64,
 ) -> GooseResult<RecoverySensorDailyMetricStatus> {
     let metric_name = recovery_metric_name(&widget.metric_id).to_string();
-    let value = recovery_sensor_metric_value(widget, discovery, options.date_key);
+    let mut value = recovery_sensor_metric_value(widget, discovery, options.date_key);
     let mut blocker_reasons = widget.blocker_reasons.clone();
     blocker_reasons.extend(value.blocker_reasons.clone());
+
+    // whoop-lab: when goose's own discovery cannot promote HRV or skin temperature, fall back to
+    // the WHOOP 5.0 R18 path (successive rest/sleep beats; sleep temperature vs personal baseline).
+    let mut whoop_lab_value = false;
+    if !(widget.promotion_allowed && value.local_value.is_some()) {
+        match whoop_lab_k18::k18_recovery_value(
+            store,
+            &widget.metric_id,
+            start_time_unix_ms,
+            end_time_unix_ms,
+        )? {
+            Some(k18) => {
+                value = RecoverySensorMetricValue {
+                    local_value: Some(k18.value),
+                    unit: recovery_metric_unit(&widget.metric_id).to_string(),
+                    value_source: Some(k18.value_source.to_string()),
+                    input_ids: k18.input_ids,
+                    blocker_reasons: Vec::new(),
+                };
+                blocker_reasons.clear();
+                whoop_lab_value = true;
+            }
+            None => match widget.metric_id.as_str() {
+                "hrv_rmssd_ms" => blocker_reasons.push("whoop_lab_k18_not_enough_rest_beats".to_string()),
+                "skin_temperature_delta_c" => {
+                    blocker_reasons.push("whoop_lab_k18_sleep_baseline_building".to_string())
+                }
+                _ => {}
+            },
+        }
+    }
     blocker_reasons.sort();
     blocker_reasons.dedup();
 
-    let promotable_value = widget.promotion_allowed && value.local_value.is_some();
+    let promotable_value =
+        (widget.promotion_allowed || whoop_lab_value) && value.local_value.is_some();
     let source_kind = if promotable_value {
         "device_sensor"
     } else {
         "unavailable"
     };
-    let confidence = if promotable_value {
+    let confidence = if whoop_lab_value {
+        WHOOP_LAB_K18_CONFIDENCE
+    } else if promotable_value {
         widget.confidence
     } else {
         0.0
@@ -890,7 +927,11 @@ fn recovery_sensor_daily_metric_status_for_widget(
             "value_source": value.value_source,
             "input_ids": value.input_ids,
             "discovery_report_schema": discovery.schema,
-            "promotion_policy": "requires_recovery_sensor_discovery_promotable_widget_and_validated_value",
+            "promotion_policy": if whoop_lab_value {
+                "whoop_lab_k18_r18_history_path"
+            } else {
+                "requires_recovery_sensor_discovery_promotable_widget_and_validated_value"
+            },
             "official_labels_policy": "not_used",
         })
         .to_string();

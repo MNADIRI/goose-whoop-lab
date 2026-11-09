@@ -1902,6 +1902,78 @@ impl GooseStore {
         }
     }
 
+    /// whoop-lab: re-parse stored R18 history frames decoded before the parser exposed the
+    /// `r18` body fields, so step, HRV and temperature extraction also cover older history.
+    /// Returns (frames examined, frames updated).
+    pub fn reparse_r18_history_frames(&self) -> GooseResult<(usize, usize)> {
+        let rows = {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT decoded_frames.frame_id, raw_evidence.payload_hex
+                FROM decoded_frames
+                JOIN raw_evidence ON raw_evidence.evidence_id = decoded_frames.evidence_id
+                WHERE decoded_frames.packet_type = 47
+                  AND decoded_frames.raw_len = 124
+                  AND instr(decoded_frames.parsed_payload_json, '"r18"') = 0
+                "#,
+            )?;
+            let mapped = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let examined = rows.len();
+        let mut updated = 0usize;
+        let transaction = self.conn.unchecked_transaction()?;
+        for (frame_id, frame_hex) in rows {
+            let Ok(frame) = hex::decode(frame_hex.trim()) else {
+                continue;
+            };
+            let Ok(parsed) = crate::protocol::parse_frame(DeviceType::Goose, &frame) else {
+                continue;
+            };
+            let parsed_payload_json = serde_json::to_string(&parsed.parsed_payload)
+                .map_err(|error| GooseError::message(error.to_string()))?;
+            if !parsed_payload_json.contains("\"r18\"") {
+                continue;
+            }
+            updated += transaction.execute(
+                "UPDATE decoded_frames SET parsed_payload_json = ?1 WHERE frame_id = ?2",
+                params![parsed_payload_json, frame_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok((examined, updated))
+    }
+
+    /// whoop-lab: decoded R18 records whose device timestamp is in [start_seconds, end_seconds),
+    /// ordered by device time, one per timestamp. Returns (unix seconds, frame_id, r18 JSON).
+    pub fn k18_history_records(
+        &self,
+        start_seconds: i64,
+        end_seconds: i64,
+    ) -> GooseResult<Vec<(i64, String, String)>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT CAST(json_extract(parsed_payload_json, '$.timestamp_seconds') AS INTEGER) AS ts,
+                   MIN(frame_id),
+                   json_extract(parsed_payload_json, '$.body_summary.r18')
+            FROM decoded_frames
+            WHERE packet_type = 47
+              AND raw_len = 124
+              AND instr(parsed_payload_json, '"r18"') > 0
+              AND CAST(json_extract(parsed_payload_json, '$.timestamp_seconds') AS INTEGER) >= ?1
+              AND CAST(json_extract(parsed_payload_json, '$.timestamp_seconds') AS INTEGER) < ?2
+            GROUP BY ts
+            ORDER BY ts
+            "#,
+        )?;
+        let rows = statement.query_map(params![start_seconds, end_seconds], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(GooseError::from)
+    }
+
     pub fn insert_decoded_frame(&self, input: DecodedFrameInput<'_>) -> GooseResult<bool> {
         validate_required("frame_id", input.frame_id)?;
         validate_required("evidence_id", input.evidence_id)?;
@@ -3808,7 +3880,7 @@ impl GooseStore {
                 && existing.evidence_id.as_deref() == input.evidence_id
                 && existing.capture_session_id.as_deref() == input.capture_session_id
                 && existing.quality_flags_json == input.quality_flags_json
-                && existing.provenance_json == input.provenance_json;
+                && same_step_sample_provenance(&existing.provenance_json, input.provenance_json);
             if same {
                 return Ok(false);
             }
@@ -7043,6 +7115,26 @@ fn validate_metric_debug_feature_input(input: &MetricDebugFeatureInput<'_>) -> G
     validate_json("quality_flags_json", input.quality_flags_json)?;
     validate_json_object("provenance_json", input.provenance_json)?;
     Ok(())
+}
+
+/// whoop-lab: step sample provenance records the ingest window (`start`/`end`) and the database
+/// path, which legitimately change between runs (moving window, app container path). They do not
+/// describe the sample, so a re-ingest that differs only there is the same sample, not a conflict.
+fn same_step_sample_provenance(existing: &str, incoming: &str) -> bool {
+    if existing == incoming {
+        return true;
+    }
+    let (Ok(Value::Object(mut existing)), Ok(Value::Object(mut incoming))) = (
+        serde_json::from_str::<Value>(existing),
+        serde_json::from_str::<Value>(incoming),
+    ) else {
+        return false;
+    };
+    for volatile in ["start", "end", "database_path"] {
+        existing.remove(volatile);
+        incoming.remove(volatile);
+    }
+    existing == incoming
 }
 
 fn validate_step_counter_sample_input(input: &StepCounterSampleInput<'_>) -> GooseResult<()> {
