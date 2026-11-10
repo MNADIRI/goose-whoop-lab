@@ -207,12 +207,46 @@ th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}}.ca
 {''.join(sections)}</main></body></html>"""
 
 
+def app_payload(result: dict) -> dict:
+    """Compact results for the iOS app (schema whoop-lab.results.v1)."""
+    nights = [n for n in result["nights"] if n.get("available")]
+    days = [d for d in result["days"] if d.get("steps") is not None]
+    code = {"wake": "W", "rem": "R", "light": "L", "deep": "D"}
+    def night(n: dict) -> dict:
+        keep = {k: v for k, v in n.items() if k != "hypnogram"}
+        keep["hypnogram"] = "".join(code[s] for s in n["hypnogram"])
+        return keep
+    def day(d: dict) -> dict:
+        return {k: v for k, v in d.items() if k != "hourly"} | {"hourly": {str(h): v for h, v in d["hourly"].items()}}
+    dev = dict(result["device"])
+    dev["battery_mv"] = dev["battery_mv"][-1:] if dev["battery_mv"] else []
+    return {"schema": "whoop-lab.results.v1", "generated": result["generated"],
+            "last_night": night(nights[-1]) if nights else None, "today": day(days[-1]) if days else None,
+            "nights": [{k: v for k, v in night(n).items() if k != "hypnogram"} for n in nights[-30:]],
+            "load": result.get("load"),
+            "device": dev}
+
+
+def write_app_results(result: dict) -> Path:
+    """Write results/latest.json next to the raw chunks in iCloud Drive, atomically."""
+    import json
+    import import_raw
+    folder = import_raw.DEFAULT_SOURCE / "results"
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / ".latest.json.tmp"
+    tmp.write_text(json.dumps(app_payload(result), separators=(",", ":"), default=float), encoding="utf-8")
+    final = folder / "latest.json"
+    tmp.replace(final)
+    return final
+
+
 def main() -> int:
     subprocess.run([sys.executable, str(HERE / "ingest.py")], check=True, capture_output=True)
     result = analyze.run()
     out = HERE / "report.html"
     out.write_text(render(result), encoding="utf-8")
     print(out)
+    print(write_app_results(result))
     return 0
 
 

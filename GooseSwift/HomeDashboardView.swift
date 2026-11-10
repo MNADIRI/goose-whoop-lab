@@ -4,11 +4,13 @@ struct HomeDashboardView: View {
   @EnvironmentObject private var model: GooseAppModel
   @EnvironmentObject private var router: AppRouter
   @ObservedObject var healthStore: HealthDataStore
+  @ObservedObject var labResults: WhoopLabResultsStore
   @Binding var selectedDate: Date
   let openHealthRoute: (HealthRoute) -> Void
   @State private var showingScoreDatePicker = false
   @State private var showingCardioLoadSheet = false
   @State private var selectedHealthMonitorTrend: HealthMetricSnapshot?
+  private let labRefreshTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
   var body: some View {
     ScrollView {
@@ -29,16 +31,33 @@ struct HomeDashboardView: View {
 
         HomeCardioLoadWidget(
           snapshot: landingSnapshot(for: .cardioLoad),
-          days: healthStore.cardioLoadWeeklyPoints()
+          days: labResults.results?.cardioLoadDays() ?? healthStore.cardioLoadWeeklyPoints()
         ) {
           showingCardioLoadSheet = true
           model.recordUIAction("health.sheet.opened", detail: "Cardio Load home widget")
         }
 
         HomeHealthMonitorSection(
-          snapshots: healthStore.healthMonitorSnapshots(allowLiveFallbacks: false),
+          snapshots: healthStore.healthMonitorSnapshots(allowLiveFallbacks: false).map(labOverlay),
           openSnapshot: openHealthMonitorSnapshot
         )
+
+        if let results = labResults.results {
+          if let night = results.lastNight, night.available {
+            LabNightSection(night: night)
+          }
+          if let day = results.today {
+            LabDaySection(day: day)
+          }
+          if let load = results.load {
+            LabLoadSection(load: load)
+          }
+          LabTrendSection(nights: results.nights.filter(\.available))
+          LabQualitySection(device: results.device)
+        }
+        Text("Analyses : \(labResults.status)")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
 
         HomeTimelineSection(
           sleep: homeSnapshot(for: .sleep),
@@ -55,6 +74,9 @@ struct HomeDashboardView: View {
       .padding(.vertical, 18)
     }
     .scrollClipDisabled()
+    .refreshable { reloadLabResults() }
+    .onAppear { reloadLabResults() }
+    .onReceive(labRefreshTimer) { _ in reloadLabResults() }
     .gooseScreenBackground()
     .navigationTitle("Today")
     .navigationBarTitleDisplayMode(.inline)
@@ -166,7 +188,16 @@ struct HomeDashboardView: View {
   }
 
   private func landingSnapshot(for route: HealthRoute) -> HealthMetricSnapshot {
-    landingSnapshots.first { $0.route == route } ?? healthStore.snapshot(for: route)
+    labOverlay(landingSnapshots.first { $0.route == route } ?? healthStore.snapshot(for: route))
+  }
+
+  /// whoop-lab: Mac lab values replace goose's own for the metrics the lab computes.
+  private func labOverlay(_ snapshot: HealthMetricSnapshot) -> HealthMetricSnapshot {
+    labResults.results?.overlay(snapshot) ?? snapshot
+  }
+
+  private func reloadLabResults() {
+    labResults.refresh(folder: model.whoopLabExport.resolveFolder())
   }
 
   private func homeSnapshot(for route: HealthRoute) -> HealthMetricSnapshot {

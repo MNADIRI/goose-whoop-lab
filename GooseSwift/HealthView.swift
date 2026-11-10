@@ -6,6 +6,7 @@ import UIKit
 struct HealthView: View {
   @EnvironmentObject private var model: GooseAppModel
   @ObservedObject var store: HealthDataStore
+  @ObservedObject var labResults: WhoopLabResultsStore
 
   var body: some View {
     ScrollView {
@@ -76,7 +77,12 @@ struct HealthView: View {
   }
 
   private var vitalSnapshots: [HealthMetricSnapshot] {
-    Array(store.healthMonitorSnapshots().prefix(4))
+    Array(store.healthMonitorSnapshots().prefix(4)).map(labOverlay)
+  }
+
+  /// whoop-lab: same values as Home for the metrics the Mac lab computes.
+  private func labOverlay(_ snapshot: HealthMetricSnapshot) -> HealthMetricSnapshot {
+    labResults.results?.overlay(snapshot) ?? snapshot
   }
 
   private var liveHeartRateValue: String {
@@ -101,7 +107,7 @@ struct HealthView: View {
 
   private func snapshots(for routes: [HealthRoute]) -> [HealthMetricSnapshot] {
     routes.compactMap { route in
-      landingSnapshots.first { $0.route == route } ?? store.snapshot(for: route)
+      labOverlay(landingSnapshots.first { $0.route == route } ?? store.snapshot(for: route))
     }
   }
 

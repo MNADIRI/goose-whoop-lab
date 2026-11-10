@@ -72,11 +72,12 @@ struct AppShellView: View {
     case .home:
       HomeDashboardView(
         healthStore: healthStore,
+        labResults: model.labResults,
         selectedDate: $homeSelectedDate,
         openHealthRoute: openHomeHealthRoute
       )
     case .health:
-      HealthView(store: healthStore)
+      HealthView(store: healthStore, labResults: model.labResults)
     case .coach:
       CoachView(healthStore: healthStore)
     case .more:

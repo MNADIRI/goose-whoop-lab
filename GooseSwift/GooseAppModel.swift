@@ -54,6 +54,7 @@ final class GooseAppModel: ObservableObject {
 
   let ble: GooseBLEClient
   let whoopLabExport = WhoopLabAutoExport()
+  let labResults = WhoopLabResultsStore()
   let packetMonitor = PacketMonitorModel()
   let activitySession = ActivitySessionModel()
   let activityLocationTracker = ActivityLocationTracker()

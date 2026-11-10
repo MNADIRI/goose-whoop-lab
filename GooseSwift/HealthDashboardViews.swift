@@ -360,8 +360,19 @@ struct HealthRouteContentView: View {
   let route: HealthRoute
   @ObservedObject var store: HealthDataStore
   var selectedDate: Binding<Date>? = nil
+  @EnvironmentObject private var model: GooseAppModel
 
   var body: some View {
+    // whoop-lab: metric screens show the lab's values so every display shares one source.
+    if let results = model.labResults.results, LabResults.coveredRoutes.contains(route) {
+      LabRouteDetailView(route: route, results: results)
+    } else {
+      gooseContent
+    }
+  }
+
+  @ViewBuilder
+  private var gooseContent: some View {
     switch route {
     case .healthMonitor:
       HealthMonitorView(store: store)

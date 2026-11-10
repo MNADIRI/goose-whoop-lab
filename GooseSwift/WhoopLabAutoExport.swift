@@ -127,7 +127,7 @@ final class WhoopLabAutoExport: ObservableObject {
     }
   }
 
-  private func resolveFolder() -> URL? {
+  func resolveFolder() -> URL? {
     guard let bookmark = defaults.data(forKey: bookmarkKey) else {
       return nil
     }

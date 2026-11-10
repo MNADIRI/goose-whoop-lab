@@ -18,7 +18,7 @@ struct HealthPreviewRouteHost: View {
 
 #Preview("Health Landing") {
   NavigationStack {
-    HealthView(store: HealthDataStore())
+    HealthView(store: HealthDataStore(), labResults: WhoopLabResultsStore())
   }
   .environmentObject(GooseAppModel(startBLE: false))
 }

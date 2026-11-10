@@ -326,12 +326,55 @@ def analyze_day(db: sqlite3.Connection, day: dt.date, profile: dict, resting_hr:
             dd = np.diff(st[m]); hourly[h] = {"hr": round(float(np.nanmean(bio.hr[m])), 1), "steps": int(np.sum(dd[(dd > 0) & (dd < 300)])),
                                               "move": round(float(np.nanmean(bio.dyn[m])) * 1000, 1), "skin": round(float(np.nanmean(bio.skin[m])), 2)}
     wrist_on_pct = round(100 * float(np.mean(bio.wrist == 0)), 1)
+    stress = stress_index(bio, rhr, hrmax)
     out.update({"steps": steps, "walk_min": round(float(np.sum(bio.activity == "walk")) / 60, 1),
                 "run_min": round(float(np.sum(bio.activity == "run")) / 60, 1), "mvpa_min": mvpa, "hr_zone_min": zone_min,
                 "edwards_trimp": round(trimp, 1), "strain_0_21": strain, "hrmax_used": round(hrmax), "energy": kcal,
                 "hr_mean": round(float(np.nanmean(bio.hr)), 1), "hr_min": int(np.nanmin(bio.hr)), "hr_max": int(np.nanmax(bio.hr)),
-                "hourly": hourly, "wrist_bits0_pct": wrist_on_pct, "age_default_used": not profile.get("age")})
+                "hourly": hourly, "wrist_bits0_pct": wrist_on_pct, "stress": stress, "age_default_used": not profile.get("age")})
     return out
+
+
+def stress_index(bio: Bio, rhr: float, hrmax: float) -> dict | None:
+    """Physiological stress while awake and not moving: HR elevation above resting HR as a share of
+    the HR reserve, per 5-min bucket, only where the band reports no activity (activity still,
+    dynamic acceleration < 0.03 g) so exercise does not count. 0-25 rest, 26-50 low, 51-75 medium,
+    76-100 high (same banding as common consumer stress scores)."""
+    awake = ~np.isin(bio.band, ["sleep"])
+    calm = (bio.activity == "still") & (np.nan_to_num(bio.dyn, nan=1) < 0.03)
+    mask = awake & calm & np.isfinite(bio.hr)
+    if mask.sum() < 600:
+        return None
+    reserve = max(hrmax - rhr, 1)
+    level = np.clip((bio.hr - rhr) / (0.4 * reserve), 0, 1) * 100
+    buckets = (bio.ts - bio.ts[0]) // 300
+    scores = []
+    for b in np.unique(buckets[mask]):
+        m = mask & (buckets == b)
+        if m.sum() >= 120:
+            scores.append(float(np.mean(level[m])))
+    if not scores:
+        return None
+    arr = np.array(scores)
+    bands = {"repos": 0.0, "bas": 0.0, "moyen": 0.0, "haut": 0.0}
+    for v in arr:
+        key = "repos" if v <= 25 else "bas" if v <= 50 else "moyen" if v <= 75 else "haut"
+        bands[key] += 5
+    return {"mean": round(float(arr.mean())), "max": round(float(arr.max())), "minutes": bands, "buckets": len(arr)}
+
+
+def training_load(days: list[dict]) -> dict | None:
+    """Acute (7-day) and chronic (28-day) Edwards TRIMP load and their ratio (ACWR, Gabbett 2016).
+    Days without data count as 0; the ratio is only reported with >= 21 days of history."""
+    series = [(d["date"], d.get("edwards_trimp") or 0.0) for d in days if d.get("coverage_h")]
+    if not series:
+        return None
+    values = [v for _, v in series]
+    acute = sum(values[-7:])
+    chronic_weekly = sum(values[-28:]) / max(1, min(len(values), 28)) * 7
+    ratio = round(acute / chronic_weekly, 2) if len(values) >= 21 and chronic_weekly > 0 else None
+    return {"acute_7d": round(acute, 1), "chronic_28d_weekly": round(chronic_weekly, 1), "acwr": ratio,
+            "days": len(values), "daily": [{"date": d, "trimp": round(v, 1)} for d, v in series[-28:]]}
 
 
 def energy(hr: np.ndarray, p: dict, rhr: float) -> dict:
@@ -385,6 +428,7 @@ def run(db_path: Path = DEFAULT_DB) -> dict:
         days.append(analyze_day(db, day, profile, rhr_by_date.get(prev_night)))
         day += dt.timedelta(days=1)
     return {"generated": int(dt.datetime.now().timestamp()), "profile": profile, "nights": nights, "days": days,
+            "load": training_load(days),
             "device": device_summary(db)}
 
 
