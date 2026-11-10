@@ -40,6 +40,7 @@ pub mod timeline;
 pub mod tool_args;
 pub mod ui_coverage;
 pub mod validation_labels;
+pub mod whoop_lab_analysis;
 pub mod whoop_lab_k18;
 
 pub use error::{GooseError, GooseResult};

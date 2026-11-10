@@ -23,9 +23,14 @@ struct AppShellView: View {
     }
     .onReceive(model.ble.$lastHistoricalSyncCompletedAt.compactMap { $0 }) { _ in
       healthStore.refreshPacketInputsAfterCapture()
+      // whoop-lab: new history -> re-run the day analysis (cached, ~50 ms when nothing changed)
+      if UIApplication.shared.applicationState != .background {
+        model.labResults.refresh(force: true)
+      }
     }
     .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
       healthStore.refreshPacketInputsIfNeeded()
+      model.labResults.refresh(force: true)
     }
   }
 

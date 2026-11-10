@@ -1,12 +1,15 @@
 # WHOOP 5.0 : des capteurs à l'écran
 
-Source unique : toutes les valeurs physiologiques affichées dans l'app (Home, Health, écrans de détail)
-viennent du labo Mac (`lab/analyze.py` → `iCloud Drive/whoop-lab/results/latest.json`). L'app ne garde
-ses propres calculs que tant que le labo n'a pas encore de résultat, et pour les écrans de diagnostic
-(Packet Inputs, Algorithms, Reference Comparisons, Calibration).
+Source unique : toutes les valeurs physiologiques de l'app sont calculées **sur l'iPhone** par le cœur
+Rust (`Rust/core/src/whoop_lab_analysis.rs`, méthode de pont `whoop_lab.analyze`). C'est un portage du
+labo Python de référence (`lab/analyze.py`), qui sert à valider le Rust et à produire le rapport HTML.
 
-Chaîne : bracelet → BLE → goose (iPhone, trames brutes en base) → export iCloud toutes les 10 min →
-`ingest.py` (décodage, tables typées) → `analyze.py` → `report.py` (rapport HTML + `latest.json`) → app.
+Chaîne : bracelet → BLE → trames vérifiées (CRC) dans `decoded_frames` → table 1 Hz `whoop_lab_biometric`
+(incrémentale) → analyse par jour local, du premier jour de données à aujourd'hui, mise en cache dans
+`whoop_lab_days` (un jour n'est recalculé que si ses données changent) → `WhoopLabResultsStore` → écrans.
+
+Écrans : **Aujourd'hui** (Home) = un jour à la fois, avec sélecteur de jour ; **Tendances** (Health) =
+historique de chaque mesure ; écrans de détail = même vue ; **Diagnostic** = rapports internes goose.
 
 ## 1. Données brutes extraites
 
@@ -37,25 +40,25 @@ Non disponible : SpO₂ (aucun champ fiable dans les trames, rien n'est inventé
 
 | Valeur affichée | Entrées | Méthode | Où dans l'app |
 |---|---|---|---|
-| **Période de sommeil** (coucher, endormissement, réveil, temps au lit) | État du bracelet, gravité | Plus long bloc « sommeil » (trous ≤ 20 min fusionnés), étendu en arrière sur « immobile » pour le coucher | Home › Nuit, Health › Sleep |
+| **Période de sommeil** (coucher, endormissement, réveil, temps au lit) | État du bracelet, gravité | Plus long bloc « sommeil » (trous ≤ 20 min fusionnés), étendu en arrière sur « immobile » pour le coucher | Aujourd'hui › Nuit |
 | **Sommeil / éveil par époque de 30 s** | Gravité | Cole-Kripke (poids te Lindert 30 s) sur la variation de gravité au-dessus d'un plancher de bruit de 10 mg ; échelle /1000 pour que le retournement isolé reste du sommeil | Hypnogramme |
-| **Stades** (léger, profond, paradoxal, éveil) | FC, R-R, mouvement | Règles transparentes : profond = FC basse + VFC locale haute + immobile, 1re moitié ; paradoxal = variabilité de FC haute, immobile, après 60 min ; sinon léger ; époque isolée lissée. Approximatif, sans EEG | Home › Nuit, hypnogramme |
-| **Efficacité, latence, réveils** | Stades, temps au lit | sommeil / temps au lit ; endormissement − coucher ; passages vers l'éveil | Home › Nuit |
-| **Score Sommeil (%)** | Durée de sommeil | sommeil / 8 h (plafonné à 100) | Home › scores |
-| **FC au repos** | FC pendant le sommeil | Plus basse moyenne glissante de 5 min | Home › Moniteur, Nuit |
-| **VFC : RMSSD, SDNN, pNN50, ln RMSSD** | R-R pendant le sommeil | Battements réellement successifs uniquement (secondes consécutives, 300–2000 ms, saut ≤ 20 %, ≥ 100 différences) ; nuit entière et dernier tiers | Home › Moniteur (RMSSD), Nuit |
-| **Fréquence respiratoire** | R-R pendant le sommeil | Arythmie sinusale respiratoire : tachogramme 1 Hz, fenêtres de 2 min couvertes ≥ 80 %, pic Welch 0,13–0,45 Hz ≥ 3× la médiane de la bande, médiane des fenêtres | Home › Moniteur, Nuit |
-| **Température peau** | Peau (R18) pendant le sommeil | Médiane de la nuit ; écart = nuit − moyenne des nuits précédentes (≥ 3) | Home › Moniteur (écart, ou absolu tant que la référence se construit) |
-| **Récupération (0–100)** | ln RMSSD, FC au repos | z-scores vs ta référence (≥ 3 nuits), 0,6×z VFC + 0,4×(−z FC), logistique | Home › scores, Nuit |
-| **Pas** | Compteur de pas | Somme des incréments positifs (< 300/s, ignore les remises à zéro) | Home › Journée |
-| **Marche / course** | Classe d'activité | Secondes classées marche/course | Home › Journée |
-| **Zones FC, activité modérée+** | FC, âge | %FCmax (Tanaka 208−0,7×âge) ; modérée+ = ≥ 40 % réserve cardiaque | Home › Journée |
-| **Charge du jour (0–21)** | Zones FC | TRIMP d'Edwards (minutes × numéro de zone), ramené sur 0–21 | Home › scores (Strain, en %), Journée |
-| **Charge cardio 7 j / 28 j, ratio A/C** | TRIMP quotidiens | Somme 7 j ; moyenne hebdo sur 28 j ; ACWR (Gabbett) après 21 jours | Home › Cardio Load, Health › Cardio Load |
-| **Stress (0–100)** | FC, FC repos, activité, accélération | Éveillé et immobile (activité « immobile », accél. < 0,03 g) : (FC − FC repos) / (40 % réserve) par tranche de 5 min ; bandes repos/bas/moyen/haut | Home › Stress, Health › Stress |
-| **Énergie dépensée** | FC, profil | Repos : Mifflin-St Jeor ; actif : Keytel 2005 au-dessus de FC repos + 20 | Home › carte « Énergie dépensée » (remplace Energy Bank), Journée |
-| **FC journée, par heure** | FC | moyenne, min, max ; moyenne horaire | Home › Journée (graphique) |
-| **Qualité** | Toutes les secondes R18, R26 | Couverture 1 Hz ; % de fenêtres optiques acceptées | Home › Qualité |
+| **Stades** (léger, profond, paradoxal, éveil) | FC, R-R, mouvement | Règles transparentes : profond = FC basse + VFC locale haute + immobile, 1re moitié ; paradoxal = variabilité de FC haute, immobile, après 60 min ; sinon léger ; époque isolée lissée. Approximatif, sans EEG | Aujourd'hui › Nuit, hypnogramme |
+| **Efficacité, latence, réveils** | Stades, temps au lit | sommeil / temps au lit ; endormissement − coucher ; passages vers l'éveil | Aujourd'hui › Nuit |
+| **Score Sommeil (%)** | Durée de sommeil | sommeil / 8 h (plafonné à 100) | Aujourd'hui › scores |
+| **FC au repos** | FC pendant le sommeil | Plus basse moyenne glissante de 5 min | Aujourd'hui › Moniteur, Nuit |
+| **VFC : RMSSD, SDNN, pNN50, ln RMSSD** | R-R pendant le sommeil | Battements réellement successifs uniquement (secondes consécutives, 300–2000 ms, saut ≤ 20 %, ≥ 100 différences) ; nuit entière et dernier tiers | Aujourd'hui › Moniteur (RMSSD), Nuit |
+| **Fréquence respiratoire** | R-R pendant le sommeil | Arythmie sinusale respiratoire : tachogramme 1 Hz, fenêtres de 2 min couvertes ≥ 80 %, pic Welch 0,13–0,45 Hz ≥ 3× la médiane de la bande, médiane des fenêtres | Aujourd'hui › Moniteur, Nuit |
+| **Température peau** | Peau (R18) pendant le sommeil | Médiane de la nuit ; écart = nuit − moyenne des nuits précédentes (≥ 3) | Aujourd'hui › Moniteur (écart, ou absolu tant que la référence se construit) |
+| **Récupération (0–100)** | ln RMSSD, FC au repos | z-scores vs ta référence (≥ 3 nuits), 0,6×z VFC + 0,4×(−z FC), logistique | Aujourd'hui › scores, Nuit |
+| **Pas** | Compteur de pas | Somme des incréments positifs (< 300/s, ignore les remises à zéro) | Aujourd'hui › Journée |
+| **Marche / course** | Classe d'activité | Secondes classées marche/course | Aujourd'hui › Journée |
+| **Zones FC, activité modérée+** | FC, âge | %FCmax (Tanaka 208−0,7×âge) ; modérée+ = ≥ 40 % réserve cardiaque | Aujourd'hui › Journée |
+| **Charge du jour (0–21)** | Zones FC | TRIMP d'Edwards (minutes × numéro de zone), ramené sur 0–21 | Aujourd'hui › scores (Strain, en %), Journée |
+| **Charge cardio 7 j / 28 j, ratio A/C** | TRIMP quotidiens | Somme 7 j ; moyenne hebdo sur 28 j ; ACWR (Gabbett) après 21 jours | Aujourd'hui › Cardio Load, Health › Cardio Load |
+| **Stress (0–100)** | FC, FC repos, activité, accélération | Éveillé et immobile (activité « immobile », accél. < 0,03 g) : (FC − FC repos) / (40 % réserve) par tranche de 5 min ; bandes repos/bas/moyen/haut | Aujourd'hui › Stress, Health › Stress |
+| **Énergie dépensée** | FC, profil | Repos : Mifflin-St Jeor ; actif : Keytel 2005 au-dessus de FC repos + 20 | Aujourd'hui › carte « Énergie dépensée » (remplace Energy Bank), Journée |
+| **FC journée, par heure** | FC | moyenne, min, max ; moyenne horaire | Aujourd'hui › Journée (graphique) |
+| **Qualité** | Toutes les secondes R18, R26 | Couverture 1 Hz ; % de fenêtres optiques acceptées | Aujourd'hui › Qualité |
 | **Batterie** | Événements 48 | Dernière tension rapportée | Rapport Mac |
 
 ## 3. Cohérence et redondances traitées
@@ -78,4 +81,5 @@ Non disponible : SpO₂ (aucun champ fiable dans les trames, rien n'est inventé
 - Respiration : estimée de la VFC, pas mesurée directement.
 - Énergie et zones : profil par défaut (30 ans, 70 kg, 175 cm, homme) tant que `lab/profile.json` est absent.
 - Récupération et écart de température : après 3 nuits ; ratio A/C après 21 jours.
-- Les valeurs se mettent à jour quand `report.py` tourne sur le Mac.
+- Calories : actives (Keytel) affichées en premier ; la dépense totale ajoute le métabolisme de base, proratisé sur la partie écoulée et portée de la journée.
+- Pas : compteur du bracelet au poignet ; Apple Health compte le téléphone, les totaux diffèrent.

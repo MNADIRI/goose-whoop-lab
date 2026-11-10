@@ -244,6 +244,9 @@ private struct CoachOverviewSnapshot {
     scoreNextAction: String
   ) -> [CoachDataGap] {
     var gaps: [CoachDataGap] = []
+    // whoop-lab: the readiness/feature/score/"missing" entries were goose pipeline diagnostics, not
+    // gaps in the user's data (the on-device analysis now provides every metric). None are listed.
+    return gaps
 
     appendGap(
       &gaps,

@@ -1,84 +1,52 @@
 import SwiftUI
 
+/// Home: one day at a time, from the first day with data to today. Every value comes from the
+/// on-device whoop-lab analysis (WhoopLabResultsStore); see lab/METRICS.md.
 struct HomeDashboardView: View {
   @EnvironmentObject private var model: GooseAppModel
-  @EnvironmentObject private var router: AppRouter
   @ObservedObject var healthStore: HealthDataStore
   @ObservedObject var labResults: WhoopLabResultsStore
   @Binding var selectedDate: Date
   let openHealthRoute: (HealthRoute) -> Void
-  @State private var showingScoreDatePicker = false
-  @State private var showingCardioLoadSheet = false
-  @State private var selectedHealthMonitorTrend: HealthMetricSnapshot?
-  private let labRefreshTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+  @State private var selectedKey: String?
 
   var body: some View {
     ScrollView {
-      LazyVStack(alignment: .leading, spacing: 18) {
-        HomeDailyScoreCard(
-          scores: scoreSnapshots,
-          actionSummary: dailyActionSummary,
-          coachTip: CoachTipFactory.homeTip(healthStore: healthStore, appModel: model),
-          openScore: openHealth,
-          openCoach: openCoach
-        )
-
-        HomeStressEnergySection(
-          stress: landingSnapshot(for: .stress),
-          energy: landingSnapshot(for: .energyBank),
-          openStress: { openHealth(.stress) }
-        )
-
-        HomeCardioLoadWidget(
-          snapshot: landingSnapshot(for: .cardioLoad),
-          days: labResults.results?.cardioLoadDays() ?? healthStore.cardioLoadWeeklyPoints()
-        ) {
-          showingCardioLoadSheet = true
-          model.recordUIAction("health.sheet.opened", detail: "Cardio Load home widget")
+      LazyVStack(alignment: .leading, spacing: 22) {
+        if let results = labResults.results, let current = currentDay(results) {
+          dayPicker(results: results, current: current)
+          LabScoreRow(night: current.night, day: current.day)
+          LabNightSection(night: current.night)
+          if current.night.available {
+            LabBodySection(night: current.night)
+          }
+          if current.day.hasActivity {
+            LabActivitySection(day: current.day)
+          } else {
+            LabSectionHeader(title: "Activité", subtitle: "Pas assez de données ce jour (\(labFmt(current.day.coverageH, 1)) h)")
+          }
+          Text("\(labResults.status) · \(results.device.records.formatted()) secondes enregistrées depuis le \(labDayLabel(results.firstDay ?? "", style: .dateTime.day().month(.wide)))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        } else {
+          ContentUnavailableView(
+            labResults.isRunning ? "Analyse en cours…" : "Pas encore de données",
+            systemImage: "waveform.path.ecg",
+            description: Text("Porte le bracelet et laisse la synchronisation se faire. \(labResults.status)")
+          )
         }
-
-        HomeHealthMonitorSection(
-          snapshots: healthStore.healthMonitorSnapshots(allowLiveFallbacks: false).map(labOverlay),
-          openSnapshot: openHealthMonitorSnapshot
-        )
-
-        if let results = labResults.results {
-          if let night = results.lastNight, night.available {
-            LabNightSection(night: night)
-          }
-          if let day = results.today {
-            LabDaySection(day: day)
-          }
-          if let load = results.load {
-            LabLoadSection(load: load)
-          }
-          LabTrendSection(nights: results.nights.filter(\.available))
-          LabQualitySection(device: results.device)
-        }
-        Text("Analyses : \(labResults.status)")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-
-        HomeTimelineSection(
-          sleep: homeSnapshot(for: .sleep),
-          activity: homeSnapshot(for: .strain),
-          recovery: homeSnapshot(for: .recovery),
-          activities: model.homeActivityTimelineItems,
-          openSleep: { openHealth(.sleep) },
-          openActivity: { openHealth(.strain) },
-          openRecovery: { openHealth(.recovery) }
-        )
-
       }
       .padding(.horizontal, 16)
       .padding(.vertical, 18)
     }
     .scrollClipDisabled()
-    .refreshable { reloadLabResults() }
-    .onAppear { reloadLabResults() }
-    .onReceive(labRefreshTimer) { _ in reloadLabResults() }
+    .refreshable { labResults.refresh(force: true) }
+    .onAppear {
+      labResults.refresh()
+      model.recordUIAction("page.opened", detail: "Home")
+    }
     .gooseScreenBackground()
-    .navigationTitle("Today")
+    .navigationTitle("Aujourd'hui")
     .navigationBarTitleDisplayMode(.inline)
     .toolbarBackground(.hidden, for: .navigationBar)
     .overlay(alignment: .top) {
@@ -91,159 +59,63 @@ struct HomeDashboardView: View {
         .padding(.bottom, 10)
     }
     .toolbar {
-      ToolbarItem(placement: .principal) {
-        ScoreDateTitleButton(
-          title: homeTitle,
-          subtitle: nil,
-          action: { showingScoreDatePicker = true }
-        )
-      }
       ToolbarItem(placement: .topBarTrailing) {
         NavigationLink {
           DeviceView()
         } label: {
           Image(systemName: "applewatch")
             .font(.system(size: 17, weight: .semibold))
-            .symbolRenderingMode(.monochrome)
-            .foregroundStyle(deviceToolbarTint)
+            .foregroundStyle(deviceConnected ? .green : .red)
         }
-        .accessibilityLabel("Device")
-        .accessibilityValue(deviceToolbarAccessibilityValue)
+        .accessibilityLabel("Bracelet")
+        .accessibilityValue(deviceConnected ? "Connecté" : "Déconnecté")
       }
     }
-    .onAppear {
-      model.recordUIAction("page.opened", detail: "Home")
-    }
-    .task {
-      healthStore.loadBridgeCatalogsIfNeeded()
-      model.refreshActivityTimeline(for: selectedDate)
-    }
-    .onChange(of: selectedDate) { _, newValue in
-      model.refreshActivityTimeline(for: newValue)
-    }
-    .sheet(isPresented: $showingScoreDatePicker) {
-      ScoreDatePickerSheet(
-        title: "Daily Scores",
-        routes: [.sleep, .recovery, .strain],
-        snapshots: scorePickerSnapshots,
-        selectedDate: $selectedDate
-      )
-    }
-    .sheet(isPresented: $showingCardioLoadSheet) {
-      CardioLoadSheet(store: healthStore)
-    }
-    .sheet(item: $selectedHealthMonitorTrend) { snapshot in
-      SleepV2BevelTrendSheet(snapshot: snapshot)
-    }
   }
 
-  private var scoreSnapshots: [HealthMetricSnapshot] {
-    [
-      datedHomeSnapshot(for: .sleep),
-      datedHomeSnapshot(for: .recovery),
-      datedHomeSnapshot(for: .strain),
-    ]
-  }
-
-  private var scorePickerSnapshots: [HealthMetricSnapshot] {
-    [
-      homeSnapshot(for: .sleep),
-      homeSnapshot(for: .recovery),
-      homeSnapshot(for: .strain),
-    ]
-  }
-
-  private var homeTitle: String {
-    ScoreDateTimeline.dateLabel(for: selectedDate)
-  }
-
-  private var deviceToolbarTint: Color {
-    deviceToolbarConnected ? .green : .red
-  }
-
-  private var deviceToolbarAccessibilityValue: String {
-    deviceToolbarConnected ? "Connected" : "Disconnected"
-  }
-
-  private var deviceToolbarConnected: Bool {
+  private var deviceConnected: Bool {
     let state = model.ble.connectionState.lowercased()
     return state == "ready" || state == "connected"
   }
 
-  private var dailyActionSummary: String {
-    let inputAction = healthStore.metricInputReadinessNextActionSummary()
-    if !inputAction.isEmpty {
-      return inputAction
+  private func currentDay(_ results: LabResults) -> LabDayResult? {
+    if let key = selectedKey, let day = results.day(key) {
+      return day
     }
-    return healthStore.packetDerivedScoreNextActionSummary()
+    return results.latest
   }
 
-  private var landingSnapshots: [HealthMetricSnapshot] {
-    healthStore.landingSnapshots(
-      liveHeartRateBPM: model.ble.liveHeartRateBPM,
-      liveHeartRateSource: model.ble.liveHeartRateSource,
-      liveHeartRateUpdatedAt: model.ble.liveHeartRateUpdatedAt,
-      stableDailyMetrics: true
-    )
-  }
-
-  private func landingSnapshot(for route: HealthRoute) -> HealthMetricSnapshot {
-    labOverlay(landingSnapshots.first { $0.route == route } ?? healthStore.snapshot(for: route))
-  }
-
-  /// whoop-lab: Mac lab values replace goose's own for the metrics the lab computes.
-  private func labOverlay(_ snapshot: HealthMetricSnapshot) -> HealthMetricSnapshot {
-    labResults.results?.overlay(snapshot) ?? snapshot
-  }
-
-  private func reloadLabResults() {
-    labResults.refresh(folder: model.whoopLabExport.resolveFolder())
-  }
-
-  private func homeSnapshot(for route: HealthRoute) -> HealthMetricSnapshot {
-    let snapshot = landingSnapshot(for: route)
-    guard route == .strain, snapshot.unit != "%" else {
-      return snapshot
-    }
-    let rawValue = firstNumber(in: snapshot.displayValue) ?? firstNumber(in: snapshot.value) ?? 0
-    let percent = min(max(Int((rawValue / 21 * 100).rounded()), 0), 100)
-    return HealthMetricSnapshot(
-      id: snapshot.id,
-      route: snapshot.route,
-      group: snapshot.group,
-      title: snapshot.title,
-      value: "\(percent)",
-      unit: "%",
-      status: snapshot.status,
-      freshness: snapshot.freshness,
-      provenance: snapshot.provenance,
-      source: snapshot.source,
-      systemImage: snapshot.systemImage,
-      tint: snapshot.tint,
-      trend: snapshot.trend
-    )
-  }
-
-  private func datedHomeSnapshot(for route: HealthRoute) -> HealthMetricSnapshot {
-    ScoreDateTimeline.datedSnapshot(from: homeSnapshot(for: route), date: selectedDate)
-  }
-
-  private func openHealth(_ route: HealthRoute) {
-    openHealthRoute(route)
-    model.recordUIAction("health.deep_link.opened", detail: route.title)
-  }
-
-  private func openHealthMonitorSnapshot(_ snapshot: HealthMetricSnapshot) {
-    if snapshot.id == "resting-hr" {
-      selectedHealthMonitorTrend = snapshot
-    } else {
-      openHealth(.healthMonitor)
+  private func dayPicker(results: LabResults, current: LabDayResult) -> some View {
+    let index = results.days.firstIndex { $0.date == current.date } ?? results.days.count - 1
+    return HStack {
+      Button {
+        selectedKey = results.days[max(0, index - 1)].date
+      } label: {
+        Image(systemName: "chevron.left").font(.headline)
+      }
+      .disabled(index == 0)
+      Spacer()
+      VStack(spacing: 2) {
+        Text(index == results.days.count - 1 ? "Aujourd'hui" : labDayLabel(current.date))
+          .font(.headline)
+        Text(current.night.available
+             ? "Nuit du \(previousDayLabel(current.date)) au \(labDayLabel(current.date, style: .dateTime.day().month()))"
+             : labDayLabel(current.date, style: .dateTime.day().month(.wide).year()))
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      Button {
+        selectedKey = results.days[min(results.days.count - 1, index + 1)].date
+      } label: {
+        Image(systemName: "chevron.right").font(.headline)
+      }
+      .disabled(index == results.days.count - 1)
     }
   }
 
-  private func openCoach(_ prompt: String) {
-    router.openCoach(prompt: prompt)
-    model.recordUIAction("coach.opened", detail: "Home daily score card")
+  private func previousDayLabel(_ key: String) -> String {
+    guard let date = labDate(key), let previous = Calendar.current.date(byAdding: .day, value: -1, to: date) else { return "" }
+    return previous.formatted(.dateTime.day().month())
   }
 }
-

@@ -11,40 +11,30 @@ struct HealthView: View {
   var body: some View {
     ScrollView {
       LazyVStack(alignment: .leading, spacing: 22) {
-        HealthDashboardStatusHeader(
-          catalogStatus: store.catalogStatus,
-          usesSampleData: store.usesSampleData
-        )
+        // whoop-lab: Health = history over all days; Home = one day. Same source for both.
+        if let results = labResults.results {
+          LabTrendsView(results: results)
+        } else {
+          Text(labResults.status).font(.caption).foregroundStyle(.secondary)
+        }
 
-        HealthActivityOverviewSection(
-          steps: store.whoopStepsDisplayText(),
-          activeEnergy: store.whoopActiveCaloriesDisplayText(),
-          stepsFreshness: store.whoopStepsStatusText(),
-          stepsSource: store.whoopStepsSource(),
-          activeEnergyFreshness: store.whoopActiveCaloriesStatusText(),
-          activeEnergySource: store.whoopActiveCaloriesSource(),
-          heartRateValue: liveHeartRateValue,
-          heartRateStatus: liveHeartRateStatus,
-          heartRateSource: liveHeartRateSource
-        )
-
-        HealthVitalsPreviewSection(snapshots: vitalSnapshots)
-
-        HealthRouteShortcutSection(
-          title: "Explore Health",
-          snapshots: snapshots(for: [.sleep, .recovery, .strain, .stress, .cardioLoad, .energyBank])
-        )
-
-        HealthRouteShortcutSection(
-          title: "Data & Algorithms",
-          snapshots: snapshots(for: [.packetInputs, .algorithms, .calibration])
-        )
+        VStack(alignment: .leading, spacing: 0) {
+          NavigationLink { LabMethodsView() } label: {
+            Label("Méthodes et sources", systemImage: "function").frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 12)
+          }
+          Divider()
+          NavigationLink(value: HealthRoute.packetInputs) {
+            Label("Diagnostic : trames et pipeline goose", systemImage: "stethoscope").frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 12)
+          }
+        }
+        .padding(.horizontal, 12)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14))
       }
       .padding(.horizontal, 16)
       .padding(.vertical, 18)
     }
     .gooseScreenBackground()
-    .navigationTitle("Health")
+    .navigationTitle("Tendances")
     .navigationBarTitleDisplayMode(.inline)
     .toolbarBackground(.hidden, for: .navigationBar)
     .navigationDestination(for: HealthRoute.self) { route in
@@ -67,54 +57,11 @@ struct HealthView: View {
     }
   }
 
-  private var landingSnapshots: [HealthMetricSnapshot] {
-    store
-      .landingSnapshots(
-        liveHeartRateBPM: model.ble.liveHeartRateBPM,
-        liveHeartRateSource: model.ble.liveHeartRateSource,
-        liveHeartRateUpdatedAt: model.ble.liveHeartRateUpdatedAt
-      )
-  }
-
-  private var vitalSnapshots: [HealthMetricSnapshot] {
-    Array(store.healthMonitorSnapshots().prefix(4)).map(labOverlay)
-  }
-
-  /// whoop-lab: same values as Home for the metrics the Mac lab computes.
-  private func labOverlay(_ snapshot: HealthMetricSnapshot) -> HealthMetricSnapshot {
-    labResults.results?.overlay(snapshot) ?? snapshot
-  }
-
-  private var liveHeartRateValue: String {
-    guard let bpm = model.ble.liveHeartRateBPM else {
-      return "--"
-    }
-    return "\(bpm) bpm"
-  }
-
-  private var liveHeartRateStatus: String {
-    guard model.ble.liveHeartRateBPM != nil else {
-      return store.heartRateTimelineStatus
-    }
-    return HealthDataStore.relativeText(for: model.ble.liveHeartRateUpdatedAt) ?? "Live"
-  }
-
-  private var liveHeartRateSource: HealthDataSource {
-    model.ble.liveHeartRateBPM == nil
-      ? .unavailable("BLE heart-rate stream waiting")
-      : .live(model.ble.liveHeartRateSource)
-  }
-
-  private func snapshots(for routes: [HealthRoute]) -> [HealthMetricSnapshot] {
-    routes.compactMap { route in
-      labOverlay(landingSnapshots.first { $0.route == route } ?? store.snapshot(for: route))
-    }
-  }
-
   @MainActor
   private func refreshDashboard() {
     store.refreshBridgeCatalogs()
     store.refreshHeartRateTimeline()
     store.refreshPacketInputsIfNeeded()
+    labResults.refresh(force: true)
   }
 }
