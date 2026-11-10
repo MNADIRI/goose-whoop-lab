@@ -23,7 +23,7 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "4";
+const ALGORITHM_VERSION: &str = "5"; // 5: signed R26 base, optical gain state
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];

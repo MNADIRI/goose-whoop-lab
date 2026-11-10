@@ -127,6 +127,18 @@ pub fn ingest(conn: &Connection) -> GooseResult<IngestStats> {
         .optional()?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // decoder changed: Layer B is re-derived from the immutable Layer A
+    let stored_version: Option<String> = conn.query_row("SELECT value FROM whoop5_state WHERE key = 'decoder_version'", [], |r| r.get(0)).optional()?;
+    let cursor = if stored_version.as_deref().is_some_and(|v| v != DECODER_VERSION) {
+        conn.execute_batch(
+            "DELETE FROM whoop5_r18; DELETE FROM whoop5_r26; DELETE FROM whoop5_r20_slot; DELETE FROM whoop5_r21;
+             DELETE FROM whoop5_live_hr; DELETE FROM whoop5_events; DELETE FROM whoop5_metadata; DELETE FROM whoop5_console;
+             DELETE FROM whoop5_unknown; DELETE FROM whoop5_state;",
+        )?;
+        0
+    } else {
+        cursor
+    };
     let mut stats = IngestStats { cursor, ..Default::default() };
     let tx = conn.unchecked_transaction()?;
     {

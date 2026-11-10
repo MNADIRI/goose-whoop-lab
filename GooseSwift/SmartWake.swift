@@ -211,6 +211,7 @@ final class MotionProbe: ObservableObject {
 
   func run(keepLiveHR: Bool) {
     guard let ble else { return }
+    outputName = "motion_probe.json"
     lines = []; arrivals = [:]; samples = [:]; r18Latency = [:]
     ble.rawFrameSink = { [weak self] hex, date in
       Task { @MainActor in self?.observe(hex: hex, at: date) }
@@ -244,6 +245,42 @@ final class MotionProbe: ObservableObject {
     _ = keepLiveHR
   }
 
+  /// Optical streams: live optical mode (107 + 108) for 45 s, then persistent R20 (153) recorded
+  /// for 60 s and fetched by a history sync. Everything switched back off at the end.
+  func runOptical() {
+    guard let ble else { return }
+    lines = []; arrivals = [:]; samples = [:]; r18Latency = [:]
+    outputName = "optical_probe.json"
+    ble.rawFrameSink = { [weak self] hex, date in
+      Task { @MainActor in self?.observe(hex: hex, at: date) }
+    }
+    typealias K = GooseBLEClient.SensorStreamCommandKind
+    let on = K.revisionBoolean(true), off = K.revisionBoolean(false)
+    status = "Attente d'un bracelet libre…"
+    ble.whenFreeForCommands(timeout: 60) { [weak self] ble in
+      guard let self else { return }
+      self.begin("C_optical_live")
+      ble.writeSensorStreamCommands([K(commandNumber: 107, payload: on, name: "ENABLE_OPTICAL_DATA_ON"), K(commandNumber: 108, payload: on, name: "TOGGLE_OPTICAL_MODE_ON")], requestedStatus: "Optical probe", updatePhysiologyStatus: false)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
+        self.begin("D_r20_persistent")
+        ble.whenFreeForCommands { $0.writeSensorStreamCommands([K(commandNumber: 153, payload: on, name: "TOGGLE_PERSISTENT_R20_ON")], requestedStatus: "Optical probe R20", updatePhysiologyStatus: false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+          ble.whenFreeForCommands { $0.syncHistoricalPackets() }
+          DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
+            ble.whenFreeForCommands { $0.writeSensorStreamCommands([
+              K(commandNumber: 153, payload: off, name: "TOGGLE_PERSISTENT_R20_OFF"),
+              K(commandNumber: 108, payload: off, name: "TOGGLE_OPTICAL_MODE_OFF"),
+              K(commandNumber: 107, payload: off, name: "ENABLE_OPTICAL_DATA_OFF"),
+            ], requestedStatus: "Optical probe off", updatePhysiologyStatus: false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.finish() }
+          }
+        }
+      }
+    }
+  }
+
+  private var outputName = "motion_probe.json"
+
   private func begin(_ p: String) {
     phase = p
     phaseStart = Date()
@@ -256,7 +293,9 @@ final class MotionProbe: ObservableObject {
     let type = byte(8), layout = byte(9), len = hex.count / 2
     let key = "\(phase)|type\(type)|layout\(layout)|len\(len)"
     arrivals[key, default: []].append(date.timeIntervalSince(phaseStart))
-    if samples[key, default: []].count < 3 { samples[key, default: []].append(String(hex.prefix(160))) }
+    // keep full frames of the large (raw sensor) records for offline decoding, short prefix otherwise
+    let keep = len > 200 ? 6 : 3
+    if samples[key, default: []].count < keep { samples[key, default: []].append(len > 200 ? hex : String(hex.prefix(160))) }
     if type == 47, layout == 18, len == 124 {
       // R18 timestamp: u32 at frame byte 15
       let ts = (15..<19).reversed().reduce(0) { $0 << 8 | byte($1) }
@@ -280,9 +319,25 @@ final class MotionProbe: ObservableObject {
       out.append(["key": "\(p)|r18_latency", "frames": s.count, "median_s": med, "min_s": minL, "max_s": s.last ?? 0])
       lines.append("\(p) retard R18 : médian \(Int(med)) s, min \(Int(minL)) s (\(s.count) enreg.)")
     }
-    if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-       let data = try? JSONSerialization.data(withJSONObject: out, options: .prettyPrinted) {
-      try? data.write(to: dir.appendingPathComponent("motion_probe.json"))
+    // NSJSONSerialization raises an uncatchable exception on NaN / infinity: sanitise and validate
+    func clean(_ v: Any) -> Any {
+      switch v {
+      case let d as Double: return d.isFinite ? d : NSNull()
+      case let a as [Any]: return a.map(clean)
+      case let m as [String: Any]: return m.mapValues(clean)
+      case let s as String: return s
+      case let i as Int: return i
+      default: return String(describing: v)
+      }
+    }
+    let payload: Any = ["lines": lines, "rows": out.map { clean($0) }]
+    if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+      let url = dir.appendingPathComponent(outputName)
+      if JSONSerialization.isValidJSONObject(payload), let data = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
+        try? data.write(to: url)
+      } else {
+        try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+      }
     }
     status = "Test terminé"
   }
@@ -926,10 +981,13 @@ struct MotionProbeCard: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      Label("Mouvement en direct (test)", systemImage: "figure.walk.motion").font(.headline)
+      Label("Capteurs : tests silencieux", systemImage: "figure.walk.motion").font(.headline)
       Text("Mesure le retard du mouvement : synchro haute fréquence à 30, 60, 120 et 180 s, puis mode IMU temps réel. Sans vibration, environ 4 min, bracelet porté.")
         .font(.footnote).foregroundStyle(.secondary)
-      Button("Lancer le test") { probe.run(keepLiveHR: keepLiveHR) }.buttonStyle(.bordered)
+      HStack {
+        Button("Test mouvement") { probe.run(keepLiveHR: keepLiveHR) }.buttonStyle(.bordered)
+        Button("Test optique (~3 min)") { probe.runOptical() }.buttonStyle(.bordered)
+      }
       if !probe.status.isEmpty { Text(probe.status).font(.caption) }
       ForEach(probe.lines, id: \.self) { Text($0).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary) }
     }

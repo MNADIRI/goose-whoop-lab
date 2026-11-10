@@ -12,7 +12,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
-pub const DECODER_VERSION: &str = "whoop5-records.v1";
+pub const DECODER_VERSION: &str = "whoop5-records.v2"; // v2: R26 base is signed (i32)
 pub const HEADER_LEN: usize = 8;
 
 pub const PACKET_REALTIME: u8 = 40;
@@ -163,7 +163,7 @@ pub const FIELD_CATALOG: &[FieldSpec] = &[
     f!("R26", "timestamp", 15, 4, "u32", "1", "s (unix)", ">= 2020-01-01", DecodedUnvalidated, ""),
     f!("R26", "time_word", 19, 2, "u16", "1", "raw", "", DecodedUnvalidated, "sub-second or sequence word"),
     f!("R26", "burst_counter", 21, 2, "u16", "1", "count", "", DecodedUnvalidated, ""),
-    f!("R26", "base_value", 23, 4, "u32", "1", "ADC code", "", DecodedUnvalidated, "absolute first sample of the window"),
+    f!("R26", "base_value", 23, 4, "i32", "1", "ADC code", "", DecodedUnvalidated, "absolute first sample of the window"),
     f!("R26", "deltas", 27, 48, "i16[24]", "1", "ADC code", "", DecodedUnvalidated, "x[i+1] = x[i] + delta[i]; wavelength unknown"),
     f!("R26", "motion", 75, 4, "f32", "1", "g?", "", DecodedUnvalidated, "motion during the window"),
     f!("R26", "status_raw", 79, 2, "u16", "1", "raw", "", DecodedUnvalidated, ""),
@@ -178,7 +178,8 @@ pub const FIELD_CATALOG: &[FieldSpec] = &[
     f!("R20", "block[k].source_b / drive_b", 30, 3, "u8+u16", "1", "raw", "", DecodedUnvalidated, ""),
     f!("R20", "block[k].detector_a / range_a / offset_a", 33, 7, "u8+u32+i16", "1", "raw", "", DecodedUnvalidated, "photodiode routing / TIA range / offset"),
     f!("R20", "block[k].detector_b / range_b / offset_b", 40, 7, "u8+u32+i16", "1", "raw", "", DecodedUnvalidated, ""),
-    f!("R20", "block[k].slot_a", 47, 200, "i32[50]", "1", "ADC code", "", DecodedUnvalidated, "unidentified optical channel (no wavelength label)"),
+    f!("R20", "block[k].slot_a", 47, 200, "i32[50]", "1", "ADC code", "", DecodedUnvalidated, "unidentified optical channel (no wavelength label); 25 samples/s observed (1 record = 1 s)"),
+    f!("R20", "observed roles (10 Nov, fw 50.38.1)", 26, 0, "note", "", "", "", Experimental, "block 0: source 1/4, AC/DC ~0.7 %, clean pulse (green-like); block 3: drive 0 = ambient/dark; block 4: source 2 drive 200, AC/DC 0.04-0.16 %, pulse (red- or IR-like); blocks 1-2 configured (source 3 drive 12750) but empty"),
     f!("R20", "block[k].slot_b", 247, 200, "i32[50]", "1", "ADC code", "", DecodedUnvalidated, "unidentified optical channel"),
     // R21: six-axis IMU (1244 B)
     f!("R21", "marker", 10, 1, "u8", "1", "raw", "", DecodedUnvalidated, ""),
@@ -350,9 +351,9 @@ pub struct R26Record {
     pub record_index: u32,
     pub time_word: u16,
     pub burst: u16,
-    pub base: u32,
+    pub base: i32,
     pub deltas: Vec<i16>,
-    /// Reconstructed 25-sample sequence (i64: cannot overflow, u32 base + 24 x i16).
+    /// Reconstructed 25-sample sequence (i64: cannot overflow, i32 base + 24 x i16).
     pub samples: Vec<i64>,
     pub motion: Option<f32>,
     pub status_raw: u16,
@@ -364,7 +365,8 @@ pub fn decode_r26(pl: &[u8]) -> Option<R26Record> {
     if pl.len() != R26_FRAME_LEN - 12 || pl[0] != PACKET_HISTORY || pl[1] != LAYOUT_R26 {
         return None;
     }
-    let base = u32_at(pl, p(23))?;
+    // signed: a real burst (10 Nov) had 0xffff8731 = -30 929, not 4 294 936 367
+    let base = i32_at(pl, p(23))?;
     let deltas: Vec<i16> = (0..24).map(|i| i16_at(pl, p(27) + 2 * i)).collect::<Option<_>>()?;
     let mut samples = Vec::with_capacity(25);
     samples.push(i64::from(base));
@@ -421,7 +423,8 @@ pub struct R20Record {
 pub const R20_BLOCK_FRAME_OFFSETS: [usize; 5] = [26, 448, 870, 1292, 1714];
 
 pub fn decode_r20(pl: &[u8]) -> Option<R20Record> {
-    if pl.len() != R20_FRAME_LEN - 12 || pl[0] != PACKET_HISTORY || pl[1] != LAYOUT_R20 {
+    // history (47, TOGGLE_PERSISTENT_R20) or live (43, ENABLE_OPTICAL_DATA + TOGGLE_OPTICAL_MODE): same layout
+    if pl.len() != R20_FRAME_LEN - 12 || (pl[0] != PACKET_HISTORY && pl[0] != PACKET_REALTIME_RAW) || pl[1] != LAYOUT_R20 {
         return None;
     }
     let mut warnings = Vec::new();
@@ -649,6 +652,7 @@ pub fn decode_payload(pl: &[u8]) -> Option<Record> {
         },
         PACKET_REALTIME => decode_live_hr(pl).map(Record::LiveHr),
         PACKET_REALTIME_RAW if layout == LAYOUT_R21 => decode_r21(pl).map(Record::R21),
+        PACKET_REALTIME_RAW if layout == LAYOUT_R20 => decode_r20(pl).map(Record::R20),
         PACKET_EVENT => decode_event(pl).map(Record::Event),
         PACKET_METADATA => decode_metadata(pl).map(Record::Metadata),
         PACKET_CONSOLE => decode_console(pl).map(|text| Record::Console { text }),
@@ -731,7 +735,7 @@ pub(crate) mod tests {
         pl[0] = PACKET_HISTORY;
         pl[1] = LAYOUT_R26;
         put(&mut pl, 15, &1_794_000_000u32.to_le_bytes());
-        put(&mut pl, 23, &u32::MAX.to_le_bytes());
+        put(&mut pl, 23, &i32::MIN.to_le_bytes());
         for i in 0..24 {
             let d: i16 = if i % 2 == 0 { i16::MAX } else { i16::MIN };
             put(&mut pl, 27 + 2 * i, &d.to_le_bytes());
@@ -739,9 +743,9 @@ pub(crate) mod tests {
         pl[82 - 8] = 1;
         let r = decode_r26(&roundtrip(&pl)).unwrap();
         assert_eq!(r.samples.len(), 25);
-        assert_eq!(r.samples[0], i64::from(u32::MAX));
-        assert_eq!(r.samples[1], i64::from(u32::MAX) + 32767);
-        assert_eq!(r.samples[2], i64::from(u32::MAX) - 1);
+        assert_eq!(r.samples[0], i64::from(i32::MIN));
+        assert_eq!(r.samples[1], i64::from(i32::MIN) + 32767);
+        assert_eq!(r.samples[2], i64::from(i32::MIN) - 1);
         assert_eq!(r.acceptance_raw, 1);
     }
 

@@ -210,7 +210,7 @@ class R26:
 def decode_r26(frame: bytes) -> R26:
     if len(frame) != 88 or frame[9] != LAYOUT_R26:
         raise ValueError("not an 88-byte R26 frame")
-    samples = [_u32(frame, 23)]
+    samples = [_i32(frame, 23)]  # signed base (a real burst had 0xffff8731 = -30929)
     for i in range(24):
         samples.append(samples[-1] + _i16(frame, 27 + 2 * i))
     return R26(

@@ -59,6 +59,10 @@ pub fn analyze_burst(b: &Burst, hr_at: &dyn Fn(i64) -> Option<f64>) -> Value {
         "continuity_ratio": continuity(b).map(|v| round(v, 2)),
         "motion_median": median(&motion).map(|v| round(v, 3)),
         "motion_windows": moving, "accepted_windows": accepted,
+        // LED / AFE setting candidate: changes with the DC level, so amplitudes are only comparable
+        // between bursts that share it
+        "status_raw": b.windows[0].status_raw,
+        "dc_median": median(&b.windows.iter().map(|w| w.samples[0] as f64).collect::<Vec<_>>()).map(|v| v.round()),
     });
     if n_win < 8 {
         return merge(base, json!({"status": Status::Unavailable, "reason": "burst shorter than 8 s"}));
@@ -185,7 +189,7 @@ mod tests {
                     record_index: s as u32,
                     time_word: 0,
                     burst: 1,
-                    base: samples[0] as u32,
+                    base: samples[0] as i32,
                     deltas: samples.windows(2).map(|w| (w[1] - w[0]) as i16).collect(),
                     samples,
                     motion: Some(0.05),
