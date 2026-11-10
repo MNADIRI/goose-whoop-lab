@@ -143,7 +143,7 @@ struct HealthMetricFamilyView: View {
   }
 
   private func openCoachTip() {
-    router.openCoach(prompt: coachTip.prompt)
+    // whoop-lab: Coach removed
     model.recordUIAction("coach.opened", detail: "\(route.rawValue) inline tip")
   }
 
@@ -565,7 +565,7 @@ struct StrainV2OverviewPage: View {
   }
 
   private func openCoachTip() {
-    router.openCoach(prompt: coachTip.prompt)
+    // whoop-lab: Coach removed
     model.recordUIAction("coach.opened", detail: "strain inline tip")
   }
 }

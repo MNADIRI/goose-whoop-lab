@@ -15,16 +15,9 @@ struct HomeDashboardView: View {
       LazyVStack(alignment: .leading, spacing: 22) {
         if let results = labResults.results, let current = currentDay(results) {
           dayPicker(results: results, current: current)
-          LabScoreRow(night: current.night, day: current.day)
-          LabNightSection(night: current.night)
-          if current.night.available {
-            LabBodySection(night: current.night)
-          }
-          if current.day.hasActivity {
-            LabActivitySection(day: current.day)
-          } else {
-            LabSectionHeader(title: "Activité", subtitle: "Pas assez de données ce jour (\(labFmt(current.day.coverageH, 1)) h)")
-          }
+          LabActivityCard(day: current.day)
+          LabNightCard(night: current.night)
+          LabBodyCard(night: current.night)
           Text("\(labResults.status) · \(results.device.records.formatted()) secondes enregistrées depuis le \(labDayLabel(results.firstDay ?? "", style: .dateTime.day().month(.wide)))")
             .font(.caption2)
             .foregroundStyle(.secondary)

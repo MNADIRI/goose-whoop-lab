@@ -364,8 +364,12 @@ struct HealthRouteContentView: View {
 
   var body: some View {
     // whoop-lab: metric screens show the lab's values so every display shares one source.
-    if let results = model.labResults.results, LabResults.coveredRoutes.contains(route) {
-      LabRouteDetailView(route: route, results: results)
+    if LabResults.coveredRoutes.contains(route) {
+      if let results = model.labResults.results {
+        LabRouteDetailView(route: route, results: results)
+      } else {
+        ProgressView("Analyse en cours…").task { model.labResults.refresh(force: true) }
+      }
     } else {
       gooseContent
     }

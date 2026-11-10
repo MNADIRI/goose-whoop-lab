@@ -83,8 +83,6 @@ struct AppShellView: View {
       )
     case .health:
       HealthView(store: healthStore, labResults: model.labResults)
-    case .coach:
-      CoachView(healthStore: healthStore)
     case .more:
       MoreView(healthStore: healthStore)
     }
@@ -98,7 +96,6 @@ struct AppShellView: View {
 enum GooseAppTab: String, CaseIterable, Identifiable {
   case home
   case health
-  case coach
   case more
 
   var id: String { rawValue }
@@ -107,7 +104,6 @@ enum GooseAppTab: String, CaseIterable, Identifiable {
     switch self {
     case .home: "Home"
     case .health: "Health"
-    case .coach: "Coach"
     case .more: "More"
     }
   }
@@ -116,7 +112,6 @@ enum GooseAppTab: String, CaseIterable, Identifiable {
     switch self {
     case .home: "house"
     case .health: "heart.text.square"
-    case .coach: "sparkles"
     case .more: "ellipsis.circle"
     }
   }

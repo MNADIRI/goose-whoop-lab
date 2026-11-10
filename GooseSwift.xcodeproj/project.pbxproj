@@ -42,6 +42,7 @@
 			D10000000000000000000041 /* GooseAppModel+NotificationPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000041 /* GooseAppModel+NotificationPipeline.swift */; };
 			D1000000000000000000F001 /* WhoopLabAutoExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F001 /* WhoopLabAutoExport.swift */; };
 			D1000000000000000000F002 /* WhoopLabResults.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F002 /* WhoopLabResults.swift */; };
+			D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F003 /* WhoopLabDayViews.swift */; };
 			D10000000000000000000042 /* GooseAppModel+PacketPublishing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */; };
 			D10000000000000000000043 /* GooseAppModel+ActivityTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */; };
 			D10000000000000000000017 /* NotificationFrameParsing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000017 /* NotificationFrameParsing.swift */; };
@@ -103,7 +104,6 @@
 		A1000000000000000000000F /* MapKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* MapKit.framework */; };
 		A10000000000000000000011 /* AppRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* AppRouter.swift */; };
 		A10000000000000000000012 /* HealthKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* HealthKit.framework */; };
-			A10000000000000000000013 /* CoachView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* CoachView.swift */; };
 			A10000000000000000000015 /* HealthKitSleepImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001B /* HealthKitSleepImporter.swift */; };
 			A10000000000000000000019 /* OnboardingPersistence.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001F /* OnboardingPersistence.swift */; };
 			A1000000000000000000001A /* MoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000020 /* MoreView.swift */; };
@@ -123,15 +123,7 @@
 			A1000000000000000000001B /* CodexEmbeddedAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000021 /* CodexEmbeddedAuth.swift */; };
 			A10000000000000000000023 /* GooseTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000023 /* GooseTheme.swift */; };
 			A10000000000000000000025 /* CodexCoachSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000025 /* CodexCoachSupport.swift */; };
-			A10000000000000000000026 /* OpenAICoachChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000026 /* OpenAICoachChat.swift */; };
 			A10000000000000000000027 /* CoachTips.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000027 /* CoachTips.swift */; };
-			A10000000000000000000028 /* CoachSignInScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000028 /* CoachSignInScreen.swift */; };
-			A10000000000000000000029 /* CoachChatScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000029 /* CoachChatScreen.swift */; };
-			A1000000000000000000002A /* CoachMessageViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000002A /* CoachMessageViews.swift */; };
-			A1000000000000000000002B /* CoachComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000002B /* CoachComposer.swift */; };
-			A1000000000000000000002C /* CoachChatTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000002C /* CoachChatTypes.swift */; };
-			A1000000000000000000002D /* OpenAICoachResponsesClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000002D /* OpenAICoachResponsesClient.swift */; };
-			A10000000000000000000040 /* CoachLocalToolContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000040 /* CoachLocalToolContext.swift */; };
 				B10000000000000000000001 /* WorkoutLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* WorkoutLiveActivityAttributes.swift */; };
 			B10000000000000000000002 /* WorkoutLiveActivityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* WorkoutLiveActivityController.swift */; };
 			B10000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift */; };
@@ -186,6 +178,7 @@
 			D20000000000000000000041 /* GooseAppModel+NotificationPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+NotificationPipeline.swift"; sourceTree = "<group>"; };
 			D2000000000000000000F001 /* WhoopLabAutoExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhoopLabAutoExport.swift; sourceTree = "<group>"; };
 			D2000000000000000000F002 /* WhoopLabResults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhoopLabResults.swift; sourceTree = "<group>"; };
+			D2000000000000000000F003 /* WhoopLabDayViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhoopLabDayViews.swift; sourceTree = "<group>"; };
 			D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+PacketPublishing.swift"; sourceTree = "<group>"; };
 			D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+ActivityTimeline.swift"; sourceTree = "<group>"; };
 			D20000000000000000000017 /* NotificationFrameParsing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationFrameParsing.swift; sourceTree = "<group>"; };
@@ -252,7 +245,6 @@
 		A20000000000000000000015 /* AppRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRouter.swift; sourceTree = "<group>"; };
 		A20000000000000000000016 /* HealthKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = HealthKit.framework; path = System/Library/Frameworks/HealthKit.framework; sourceTree = SDKROOT; };
 		A20000000000000000000017 /* GooseSwift.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = GooseSwift.entitlements; sourceTree = "<group>"; };
-		A20000000000000000000018 /* CoachView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachView.swift; sourceTree = "<group>"; };
 			A2000000000000000000001B /* HealthKitSleepImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthKitSleepImporter.swift; sourceTree = "<group>"; };
 			A2000000000000000000001F /* OnboardingPersistence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingPersistence.swift; sourceTree = "<group>"; };
 			A20000000000000000000020 /* MoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MoreView.swift; sourceTree = "<group>"; };
@@ -272,15 +264,7 @@
 			A20000000000000000000021 /* CodexEmbeddedAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexEmbeddedAuth.swift; sourceTree = "<group>"; };
 			A20000000000000000000023 /* GooseTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GooseTheme.swift; sourceTree = "<group>"; };
 			A20000000000000000000025 /* CodexCoachSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexCoachSupport.swift; sourceTree = "<group>"; };
-			A20000000000000000000026 /* OpenAICoachChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenAICoachChat.swift; sourceTree = "<group>"; };
 			A20000000000000000000027 /* CoachTips.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachTips.swift; sourceTree = "<group>"; };
-			A20000000000000000000028 /* CoachSignInScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachSignInScreen.swift; sourceTree = "<group>"; };
-			A20000000000000000000029 /* CoachChatScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachChatScreen.swift; sourceTree = "<group>"; };
-			A2000000000000000000002A /* CoachMessageViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachMessageViews.swift; sourceTree = "<group>"; };
-			A2000000000000000000002B /* CoachComposer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachComposer.swift; sourceTree = "<group>"; };
-			A2000000000000000000002C /* CoachChatTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachChatTypes.swift; sourceTree = "<group>"; };
-			A2000000000000000000002D /* OpenAICoachResponsesClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenAICoachResponsesClient.swift; sourceTree = "<group>"; };
-			A20000000000000000000040 /* CoachLocalToolContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachLocalToolContext.swift; sourceTree = "<group>"; };
 				B20000000000000000000001 /* WorkoutLiveActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkoutLiveActivityAttributes.swift; sourceTree = "<group>"; };
 			B20000000000000000000002 /* WorkoutLiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkoutLiveActivityController.swift; sourceTree = "<group>"; };
 			B20000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GooseWorkoutLiveActivityWidget.swift; sourceTree = "<group>"; };
@@ -370,6 +354,7 @@
 				D20000000000000000000041 /* GooseAppModel+NotificationPipeline.swift */,
 				D2000000000000000000F001 /* WhoopLabAutoExport.swift */,
 				D2000000000000000000F002 /* WhoopLabResults.swift */,
+				D2000000000000000000F003 /* WhoopLabDayViews.swift */,
 				D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */,
 				D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */,
 				D20000000000000000000017 /* NotificationFrameParsing.swift */,
@@ -418,11 +403,6 @@
 				D20000000000000000000006 /* MoreRawExportViews.swift */,
 				D20000000000000000000007 /* MoreDebugViews.swift */,
 				D20000000000000000000008 /* MoreInfoViews.swift */,
-				A20000000000000000000018 /* CoachView.swift */,
-					A20000000000000000000028 /* CoachSignInScreen.swift */,
-					A20000000000000000000029 /* CoachChatScreen.swift */,
-					A2000000000000000000002A /* CoachMessageViews.swift */,
-					A2000000000000000000002B /* CoachComposer.swift */,
 				A20000000000000000000015 /* AppRouter.swift */,
 						A20000000000000000000011 /* LiveActivityView.swift */,
 				D2000000000000000000000D /* ActivityModels.swift */,
@@ -472,10 +452,6 @@
 						A2000000000000000000001B /* HealthKitSleepImporter.swift */,
 						A20000000000000000000025 /* CodexCoachSupport.swift */,
 					A20000000000000000000021 /* CodexEmbeddedAuth.swift */,
-					A2000000000000000000002C /* CoachChatTypes.swift */,
-					A20000000000000000000026 /* OpenAICoachChat.swift */,
-					A2000000000000000000002D /* OpenAICoachResponsesClient.swift */,
-					A20000000000000000000040 /* CoachLocalToolContext.swift */,
 					A20000000000000000000027 /* CoachTips.swift */,
 					B20000000000000000000001 /* WorkoutLiveActivityAttributes.swift */,
 					B20000000000000000000002 /* WorkoutLiveActivityController.swift */,
@@ -677,6 +653,7 @@
 				D10000000000000000000041 /* GooseAppModel+NotificationPipeline.swift in Sources */,
 				D1000000000000000000F001 /* WhoopLabAutoExport.swift in Sources */,
 				D1000000000000000000F002 /* WhoopLabResults.swift in Sources */,
+				D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */,
 				D10000000000000000000042 /* GooseAppModel+PacketPublishing.swift in Sources */,
 				D10000000000000000000043 /* GooseAppModel+ActivityTimeline.swift in Sources */,
 				D10000000000000000000017 /* NotificationFrameParsing.swift in Sources */,
@@ -755,11 +732,6 @@
 					C1000000000000000000000D /* HealthSupplementalViews.swift in Sources */,
 					C1000000000000000000000E /* HealthPreviews.swift in Sources */,
 					A10000000000000000000011 /* AppRouter.swift in Sources */,
-					A10000000000000000000013 /* CoachView.swift in Sources */,
-					A10000000000000000000028 /* CoachSignInScreen.swift in Sources */,
-					A10000000000000000000029 /* CoachChatScreen.swift in Sources */,
-					A1000000000000000000002A /* CoachMessageViews.swift in Sources */,
-					A1000000000000000000002B /* CoachComposer.swift in Sources */,
 					A10000000000000000000015 /* HealthKitSleepImporter.swift in Sources */,
 					A10000000000000000000019 /* OnboardingPersistence.swift in Sources */,
 					A1000000000000000000001A /* MoreView.swift in Sources */,
@@ -778,10 +750,6 @@
 					D10000000000000000000008 /* MoreInfoViews.swift in Sources */,
 					A10000000000000000000025 /* CodexCoachSupport.swift in Sources */,
 					A1000000000000000000001B /* CodexEmbeddedAuth.swift in Sources */,
-					A1000000000000000000002C /* CoachChatTypes.swift in Sources */,
-					A10000000000000000000026 /* OpenAICoachChat.swift in Sources */,
-					A1000000000000000000002D /* OpenAICoachResponsesClient.swift in Sources */,
-					A10000000000000000000040 /* CoachLocalToolContext.swift in Sources */,
 					A10000000000000000000027 /* CoachTips.swift in Sources */,
 						A10000000000000000000023 /* GooseTheme.swift in Sources */,
 						B10000000000000000000001 /* WorkoutLiveActivityAttributes.swift in Sources */,

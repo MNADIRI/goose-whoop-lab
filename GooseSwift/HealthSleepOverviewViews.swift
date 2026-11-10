@@ -69,7 +69,7 @@ struct SleepV2OverviewPage: View {
               .frame(height: 96)
 
               SleepV2CoachingCard(palette: palette, tip: coachTip) {
-                router.openCoach(prompt: coachTip.prompt)
+                // whoop-lab: Coach removed
               }
 
 	              SleepV2ActionRow(

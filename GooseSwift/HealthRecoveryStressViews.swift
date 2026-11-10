@@ -190,7 +190,7 @@ struct RecoveryV2OverviewPage: View {
   }
 
   private func openCoachTip() {
-    router.openCoach(prompt: coachTip.prompt)
+    // whoop-lab: Coach removed
     model.recordUIAction("coach.opened", detail: "recovery v2 inline tip")
   }
 }
@@ -354,7 +354,7 @@ struct StressV2OverviewPage: View {
   }
 
   private func openCoachTip() {
-    router.openCoach(prompt: coachTip.prompt)
+    // whoop-lab: Coach removed
     model.recordUIAction("coach.opened", detail: "stress v2 inline tip")
   }
 }
