@@ -82,6 +82,17 @@ un statut et une provenance (`provenance` à la racine).
 Couche décodée (tables `whoop5_*`) et export : `whoop5.ingest`, `whoop5.inventory`, `whoop5.export` (JSONL, CSV,
 binaire brut et `schema.json` avec unités, statuts et provenance).
 
+### Ajouts des algorithmes 6 et 7 (champs du bracelet rétro-ingénierés, voir docs/OPTICAL.md)
+
+| Valeur | Entrée brute | Méthode | Où | Statut |
+|---|---|---|---|---|
+| **SpO₂ (bracelet)** | R18 octet 82 | Fenêtres de 30 s toutes les 20 min en sommeil ; médiane par fenêtre des valeurs 70–100, codes d'état écartés (au moins 10 s valides par fenêtre) ; médiane, minimum, fenêtres < 95 / < 90 % | Aujourd'hui › Corps | Décodé, non validé |
+| **Masque de qualité VFC** | R18 `cardiac_flags` bits 0, 4, 6 | R-R ignorés dans les secondes marquées « mouvement » ; RMSSD sans masque conservé pour comparaison | VFC partout | Expérimental. Nuit du 9–10 : artefacts 1,3 → 0,5 %, RMSSD 55,0 → 54,4 ms |
+| **FC de repos du bracelet** | R18 `rr_adjacent` octet haut | médiane et 10e centile pendant le sommeil, écart à la nôtre | Corps (détail FC au repos) | Décodé, non validé (p10 44 contre 43,3 pour notre calcul) |
+| **Perfusion** | R18 amplitude optique | médiane sur les secondes immobiles du sommeil, écart aux nuits précédentes (≥ 3) | Corps | Expérimental |
+| **Température de la carte** | R18 temp. auxiliaire 2 | médiane nocturne, écart peau − carte | résultats (`environment_temp`) | Décodé, non validé |
+| **Cadence de marche** | R18 période du pas | 60 × k / valeur brute, k auto-étalonné sur le compteur de pas (≥ 5 min de marche ; 196,6 mesuré, 200 par défaut) | Aujourd'hui › Activité | Expérimental |
+
 ## 3. Cohérence et redondances traitées
 
 - **Une seule valeur par mesure.** Les cartes goose (Sleep, Recovery, Strain, Stress, Cardio Load, FC repos,

@@ -132,6 +132,10 @@ struct LabActivityCard: View {
                     status: stressStatus, detail: "éveillé, au repos")
           LabMetric(title: "FC moyenne", value: labFmt(day.hrMean), unit: "bpm",
                     detail: "\(labFmt(day.hrMin)) – \(labFmt(day.hrMax)) bpm")
+          if let cad = day.cadence, cad.available {
+            LabMetric(title: "Cadence de marche", value: labFmt(cad.medianSpm), unit: "pas/min",
+                      detail: "rapide : \(labFmt(cad.p90Spm)) pas/min")
+          }
         }
         if let hourly = day.hourly, !hourly.isEmpty {
           LabHourlyChart(hourly: hourly)
@@ -382,7 +386,7 @@ struct LabBodyCard: View {
         LazyVGrid(columns: twoColumns, spacing: 16) {
           LabMetric(title: "FC au repos", value: labFmt(night.restingHrBpm), unit: "bpm",
                     status: rangeStatus(night.restingHrBpm, good: 40...60, fair: 60...70),
-                    detail: "la plus basse du sommeil")
+                    detail: night.firmwareRestingHr?.p10Bpm.map { "la plus basse du sommeil · bracelet : \(labFmt($0)) bpm" } ?? "la plus basse du sommeil")
           LabMetric(title: "VFC", value: labFmt(night.hrvNight?.rmssdMs), unit: "ms",
                     detail: "RMSSD nocturne ; à comparer à ta moyenne")
           LabMetric(title: "Respiration", value: labFmt(night.respiration?.rpm, 1), unit: "/min",
@@ -392,10 +396,15 @@ struct LabBodyCard: View {
                     unit: "°C",
                     status: night.skinTempDeltaC.map { abs($0) <= 0.5 ? .good : abs($0) <= 1 ? .fair : .low } ?? .neutral,
                     detail: night.skinTempDeltaC != nil ? "écart à ta moyenne" : "écart disponible après 3 nuits")
+          if let amp = night.perfusion?.opticalAmplitudeMedian {
+            LabMetric(title: "Perfusion", value: night.perfusion?.vsPreviousNightsPct.map { String(format: "%+.0f", $0) } ?? labFmt(amp),
+                      unit: night.perfusion?.vsPreviousNightsPct != nil ? "%" : "u.r.",
+                      detail: night.perfusion?.vsPreviousNightsPct != nil ? "amplitude du pouls vs ta moyenne " : "amplitude du pouls ; écart après 3 nuits")
+          }
           if let spo2 = night.spo2, spo2.available {
             LabMetric(title: "SpO₂ (bracelet)", value: labFmt(spo2.medianPct), unit: "%",
                       status: rangeStatus(spo2.medianPct, good: 95...100, fair: 90...95),
-                      detail: "mesure du bracelet, \(spo2.validWindows ?? 0)/\(spo2.windows ?? 0) relevés ; min \(labFmt(spo2.minWindowPct)) % · non validée")
+                      detail: "mesure du bracelet, \(spo2.validWindows ?? 0)/\(spo2.windows ?? 0) relevés ; min \(labFmt(spo2.minWindowPct)) %")
           }
         }
       } else {

@@ -23,7 +23,7 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "6"; // 5: signed R26 base, optical gain state; 6: on-strap SpO2
+const ALGORITHM_VERSION: &str = "7"; // 5: signed R26 base, optical gain state; 6: on-strap SpO2
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
@@ -512,6 +512,39 @@ fn baseline_of(prev: &[&Value], pick: impl Fn(&Value) -> Option<f64>, cfg: &base
     baselines::fold(&vals, cfg)
 }
 
+/// Reverse-engineered per-second R18 fields (10 Nov, see docs/OPTICAL.md), joined by timestamp.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Extra {
+    pub cardiac_flags: u8,
+    /// rr_adjacent high byte: firmware resting-HR candidate, 0 when active
+    pub fw_rest_hr: u8,
+    pub cadence_raw: u16,
+    pub opt_amp: u8,
+    pub aux_temp: Option<f64>,
+    pub hr_quality: u8,
+}
+
+/// cardiac_flags bits 0, 4, 6: set while moving, R-R rarely valid -> beats in these seconds are skipped
+pub const MOTION_FLAGS: u8 = 0b0101_0001;
+
+pub fn load_extras(conn: &Connection, from: i64, to: i64) -> GooseResult<std::collections::HashMap<i64, Extra>> {
+    let mut st = conn.prepare_cached(
+        "SELECT ts, cardiac_flags_raw, rr_adjacent_raw, cadence_raw, optical_amplitude_a, aux_temp2_c, hr_quality_raw FROM whoop5_r18 WHERE ts >= ?1 AND ts < ?2",
+    )?;
+    let rows = st.query_map(params![from, to], |r| {
+        let ra: i64 = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+        Ok((r.get::<_, i64>(0)?, Extra {
+            cardiac_flags: r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u8,
+            fw_rest_hr: (ra >> 8) as u8,
+            cadence_raw: r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u16,
+            opt_amp: r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u8,
+            aux_temp: r.get(5)?,
+            hr_quality: r.get::<_, Option<i64>>(6)?.unwrap_or(0) as u8,
+        }))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// On-strap SpO2 (R18 frame byte 82, found 10 Nov): during sleep the strap runs a 30 s spot
 /// measurement on a fixed 20-minute clock (xx:16 / xx:36 / xx:56); each second of a window holds
 /// either a saturation in % or a status code (2, 8, 16, 32, 128, 144, 160, 168 ...). Outside the
@@ -550,7 +583,7 @@ pub fn spo2_summary(values: &[(i64, u8)]) -> Value {
     })
 }
 
-fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record], spo2_values: &[(i64, u8)]) -> Value {
+fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record], spo2_values: &[(i64, u8)], extras: &std::collections::HashMap<i64, Extra>) -> Value {
     let Some(sp) = sleep_period(s) else { return json!({ "available": false, "firmware_sleep_min": s.iter().filter(|x| x.band == "sleep").count() / 60 }) };
     let (stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
     let count = |k: &str| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round();
@@ -568,7 +601,28 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
     let last_third: Vec<Sample> = night.iter().filter(|x| x.ts >= third).cloned().collect();
     let skin_vals: Vec<f64> = night.iter().filter_map(|x| x.skin).collect();
     let skin = median(&skin_vals).map(|v| round(v, 2));
-    let (hrv, hrv_qc_json, clean_segs) = hrv_with_qc(night);
+    // quality mask: drop R-R of seconds the strap flags as moving (cardiac_flags bits 0/4/6)
+    let masked: Vec<Sample> = night
+        .iter()
+        .map(|x| {
+            let mut y = x.clone();
+            if extras.get(&x.ts).is_some_and(|e| e.cardiac_flags & MOTION_FLAGS != 0) {
+                y.rr.clear();
+            }
+            y
+        })
+        .collect();
+    let masked_secs = night.len() - masked.iter().zip(night).filter(|(a, b)| a.rr.len() == b.rr.len()).count();
+    let (hrv, hrv_qc_json, clean_segs) = hrv_with_qc(&masked);
+    let (hrv_unmasked, _, _) = hrv_with_qc(night);
+    // firmware-side signals over the sleep period
+    let ex: Vec<&Extra> = night.iter().filter_map(|x| extras.get(&x.ts)).collect();
+    let fw_rest: Vec<f64> = ex.iter().map(|e| f64::from(e.fw_rest_hr)).filter(|v| *v > 0.0).collect();
+    let still_amp: Vec<f64> = night.iter().filter(|x| x.dyn_g.is_some_and(|d| d < 0.02)).filter_map(|x| extras.get(&x.ts)).map(|e| f64::from(e.opt_amp)).filter(|v| *v > 0.0).collect();
+    let aux: Vec<f64> = ex.iter().filter_map(|e| e.aux_temp).collect();
+    let conf: Vec<f64> = ex.iter().map(|e| f64::from(e.hr_quality)).collect();
+    let prev_amp: Vec<f64> = history.iter().filter_map(|h| h["perfusion"]["optical_amplitude_median"].as_f64()).collect();
+    let amp_med = median(&still_amp);
     let (hrv_last, _, _) = hrv_with_qc(&last_third);
     let prev: Vec<&Value> = history.iter().filter(|h| h["available"] == true).collect();
     let prev_skin: Vec<f64> = prev.iter().filter_map(|h| h["skin_temp_c"].as_f64()).collect();
@@ -653,6 +707,31 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
         "optical": optical,
         "spo2": spo2_summary(&spo2_values.iter().copied().filter(|(t, _)| *t >= s[sp.bed].ts && *t <= s[sp.wake].ts).collect::<Vec<_>>()),
         "rr_coverage_pct": round(100.0 * rr_count as f64 / (hr.iter().sum::<f64>() / 60.0).max(1.0), 1),
+        "quality_mask": {
+            "method": "R-R ignored in seconds with cardiac_flags bits 0/4/6 (strap motion flags)",
+            "masked_seconds_pct": round(100.0 * masked_secs as f64 / night.len().max(1) as f64, 1),
+            "rmssd_without_mask_ms": hrv_unmasked["rmssd_ms"].clone(),
+            "hr_confidence_median": median(&conf),
+        },
+        "firmware_resting_hr": {
+            "median_bpm": median(&fw_rest).map(|v| round(v, 1)),
+            "p10_bpm": percentile(&fw_rest, 10.0).map(|v| round(v, 1)),
+            "minus_ours_bpm": median(&fw_rest).map(|v| round(v - resting, 1)),
+            "source": "R18 rr_adjacent high byte (0 when active)",
+            "status": "DECODED_UNVALIDATED",
+        },
+        "perfusion": {
+            "optical_amplitude_median": amp_med,
+            "vs_previous_nights_pct": match (amp_med, prev_amp.len() >= 3) { (Some(a), true) => Some(round(100.0 * (a / mean(&prev_amp).unwrap() - 1.0), 1)), _ => None },
+            "source": "R18 optical amplitude, still seconds of the sleep period (per-second, relative units)",
+            "status": "EXPERIMENTAL",
+        },
+        "environment_temp": {
+            "board_temp_median_c": median(&aux).map(|v| round(v, 2)),
+            "skin_minus_board_c": match (skin, median(&aux)) { (Some(a), Some(b)) => Some(round(a - b, 2)), _ => None },
+            "source": "R18 aux temperature 2 (board / under-cover environment)",
+            "status": "DECODED_UNVALIDATED",
+        },
     });
     out["recovery"] = baselines::recovery(&baselines::RecoveryInputs {
         rmssd: hrv["rmssd_ms"].as_f64(),
@@ -691,7 +770,44 @@ fn recovery(night: &Value, prev: &[&Value]) -> Value {
 
 // ------------------------------------------------------------------ day
 
-fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, resting_hr: Option<f64>) -> Value {
+/// Cadence from the R18 step-period field, self-calibrated on the step counter: k = median over
+/// walking minutes of counted steps/min x raw / 60 (5 ms ticks ~ 200 by default, 196.6 measured).
+fn cadence(s: &[Sample], extras: &std::collections::HashMap<i64, Extra>) -> Value {
+    let walking = |x: &Sample| matches!(x.activity.as_deref(), Some("walk") | Some("run"));
+    let mut ks = Vec::new();
+    let mut minute: BTreeMap<i64, Vec<&Sample>> = BTreeMap::new();
+    for x in s {
+        minute.entry(x.ts / 60).or_default().push(x);
+    }
+    for secs in minute.values() {
+        let w: Vec<&&Sample> = secs.iter().filter(|x| walking(x)).collect();
+        if secs.len() < 55 || w.len() < 40 {
+            continue;
+        }
+        let steps: i64 = secs.windows(2).map(|p| p[1].steps - p[0].steps).filter(|d| *d > 0 && *d < 300).sum();
+        let raws: Vec<f64> = w.iter().filter_map(|x| extras.get(&x.ts)).map(|e| f64::from(e.cadence_raw)).filter(|v| *v > 20.0).collect();
+        if steps >= 40 {
+            if let Some(r) = median(&raws) {
+                ks.push(steps as f64 * 60.0 / w.len() as f64 * r / 60.0);
+            }
+        }
+    }
+    let (k, src) = if ks.len() >= 5 { (median(&ks).unwrap(), "self-calibrated on the step counter") } else { (200.0, "default 5 ms tick (196.6 measured on 8 min)") };
+    let spm: Vec<f64> = s.iter().filter(|x| walking(x)).filter_map(|x| extras.get(&x.ts)).map(|e| f64::from(e.cadence_raw)).filter(|v| *v > 20.0).map(|r| 60.0 * k / r).collect();
+    if spm.len() < 60 {
+        return json!({"available": false, "status": "UNAVAILABLE"});
+    }
+    json!({
+        "available": true,
+        "median_spm": round(median(&spm).unwrap(), 0),
+        "p90_spm": round(percentile(&spm, 90.0).unwrap(), 0),
+        "walking_seconds": spm.len(),
+        "calibration": {"k": round(k, 1), "minutes": ks.len(), "source": src},
+        "status": "EXPERIMENTAL",
+    })
+}
+
+fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, resting_hr: Option<f64>, extras: &std::collections::HashMap<i64, Extra>) -> Value {
     let covered_h = s.len() as f64 / 3600.0;
     if s.len() < 600 {
         return json!({ "coverage_h": round(covered_h, 1) });
@@ -768,6 +884,7 @@ fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, restin
         "stress": stress(s, rhr, hrmax),
         "age_default_used": profile.age.is_none(),
         "training": training_block(s, rhr, age, profile),
+        "cadence": cadence(s, extras),
     })
 }
 
@@ -859,6 +976,11 @@ fn provenance() -> Value {
         "day.stress": p("R18 HR, activity, dynamic accel", "HR elevation at rest vs 40 % HR reserve, 5-min buckets", "0-100", "EXPERIMENTAL"),
         "day.energy": p("R18 HR + profile", "Mifflin-St Jeor resting + Keytel 2005 active", "kcal", "EXPERIMENTAL"),
         "load": p("daily Edwards TRIMP", "7 d acute, 28 d chronic, ACWR after 21 d, Foster monotony", "a.u.", "EXPERIMENTAL"),
+        "night.quality_mask": p("R18 cardiac_flags bits 0/4/6", "R-R of seconds flagged as moving are dropped before HRV", "", "EXPERIMENTAL"),
+        "night.firmware_resting_hr": p("R18 rr_adjacent high byte", "median / p10 during sleep, compared with ours", "bpm", "DECODED_UNVALIDATED"),
+        "night.perfusion": p("R18 optical amplitude", "median over still sleep seconds, vs previous nights", "a.u.", "EXPERIMENTAL"),
+        "night.environment_temp": p("R18 aux temperature 2", "night median, skin minus board gradient", "degC", "DECODED_UNVALIDATED"),
+        "day.cadence": p("R18 step-period field", "60 x k / raw, k self-calibrated on the step counter", "steps/min", "EXPERIMENTAL"),
         "night.spo2": p("R18 byte 82 (on-strap SpO2)", "per-window median of the % values (70-100), status codes discarded", "%", "DECODED_UNVALIDATED"),
     })
 }
@@ -929,10 +1051,11 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
                 let rows = st.query_map(params![n0, n1], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 rows.collect::<Result<_, _>>()?
             };
-            let night = analyze_night(&night_samples, &nights_hist, &optical_windows, &spo2_values);
+            let extras = load_extras(&conn, n0, d1)?;
+            let night = analyze_night(&night_samples, &nights_hist, &optical_windows, &spo2_values, &extras);
             let day_samples = load_samples(&conn, d0, d1)?;
             let rhr = night["resting_hr_bpm"].as_f64();
-            let day = analyze_day(&day_samples, d0, now, &options.profile, rhr);
+            let day = analyze_day(&day_samples, d0, now, &options.profile, rhr, &extras);
             let value = json!({ "date": key, "night": night, "day": day });
             conn.execute(
                 "INSERT OR REPLACE INTO whoop_lab_days (date_key, input_count, input_last_ts, algorithm_version, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",

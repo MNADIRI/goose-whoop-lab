@@ -730,8 +730,6 @@ struct AlarmView: View {
         nightsCard
         vibrationCard
         MotionProbeCard(probe: controller.motionProbe, keepLiveHR: controller.session != nil)
-        Text("Estimations expérimentales : probabilités d'état estimées, moment favorable prédit. Méthode : docs/SMART_WAKE.md")
-          .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
       }
       .padding(.horizontal, 16)
       .padding(.vertical, 12)

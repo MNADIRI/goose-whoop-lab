@@ -55,6 +55,11 @@ struct LabNight: Decodable {
   let skinTempDeltaC: Double?
   let recovery: LabRecovery?
   let spo2: LabSpO2?
+  let firmwareRestingHr: FirmwareRHR?
+  let perfusion: Perfusion?
+
+  struct FirmwareRHR: Decodable { let medianBpm: Double?; let p10Bpm: Double? }
+  struct Perfusion: Decodable { let opticalAmplitudeMedian: Double?; let vsPreviousNightsPct: Double? }
   let hypnogram: String?
   let hypnogramStart: Double?
 
@@ -124,10 +129,17 @@ struct LabDay: Decodable {
   let hrMax: Double?
   let hourly: [String: Hour]?
   let stress: LabStress?
+  let cadence: Cadence?
+
+  struct Cadence: Decodable {
+    let available: Bool
+    let medianSpm: Double?
+    let p90Spm: Double?
+  }
 
   // convertFromSnakeCase turns "strain_0_21" into "strain021".
   enum CodingKeys: String, CodingKey {
-    case coverageH, steps, walkMin, runMin, mvpaMin, hrZoneMin, edwardsTrimp, energy, hrMean, hrMin, hrMax, hourly, stress
+    case coverageH, steps, walkMin, runMin, mvpaMin, hrZoneMin, edwardsTrimp, energy, hrMean, hrMin, hrMax, hourly, stress, cadence
     case strain021 = "strain021"
   }
 
