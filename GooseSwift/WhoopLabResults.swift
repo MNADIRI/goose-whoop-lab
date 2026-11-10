@@ -54,6 +54,7 @@ struct LabNight: Decodable {
   let skinTempC: Double?
   let skinTempDeltaC: Double?
   let recovery: LabRecovery?
+  let spo2: LabSpO2?
   let hypnogram: String?
   let hypnogramStart: Double?
 
@@ -73,6 +74,15 @@ struct LabRespiration: Decodable {
   let rpm: Double
   let rpmIqr: [Double]
   let windows: Int
+}
+
+/// On-strap SpO2 (R18 byte 82): 30 s spot windows every 20 min during sleep. Not validated.
+struct LabSpO2: Decodable {
+  let available: Bool
+  let medianPct: Double?
+  let minWindowPct: Double?
+  let validWindows: Int?
+  let windows: Int?
 }
 
 struct LabRecovery: Decodable {

@@ -141,3 +141,31 @@ Onglet Alarme → « Test optique de nuit ». Avec le réveil intelligent armé,
 pendant 30 min, environ 2 h après l'endormissement détecté et au moins 40 min avant la fenêtre de réveil, puis le coupe.
 Les données remontent aux synchronisations suivantes et dans l'export iCloud (`whoop-lab/raw`). On saura alors si les
 blocs 1 et 2 (source 3, candidate infrarouge) s'allument pendant le sommeil.
+
+## Rétro-ingénierie approfondie (10 novembre) : nature des signaux et usages
+
+| Signal | Nature (preuve) | Confiance | Feature |
+|---|---|---|---|
+| **R18 octet 82** | **SpO₂ calculée par le bracelet** : seulement en sommeil, fenêtres de 30 s sur une horloge fixe de 20 min (xx:16, xx:36, xx:56) ; chaque seconde vaut soit 70–100 (%), soit un code (2, 8, 16, 32, 128, 144, 160, 168) | élevée sur le format, valeur **non validée** | **branchée** : `night.spo2` (médiane des fenêtres, minimum, fenêtres < 95 % / < 90 %), carte Corps. Nuit du 9–10 : médiane 99 %, minimum 97 %, 8 fenêtres valides sur 24 |
+| R18 `rr_adjacent` octet bas | copie de la FC (écart médian 0) | élevée | redondant |
+| R18 `rr_adjacent` octet haut | 0 en activité, ~48–53 au repos ou en sommeil, suit la FC (r = 0,84 en sommeil) | moyenne | FC de repos du firmware : à comparer à notre FC de repos |
+| R18 `cardiac_flags` | champ de bits : bit 5 (88 %) = immobile ou FC accrochée ; bits 0, 4, 6 = mouvement (R-R rarement présents) | moyenne | masque de qualité pour la FC et les R-R |
+| R18 `hr_quality` | confiance FC, ~IBI/9 ms, plus haute avec des R-R | moyenne | pondération de la FC, contrôle qualité |
+| R18 `cadence_raw` | période du pas (arrêt 138, marche 128, course 81) | moyenne | cadence, intensité de la marche |
+| R18 `optical_amplitude_a/b` | amplitude optique chaque seconde | moyenne | indice de perfusion continu |
+| R18 octet 34 | suit la FC sur 5 min (r = 0,76) | faible | — |
+| R18 octet 35 | bits 5–7 = état du bracelet × 32 ; bits bas inconnus | élevée (bits hauts) | redondant avec l'état du bracelet |
+| R18 octet 40 | inverse de la FC (r = −0,66), lié à `hr_quality` | faible | — |
+| R18 `aux_temp1/2` | températures carte / environnement | moyenne | gradient peau − environnement |
+| R18 octets 65–68, 83–103, 110–112 | toujours 0 | élevée | réservés |
+| Événement 3 `BATTERY_LEVEL` | batterie % (u16@1 / 10), tension mV (u16@5) | élevée | décodé |
+| Événement 29 `STRAP_CONDITION_REPORT` | toutes les 10 min ; u16@6 en ‰ qui baisse lentement (954 → 949 en 1 h) ; contient aussi le mot d'état optique | moyenne | suivi batterie / état |
+| Événement 63 | température de la batterie candidate (u16@5 / 10) | faible | — |
+| Événement 120 | 32 o, à intervalles multiples de 2 h, contient la constante 7200 (s) | faible | résumé périodique du firmware, à étudier |
+| Réponse `GET_HELLO` (145) | **numéro de série et identifiant du bracelet** | élevée | **volontairement non exploité** (vie privée) |
+| Journal du firmware (paquet 50) | `SLEEPFLAG`, `WEAR-DETECT V5`, `AFE configuration changed`, `SOC report`, capteur AS6221 | élevée | états internes du firmware |
+
+Validation encore nécessaire :
+- **SpO₂** : comparer une nuit à un oxymètre de doigt, et vérifier si la valeur WHOOP officielle de la même nuit correspond.
+- **Cadence** : compter des pas à cadence connue.
+- **FC de repos du firmware** : la comparer à notre estimation sur plusieurs nuits.

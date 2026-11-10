@@ -392,6 +392,11 @@ struct LabBodyCard: View {
                     unit: "°C",
                     status: night.skinTempDeltaC.map { abs($0) <= 0.5 ? .good : abs($0) <= 1 ? .fair : .low } ?? .neutral,
                     detail: night.skinTempDeltaC != nil ? "écart à ta moyenne" : "écart disponible après 3 nuits")
+          if let spo2 = night.spo2, spo2.available {
+            LabMetric(title: "SpO₂ (bracelet)", value: labFmt(spo2.medianPct), unit: "%",
+                      status: rangeStatus(spo2.medianPct, good: 95...100, fair: 90...95),
+                      detail: "mesure du bracelet, \(spo2.validWindows ?? 0)/\(spo2.windows ?? 0) relevés ; min \(labFmt(spo2.minWindowPct)) % · non validée")
+          }
         }
       } else {
         Text("Ces signaux sont mesurés pendant le sommeil.").foregroundStyle(.secondary)

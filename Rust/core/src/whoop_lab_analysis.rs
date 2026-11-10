@@ -23,7 +23,7 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "5"; // 5: signed R26 base, optical gain state
+const ALGORITHM_VERSION: &str = "6"; // 5: signed R26 base, optical gain state; 6: on-strap SpO2
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
@@ -512,7 +512,45 @@ fn baseline_of(prev: &[&Value], pick: impl Fn(&Value) -> Option<f64>, cfg: &base
     baselines::fold(&vals, cfg)
 }
 
-fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record]) -> Value {
+/// On-strap SpO2 (R18 frame byte 82, found 10 Nov): during sleep the strap runs a 30 s spot
+/// measurement on a fixed 20-minute clock (xx:16 / xx:36 / xx:56); each second of a window holds
+/// either a saturation in % or a status code (2, 8, 16, 32, 128, 144, 160, 168 ...). Outside the
+/// windows the byte is 0. Values 70..=100 are taken as SpO2 %, everything else as a status code.
+pub fn spo2_summary(values: &[(i64, u8)]) -> Value {
+    let mut windows: Vec<Vec<(i64, u8)>> = Vec::new();
+    for &(t, v) in values.iter().filter(|(_, v)| *v != 0) {
+        match windows.last_mut() {
+            Some(w) if t - w.last().unwrap().0 <= 5 => w.push((t, v)),
+            _ => windows.push(vec![(t, v)]),
+        }
+    }
+    let per_window: Vec<(i64, f64, usize)> = windows
+        .iter()
+        .filter_map(|w| {
+            let vals: Vec<f64> = w.iter().map(|(_, v)| f64::from(*v)).filter(|v| (70.0..=100.0).contains(v)).collect();
+            // a window counts when at least 10 of its ~30 seconds carry a saturation
+            (vals.len() >= 10).then(|| (w[0].0, median(&vals).unwrap(), vals.len()))
+        })
+        .collect();
+    if per_window.is_empty() {
+        return json!({"available": false, "windows": windows.len(), "status": "UNAVAILABLE"});
+    }
+    let meds: Vec<f64> = per_window.iter().map(|w| w.1).collect();
+    json!({
+        "available": true,
+        "median_pct": round(median(&meds).unwrap(), 1),
+        "min_window_pct": meds.iter().copied().fold(f64::INFINITY, f64::min),
+        "windows": windows.len(),
+        "valid_windows": per_window.len(),
+        "windows_below_95": meds.iter().filter(|v| **v < 95.0).count(),
+        "windows_below_90": meds.iter().filter(|v| **v < 90.0).count(),
+        "series": per_window.iter().map(|w| json!([w.0, w.1, w.2])).collect::<Vec<_>>(),
+        "source": "computed on the strap (R18 byte 82), 30 s windows every 20 min during sleep",
+        "status": "DECODED_UNVALIDATED",
+    })
+}
+
+fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record], spo2_values: &[(i64, u8)]) -> Value {
     let Some(sp) = sleep_period(s) else { return json!({ "available": false, "firmware_sleep_min": s.iter().filter(|x| x.band == "sleep").count() / 60 }) };
     let (stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
     let count = |k: &str| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round();
@@ -613,6 +651,7 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
             "stages_status": "EXPERIMENTAL (65-73 % epoch agreement ceiling without EEG)",
         },
         "optical": optical,
+        "spo2": spo2_summary(&spo2_values.iter().copied().filter(|(t, _)| *t >= s[sp.bed].ts && *t <= s[sp.wake].ts).collect::<Vec<_>>()),
         "rr_coverage_pct": round(100.0 * rr_count as f64 / (hr.iter().sum::<f64>() / 60.0).max(1.0), 1),
     });
     out["recovery"] = baselines::recovery(&baselines::RecoveryInputs {
@@ -820,7 +859,7 @@ fn provenance() -> Value {
         "day.stress": p("R18 HR, activity, dynamic accel", "HR elevation at rest vs 40 % HR reserve, 5-min buckets", "0-100", "EXPERIMENTAL"),
         "day.energy": p("R18 HR + profile", "Mifflin-St Jeor resting + Keytel 2005 active", "kcal", "EXPERIMENTAL"),
         "load": p("daily Edwards TRIMP", "7 d acute, 28 d chronic, ACWR after 21 d, Foster monotony", "a.u.", "EXPERIMENTAL"),
-        "spo2": p("none", "no reliable field in WHOOP 5.0 frames", "", "UNAVAILABLE"),
+        "night.spo2": p("R18 byte 82 (on-strap SpO2)", "per-window median of the % values (70-100), status codes discarded", "%", "DECODED_UNVALIDATED"),
     })
 }
 
@@ -885,7 +924,12 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
         } else {
             let night_samples = load_samples(&conn, n0, n1)?;
             let optical_windows = whoop5_store::load_r26(&conn, n0, n1)?;
-            let night = analyze_night(&night_samples, &nights_hist, &optical_windows);
+            let spo2_values: Vec<(i64, u8)> = {
+                let mut st = conn.prepare_cached("SELECT ts, sleep_adjacent_raw FROM whoop5_r18 WHERE ts >= ?1 AND ts < ?2 AND sleep_adjacent_raw > 0 ORDER BY ts")?;
+                let rows = st.query_map(params![n0, n1], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let night = analyze_night(&night_samples, &nights_hist, &optical_windows, &spo2_values);
             let day_samples = load_samples(&conn, d0, d1)?;
             let rhr = night["resting_hr_bpm"].as_f64();
             let day = analyze_day(&day_samples, d0, now, &options.profile, rhr);
@@ -936,6 +980,19 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spo2_windows_from_real_sequences() {
+        // two real windows (10 Nov 01:36 and 02:56): one clean, one mostly status codes
+        let a = [16u8, 48, 32, 32, 99, 100, 99, 99, 99, 99, 99, 100, 99, 100, 100, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 100];
+        let b = [128u8, 128, 128, 144, 32, 32, 32, 88, 86, 87, 88, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 160, 87, 90, 32, 32];
+        let mut v: Vec<(i64, u8)> = a.iter().enumerate().map(|(i, x)| (1000 + i as i64, *x)).collect();
+        v.extend(b.iter().enumerate().map(|(i, x)| (2200 + i as i64, *x)));
+        let s = spo2_summary(&v);
+        assert_eq!(s["windows"], 2);
+        assert_eq!(s["valid_windows"], 1); // the second has only 6 saturation seconds
+        assert_eq!(s["median_pct"], 99.0);
+    }
 
     #[test]
     fn civil_dates() {
