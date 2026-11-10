@@ -58,3 +58,59 @@ personnels (stades de sommeil, récupération). C'est à évaluer contre les mes
 Activer R20 en historique pendant 20 à 30 min **de sommeil**. WHOOP calcule sa SpO₂ la nuit, et les blocs 1 et 2 (source 3)
 pourraient n'être échantillonnés qu'à ce moment-là. S'ils contiennent une voie pulsatile, une étude SpO₂ relative (ratio of
 ratios, tendances nocturnes, sans valeur absolue tant qu'il n'y a pas d'étalonnage) deviendrait envisageable.
+
+## Quels flux sont mesurés, quand, et transmis comment
+
+D'après les données du 9 au 10 novembre (21 h → 16 h, firmware 50.38.1).
+
+| Flux | Quand il est produit | Comment il arrive | Remarques |
+|---|---|---|---|
+| R18 (FC, R-R, gravité, accélération dynamique, pas, activité, peau, état du bracelet) | **en continu, 1 enregistrement/s, 24 h/24** | stocké dans le bracelet, envoyé à la synchro de l'historique | Les R-R ne sont présents que 20 à 80 % des secondes : peu le jour (mouvement), environ 75 % la nuit |
+| R26 (PPG compact, 1 voie, 25 Hz) | **rafales de 40 s toutes les 14 à 21 min, jour et nuit** | historique | La configuration optique (`status_raw`) change à l'endormissement (2816 → 2656 → 2832) et au réveil (→ 2896) |
+| R20 (optique brute, plusieurs LED + ambiante) | **seulement sur commande** | `153` → historique ; `107`+`108` → direct (paquet 43) | Le bracelet ne l'enregistre pas de lui-même |
+| R21 / IMU six axes | **seulement sur commande** | `106` → direct (paquet 43) ; `154` → historique (non testé) | |
+| FC + R-R en direct (paquet 40) | **seulement sur commande** (`3`) | direct, 1/s | |
+| Événements (paquet 48) | à l'événement | historique et direct | rapport d'état fréquent, batterie environ toutes les 15 min, connexions BLE, double tap… |
+
+**Tout n'est pas transmis.** Le bracelet échantillonne ses capteurs bien plus vite qu'il n'enregistre :
+- par défaut, il **calcule à bord** la FC, les R-R, la gravité, les pas, l'état du bracelet et la température de peau, et
+  ne garde que ce résumé par seconde (R18) ;
+- il y ajoute de courts extraits de PPG (R26).
+
+Le signal optique brut multi-LED (R20) et l'IMU brute ne sont produits que si l'app les demande. Pour la batterie et la
+mémoire du bracelet, c'est sans doute le plus gros poste : R20 pèse 2 140 o/s contre 124 o/s pour R18.
+
+**Pas de SpO₂ brute dans l'historique standard.** Les octets de R18 qui pourraient la porter (65–68, 83–103, 110–112)
+valent **toujours 0**, jour et nuit. Seuls changent à l'endormissement l'octet 35 (7 → 71), l'octet 40 et quelques mots
+d'état : ce sont des indicateurs de mode, pas des mesures. Sur la 4.0, NOOP trouve `spo2_red` et `spo2_ir` dans
+l'historique ; sur ce 5.0, ces valeurs n'y sont pas.
+
+## Comment WHOOP calcule (d'après ses publications et des tests indépendants)
+
+- **SpO₂** : LED rouge et infrarouge, par la méthode classique du rapport des parts pulsatiles (AC/DC) rouge / infrarouge.
+  Mesure **pendant le sommeil seulement**, par prélèvements ponctuels toutes les quelques minutes. Calcul fait par WHOOP,
+  à partir de données optiques que l'app officielle déclenche ou récupère. On peut supposer, sans preuve, que l'app
+  officielle active un mode optique (type R20) la nuit, ce que goose ne fait pas.
+- **Fréquence respiratoire** : mesurée pendant le sommeil à partir du rythme cardiaque. La méthode détaillée n'est pas
+  publiée ; l'approche standard est l'arythmie sinusale respiratoire (RSA), celle de goose.
+- **Pression artérielle (WHOOP MG, « Blood Pressure Insights », bêta)** :
+  - PPG mesuré **pendant le sommeil** ;
+  - **étalonnage obligatoire** avec 3 mesures d'un brassard validé, et nouvel étalonnage demandé si un écart important
+    apparaît ;
+  - résultat affiché en **plage**, pas en valeur ;
+  - non validé de façon indépendante, et ayant fait l'objet d'un avertissement de la FDA en 2025.
+
+## Pression artérielle avec nos signaux : ce qui est faisable
+
+La démarche honnête est celle de WHOOP : **des tendances personnelles étalonnées**, pas une mesure absolue.
+1. **Capture** : R20 vert (bloc 0) pendant 20 à 30 min de sommeil calme chaque nuit.
+2. **Caractéristiques du pouls** : temps de montée, largeur à mi-hauteur, AC/DC (seulement à réglage LED identique),
+   FC et VFC. À 25 Hz, les dérivées secondes et l'onde dicrote ne sont pas exploitables, donc le jeu de caractéristiques
+   reste pauvre.
+3. **Étalonnage** : au moins 3 mesures au brassard saisies par toi (systolique et diastolique), puis régression
+   personnelle avec une incertitude affichée.
+4. **Sortie** : une **plage** et une tendance sur plusieurs nuits, marquées expérimentales, avec une alerte de nouvel
+   étalonnage si l'erreur sur une mesure de contrôle dépasse un seuil.
+
+Précision attendue : inconnue tant que des mesures de contrôle au brassard n'ont pas été comparées. La littérature sur la
+pression sans brassard à partir du PPG seul rapporte des erreurs de l'ordre de 8 à 15 mmHg, même après étalonnage.
