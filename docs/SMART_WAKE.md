@@ -204,3 +204,31 @@ avec des appels cadencés comme dans l'app.
 - que les paquets 40 arrivent bien en arrière-plan toute la nuit ;
 - que l'alarme limite et les alarmes de la rampe (id 1 à 3) peuvent coexister ;
 - le délai entre le lever et l'arrêt, qui dépend de la synchronisation toutes les 45 s.
+
+## 9. Mouvement en direct (tests du 10 novembre)
+
+Test silencieux « Mouvement en direct » de l'onglet Alarme, réponses du bracelet :
+
+| Méthode | Réponse | Données reçues |
+|---|---|---|
+| Synchronisation haute fréquence (commande 96) à 15, 30 et 60 s | refusée | — |
+| Synchronisation haute fréquence à 120 et 180 s | acceptée (événements 97 / 98) | un envoi au mieux toutes les 2 min, pas mieux que la synchronisation actuelle : non utilisée |
+| Flux mouvement temps réel R10/R11 (commande 63) | refusé (code 3) | — |
+| **Mode IMU temps réel (commande 106)** | **acceptée** | **paquet 43, même format que R21 (1 244 o), 1 trame par seconde, 100 échantillons par axe** |
+
+**Utilisation pour le réveil.** L'app active le mode IMU **5 min avant l'ouverture de la fenêtre**, pour épargner la
+batterie, puis le relance s'il s'interrompt et le coupe à la fin. Les trames brutes sont gardées telles quelles
+(`smart_wake_imu`) et décodées par le décodeur R21. Elles fournissent, avec environ 1 s de retard :
+- l'orientation du poignet à chaque seconde, qui remplace la gravité R18 arrivant 2 min plus tard ;
+- l'intensité du mouvement : écart-type de |a| sur la seconde ;
+- les pas, via `imu::features`.
+
+**Nouvelles règles :**
+- **Marche dans la fenêtre** (au moins 20 pas en 30 s) : réveil acquis, sans vibration.
+- **Après la vibration** : au moins 10 pas, ou au moins 15 s de mouvement (écart-type > 0,06 g) dans les 30 dernières
+  secondes, suffisent à arrêter l'alarme. Les 70 s qui suivent le déclenchement sont ignorées, car le moteur haptique
+  secoue lui-même l'accéléromètre.
+
+Ces règles sont testées dans `smart_wake::e2e` avec de vraies trames 43 synthétiques. Il reste à vérifier sur des données
+réelles l'échelle de l'accéléromètre (1/4096 g supposée, contrôlable avec `imu::accel_scale_check`) et l'autonomie du
+bracelet avec le mode IMU allumé environ 50 min.

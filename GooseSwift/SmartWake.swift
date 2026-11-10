@@ -190,6 +190,104 @@ final class HapticRampPlayer: ObservableObject {
   }
 }
 
+// MARK: - Motion latency probe
+
+/// Measures how fast movement data can reach the phone: phase A = strap-pushed history
+/// (ENTER_HIGH_FREQ_SYNC, 15 s interval), latency = arrival - R18 record timestamp; phase B =
+/// realtime streams (TOGGLE_REALTIME_HR + SEND_R10_R11_REALTIME): which frames arrive, how often.
+/// No vibration. Results: on screen and Documents/motion_probe.json.
+@MainActor
+final class MotionProbe: ObservableObject {
+  @Published private(set) var status = ""
+  @Published private(set) var lines: [String] = []
+  private weak var ble: GooseBLEClient?
+  private var phase = ""
+  private var phaseStart = Date()
+  private var arrivals: [String: [Double]] = [:]   // key = phase|type|layout|len -> arrival offsets
+  private var samples: [String: [String]] = [:]
+  private var r18Latency: [String: [Double]] = [:]
+
+  func attach(ble: GooseBLEClient) { self.ble = ble }
+
+  func run(keepLiveHR: Bool) {
+    guard let ble else { return }
+    lines = []; arrivals = [:]; samples = [:]; r18Latency = [:]
+    ble.rawFrameSink = { [weak self] hex, date in
+      Task { @MainActor in self?.observe(hex: hex, at: date) }
+    }
+    status = "Attente d'un bracelet libre…"
+    // round 2: which high-frequency intervals the strap accepts, then realtime IMU mode
+    let intervals = [30, 60, 120, 180]
+    ble.whenFreeForCommands(timeout: 60) { [weak self] ble in
+      guard let self else { return }
+      var t = 0.0
+      for iv in intervals {
+        DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+          self.begin("A_hfs_\(iv)s")
+          ble.whenFreeForCommands { $0.enterHighFrequencyHistorySync(intervalSeconds: iv, durationSeconds: 600) }
+        }
+        // stay long enough to see one push at this interval (max 70 s per try)
+        t += Double(min(iv, 60) + 10)
+        DispatchQueue.main.asyncAfter(deadline: .now() + t - 4) {
+          ble.whenFreeForCommands { $0.exitHighFrequencyHistorySync() }
+        }
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + t + 2) {
+        self.begin("B_imu_realtime")
+        ble.whenFreeForCommands { $0.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")], requestedStatus: "Motion probe IMU", updatePhysiologyStatus: false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+          ble.whenFreeForCommands { $0.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(false), name: "TOGGLE_IMU_MODE_OFF")], requestedStatus: "Motion probe IMU off", updatePhysiologyStatus: false) }
+          DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.finish() }
+        }
+      }
+    }
+    _ = keepLiveHR
+  }
+
+  private func begin(_ p: String) {
+    phase = p
+    phaseStart = Date()
+    status = "Phase \(p)…"
+  }
+
+  private func observe(hex: String, at date: Date) {
+    guard !phase.isEmpty, hex.count >= 20 else { return }
+    func byte(_ i: Int) -> Int { Int(hex.dropFirst(2 * i).prefix(2), radix: 16) ?? -1 }
+    let type = byte(8), layout = byte(9), len = hex.count / 2
+    let key = "\(phase)|type\(type)|layout\(layout)|len\(len)"
+    arrivals[key, default: []].append(date.timeIntervalSince(phaseStart))
+    if samples[key, default: []].count < 3 { samples[key, default: []].append(String(hex.prefix(160))) }
+    if type == 47, layout == 18, len == 124 {
+      // R18 timestamp: u32 at frame byte 15
+      let ts = (15..<19).reversed().reduce(0) { $0 << 8 | byte($1) }
+      r18Latency[phase, default: []].append(date.timeIntervalSince1970 - Double(ts))
+    }
+  }
+
+  private func finish() {
+    ble?.rawFrameSink = nil
+    phase = ""
+    var out: [[String: Any]] = []
+    for (key, t) in arrivals.sorted(by: { $0.key < $1.key }) {
+      let gaps = zip(t.dropFirst(), t).map { $0 - $1 }.sorted()
+      let medianGap = gaps.isEmpty ? 0 : gaps[gaps.count / 2]
+      out.append(["key": key, "frames": t.count, "median_gap_s": medianGap, "first_s": t.first ?? 0, "samples": samples[key] ?? []])
+      lines.append("\(key): \(t.count) trames, écart médian \(String(format: "%.2f", medianGap)) s")
+    }
+    for (p, lat) in r18Latency.sorted(by: { $0.key < $1.key }) {
+      let s = lat.sorted()
+      let med = s[s.count / 2], minL = s.first ?? 0
+      out.append(["key": "\(p)|r18_latency", "frames": s.count, "median_s": med, "min_s": minL, "max_s": s.last ?? 0])
+      lines.append("\(p) retard R18 : médian \(Int(med)) s, min \(Int(minL)) s (\(s.count) enreg.)")
+    }
+    if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+       let data = try? JSONSerialization.data(withJSONObject: out, options: .prettyPrinted) {
+      try? data.write(to: dir.appendingPathComponent("motion_probe.json"))
+    }
+    status = "Test terminé"
+  }
+}
+
 // MARK: - Controller
 
 /// Smart wake-up: runs the Rust engine (`smart_wake.update`, Rust/core/src/smart_wake.rs) every 30 s
@@ -215,6 +313,7 @@ final class SmartWakeController: ObservableObject {
   @Published private(set) var feedbackPendingSessionID: String?
   @Published private(set) var plan: [String: Any] = [:]
   let ramp = HapticRampPlayer()
+  let motionProbe = MotionProbe()
 
   private weak var ble: GooseBLEClient?
   private let queue = DispatchQueue(label: "smart-wake.engine", qos: .userInitiated)
@@ -254,9 +353,13 @@ final class SmartWakeController: ObservableObject {
   func attach(ble: GooseBLEClient) {
     self.ble = ble
     ramp.attach(ble: ble)
+    motionProbe.attach(ble: ble)
     if session != nil { startHeartbeat() }
     ble.liveSampleSink = { [weak self] date, hr, rr, source in
       self?.ingest(date: date, hr: hr, rr: rr, source: source)
+    }
+    ble.liveIMUSink = { [weak self] hex, date in
+      self?.ingestIMU(hex: hex, date: date)
     }
   }
 
@@ -305,7 +408,10 @@ final class SmartWakeController: ObservableObject {
     ble?.whenFreeForCommands(timeout: 120) { ble in
       ble.disableWhoopAlarms()
       DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-        ble.whenFreeForCommands { $0.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 3, payload: [0], name: "TOGGLE_REALTIME_HR_OFF")], requestedStatus: "Smart wake: live HR off", updatePhysiologyStatus: false) }
+        ble.whenFreeForCommands { $0.writeSensorStreamCommands([
+          GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(false), name: "TOGGLE_IMU_MODE_OFF"),
+          GooseBLEClient.SensorStreamCommandKind(commandNumber: 3, payload: [0], name: "TOGGLE_REALTIME_HR_OFF"),
+        ], requestedStatus: "Smart wake: live streams off", updatePhysiologyStatus: false) }
       }
     }
     status = "Inactif (\(reason))"
@@ -333,6 +439,16 @@ final class SmartWakeController: ObservableObject {
 
   // MARK: live loop
 
+  nonisolated(unsafe) private var pendingIMU: [(Int, String)] = []
+  nonisolated(unsafe) private var lastIMU: TimeInterval = 0
+
+  nonisolated private func ingestIMU(hex: String, date: Date) {
+    lock.lock()
+    lastIMU = date.timeIntervalSince1970
+    if pendingIMU.count < 600 { pendingIMU.append((Int(date.timeIntervalSince1970), hex)) }
+    lock.unlock()
+  }
+
   nonisolated(unsafe) private var lastPacket40: TimeInterval = 0
   nonisolated(unsafe) private var lastLiveSample: TimeInterval = 0
 
@@ -353,6 +469,9 @@ final class SmartWakeController: ObservableObject {
 
   @Published private(set) var deadlineConfirmed = false
   @Published private(set) var liveStreamOK = false
+  @Published private(set) var imuStreamOK = false
+  private var lastIMURequest = Date.distantPast
+  private var imuRequested = false
   private var lastDeadlineAttempt = Date.distantPast
   private var lastLiveRequest = Date.distantPast
 
@@ -365,6 +484,15 @@ final class SmartWakeController: ObservableObject {
     if !liveStreamOK, now.timeIntervalSince(lastLiveRequest) >= 30, ble.isFreeForCommands {
       lastLiveRequest = now
       ble.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 3, payload: [1], name: "TOGGLE_REALTIME_HR_ON")], requestedStatus: "Smart wake: live HR", updatePhysiologyStatus: false)
+    }
+    // live IMU (1 frame/s, ~1 s latency) only from 5 min before the window opens: battery
+    lock.lock(); let imuAge = now.timeIntervalSince1970 - lastIMU; lock.unlock()
+    imuStreamOK = imuAge < 10
+    let opens = windowStart ?? Date(timeIntervalSince1970: TimeInterval(s.windowEnd - 2700))
+    if now >= opens.addingTimeInterval(-300), !imuStreamOK, now.timeIntervalSince(lastIMURequest) >= 30, ble.isFreeForCommands, !ramp.isPlaying {
+      lastIMURequest = now
+      imuRequested = true
+      ble.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")], requestedStatus: "Smart wake: live IMU", updatePhysiologyStatus: false)
     }
     if !deadlineConfirmed, now.timeIntervalSince(lastDeadlineAttempt) >= 20, ble.isFreeForCommands, !ramp.isPlaying {
       lastDeadlineAttempt = now
@@ -405,11 +533,14 @@ final class SmartWakeController: ObservableObject {
     lock.lock()
     let live = pending.sorted { $0.key < $1.key }.map { [$0.key, $0.value.hr ?? 0, $0.value.rr] as [Any] }
     pending.removeAll()
+    let imu = pendingIMU.map { [$0.0, $0.1] as [Any] }
+    pendingIMU.removeAll()
     lock.unlock()
     let args: [String: Any] = [
       "database_path": HealthDataStore.defaultDatabasePath(),
       "session": ["id": s.id, "start_ts": s.startTs, "window_start": 0, "window_end": s.windowEnd, "utc_offset_seconds": TimeZone.current.secondsFromGMT()],
       "live": live,
+      "imu": imu,
       "acknowledged": acknowledged,
     ]
     queue.async { [weak self] in
@@ -495,6 +626,7 @@ struct AlarmView: View {
         tonightCard
         nightsCard
         vibrationCard
+        MotionProbeCard(probe: controller.motionProbe, keepLiveHR: controller.session != nil)
         Text("Estimations expérimentales : probabilités d'état estimées, moment favorable prédit. Méthode : docs/SMART_WAKE.md")
           .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
       }
@@ -578,6 +710,9 @@ struct AlarmView: View {
           .foregroundStyle(controller.deadlineConfirmed ? .green : .orange)
       }
       .font(.caption)
+      Label(controller.imuStreamOK ? "Mouvement en direct (IMU)" : "Mouvement en direct : activé 5 min avant la fenêtre", systemImage: controller.imuStreamOK ? "figure.walk.motion" : "moon.zzz")
+        .font(.caption)
+        .foregroundStyle(controller.imuStreamOK ? .green : .secondary)
       if controller.posterior.count == 4 {
         HStack(alignment: .bottom, spacing: 12) {
           stateBar("Éveil", controller.posterior[0], .orange)
@@ -782,5 +917,24 @@ struct AlarmView: View {
   private func duration(_ minutes: Double) -> String {
     let m = Int(minutes.rounded())
     return m >= 60 ? "\(m / 60) h \(String(format: "%02d", m % 60))" : "\(m) min"
+  }
+}
+
+struct MotionProbeCard: View {
+  @ObservedObject var probe: MotionProbe
+  let keepLiveHR: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Label("Mouvement en direct (test)", systemImage: "figure.walk.motion").font(.headline)
+      Text("Mesure le retard du mouvement : synchro haute fréquence à 30, 60, 120 et 180 s, puis mode IMU temps réel. Sans vibration, environ 4 min, bracelet porté.")
+        .font(.footnote).foregroundStyle(.secondary)
+      Button("Lancer le test") { probe.run(keepLiveHR: keepLiveHR) }.buttonStyle(.bordered)
+      if !probe.status.isEmpty { Text(probe.status).font(.caption) }
+      ForEach(probe.lines, id: \.self) { Text($0).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary) }
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
   }
 }

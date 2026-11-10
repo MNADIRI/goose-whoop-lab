@@ -54,6 +54,8 @@ pub struct Sec {
     pub grav: Option<[f64; 3]>,
     pub band: Option<u8>, // 0 wake, 1 still, 2 sleep, 3 up
     pub live: bool,
+    /// live IMU (packet 43): SD of |a| within the second (g)
+    pub imu_dyn: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -448,6 +450,9 @@ pub struct UpdateArgs {
     /// Swift reports that the last stimulation could not be sent
     #[serde(default)]
     pub stimulation_failed: bool,
+    /// live IMU frames (packet 43 / R21 layout, TOGGLE_IMU_MODE) since the last call: [arrival_ts, frame_hex]
+    #[serde(default)]
+    pub imu: Vec<(i64, String)>,
 }
 
 pub fn ensure_tables(conn: &Connection) -> GooseResult<()> {
@@ -462,6 +467,7 @@ pub fn ensure_tables(conn: &Connection) -> GooseResult<()> {
         );
         CREATE TABLE IF NOT EXISTS smart_wake_log (session_id TEXT NOT NULL, ts INTEGER NOT NULL, epoch_json TEXT NOT NULL, PRIMARY KEY (session_id, ts));
         CREATE TABLE IF NOT EXISTS smart_wake_model (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS smart_wake_imu (session_id TEXT NOT NULL, ts INTEGER NOT NULL, frame BLOB NOT NULL, PRIMARY KEY (session_id, ts));
         "#,
     )?;
     Ok(())
@@ -489,6 +495,7 @@ pub fn load_secs(conn: &Connection, session_id: Option<&str>, from: i64, to: i64
                 grav: match g { (Some(x), Some(y), Some(z)) => Some([x as f64 / 1000.0, y as f64 / 1000.0, z as f64 / 1000.0]), _ => None },
                 band: match band.as_str() { "wake" => Some(0), "still" => Some(1), "sleep" => Some(2), "up" => Some(3), _ => None },
                 live: false,
+                imu_dyn: None,
             });
         }
     }
@@ -506,8 +513,36 @@ pub fn load_secs(conn: &Connection, session_id: Option<&str>, from: i64, to: i64
             }
             e.live = true;
         }
+        for r in load_imu(conn, id, from, to)? {
+            let n = r.accel_raw.iter().map(Vec::len).min().unwrap_or(0);
+            if n < 50 {
+                continue;
+            }
+            let g: [f64; 3] = std::array::from_fn(|a| r.accel_raw[a][..n].iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64 / crate::whoop5_records::ACCEL_LSB_PER_G);
+            let mags: Vec<f64> = (0..n).map(|i| ((0..3).map(|a| (f64::from(r.accel_raw[a][i]) / crate::whoop5_records::ACCEL_LSB_PER_G).powi(2)).sum::<f64>()).sqrt()).collect();
+            let e = secs.entry(r.ts.floor() as i64).or_default();
+            e.grav = Some(g); // live orientation beats the lagged R18 gravity
+            e.imu_dyn = std_sample(&mags);
+            e.live = true;
+        }
     }
     Ok(secs)
+}
+
+/// Live IMU records of a session, decoded from the stored raw frames (raw kept as received).
+pub fn load_imu(conn: &Connection, session_id: &str, from: i64, to: i64) -> GooseResult<Vec<crate::whoop5_records::R21Record>> {
+    let mut st = conn.prepare_cached("SELECT frame FROM smart_wake_imu WHERE session_id = ?1 AND ts >= ?2 AND ts <= ?3 ORDER BY ts")?;
+    let mut rows = st.query(params![session_id, from, to])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let frame: Vec<u8> = r.get(0)?;
+        if frame.len() == crate::whoop5_records::R21_FRAME_LEN {
+            if let Some(rec) = crate::whoop5_records::decode_r21(&frame[crate::whoop5_records::HEADER_LEN..frame.len() - 4]) {
+                out.push(rec);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Personal context from past nights (whoop_lab_days): baselines, habitual wake, sleep need/debt,
@@ -663,6 +698,17 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                     ins.execute(params![cfg.id, ts, hr, rr.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(",")])?;
                 }
             }
+            let mut imu = tx.prepare_cached("INSERT OR REPLACE INTO smart_wake_imu (session_id, ts, frame) VALUES (?1, ?2, ?3)")?;
+            for (_arrival, hex_frame) in &args.imu {
+                let Ok(frame) = hex::decode(hex_frame.trim()) else { continue };
+                // CRC-checked frames only; key by the record's own device timestamp (frame byte 15)
+                let Ok(parsed) = crate::protocol::parse_frame(crate::protocol::DeviceType::Goose, &frame) else { continue };
+                if !(parsed.header_crc_valid && parsed.payload_crc_valid) || frame.len() != crate::whoop5_records::R21_FRAME_LEN {
+                    continue;
+                }
+                let ts = i64::from(u32::from_le_bytes([frame[15], frame[16], frame[17], frame[18]]));
+                imu.execute(params![cfg.id, ts, frame])?;
+            }
         }
         tx.commit()?;
     }
@@ -710,12 +756,31 @@ fn step_engine(conn: &Connection, cfg: &SessionConfig, now: i64, ctx: &Context, 
     let in_window = now >= window_start;
     // sustained wake: the strap reports "up" (standing / orthostatic) in a recent epoch
     let up_since = |from: usize| f[from.min(k)..=k].iter().any(|x| x.band == Some(3));
+    // live IMU (only while the app streams it, near the window): steps and sustained motion in the
+    // last 30 s; `quiet_after` excludes the seconds where our own vibration shakes the accelerometer
+    let imu_activity = |quiet_after: Option<i64>| -> GooseResult<Option<(usize, usize)>> {
+        let Some(id) = live_id else { return Ok(None) };
+        let from = quiet_after.map_or(now - 30, |q| (now - 30).max(q));
+        if now - from < 15 {
+            return Ok(None);
+        }
+        let recs = load_imu(conn, id, from, now)?;
+        if recs.len() < 10 {
+            return Ok(None);
+        }
+        let series = crate::imu::series(&recs);
+        let feats = crate::imu::features(&series, 10.0);
+        let steps = feats["steps"].as_u64().unwrap_or(0) as usize;
+        let moving = secs.range(from..=now).filter(|(_, s)| s.imu_dyn.is_some_and(|d| d > 0.06)).count();
+        Ok(Some((steps, moving)))
+    };
     let to_h = to_habit(ctx, now);
     let dec = decide(&p, &ctx.model, asleep_h, to_h, remaining, alpha, now as u64);
     let quality = json!({
         "last_hr_age_s": last_hr_age, "fresh": fresh,
         "live_secs_last_epoch": f[k].live_secs,
-        "r18_lag_s": secs.iter().rev().find(|(_, s)| s.grav.is_some()).map(|(t, _)| now - t),
+        "r18_lag_s": secs.iter().rev().find(|(_, s)| s.grav.is_some() && !s.live).map(|(t, _)| now - t),
+        "imu_lag_s": secs.iter().rev().find(|(_, s)| s.imu_dyn.is_some()).map(|(t, _)| now - t),
         "features_present": {"hr": f[k].hr.is_some(), "hrv": f[k].ln_rmssd.is_some(), "movement": f[k].movement.is_some(), "band": f[k].band.is_some()},
     });
     let epoch = json!({
@@ -732,10 +797,11 @@ fn step_engine(conn: &Connection, cfg: &SessionConfig, now: i64, ctx: &Context, 
     match state.as_str() {
         "armed" if in_window => {
             let already_awake = post[k.saturating_sub(1)][W] >= 0.75 && p[W] >= 0.75 && fresh;
-            if up_since(k.saturating_sub(1)) {
-                // already up inside the window: no alarm at all
+            let walking = imu_activity(None)?.is_some_and(|(steps, _)| steps >= 20);
+            if up_since(k.saturating_sub(1)) || walking {
+                // already up (or walking) inside the window: no alarm at all
                 new_state = "awake".into();
-                action = json!({"action": "awake", "why": "levé détecté avant l'alarme"});
+                action = json!({"action": "awake", "why": if walking { "marche détectée avant l'alarme" } else { "levé détecté avant l'alarme" }});
                 if persist {
                     conn.execute("UPDATE smart_wake_sessions SET awake_ts = ?2 WHERE session_id = ?1", params![cfg.id, now])?;
                 }
@@ -756,11 +822,13 @@ fn step_engine(conn: &Connection, cfg: &SessionConfig, now: i64, ctx: &Context, 
             // sustained rise only: >= 12 bpm over the last 60 s with >= 40 samples
             let hr_rise = match (median(&pre), median(&post_hr)) { (Some(a), Some(b)) if post_hr.len() >= 40 => Some(b - a), _ => None };
             let stim_epoch = ((last_ts - t0) / EPOCH).max(0) as usize;
-            let stood_up = up_since(stim_epoch);
+            // the ramp plays ~60 s and shakes the accelerometer: IMU rules start 70 s after it
+            let moved = imu_activity(Some(last_ts + 70))?.is_some_and(|(steps, moving)| steps >= 10 || moving >= 15);
+            let stood_up = up_since(stim_epoch) || moved;
             let woke = acknowledged || stood_up || hr_rise.is_some_and(|d| d >= 12.0) || (p[W] >= 0.8 && post[k.saturating_sub(1)][W] >= 0.8) || double_tap_since(conn, last_ts)?;
             if woke {
                 new_state = "awake".into();
-                action = json!({"action": "awake", "hr_rise": hr_rise, "acknowledged": acknowledged, "why": if stood_up { "levé (UP) détecté" } else if acknowledged { "confirmé" } else { "réveil détecté" }});
+                action = json!({"action": "awake", "hr_rise": hr_rise, "acknowledged": acknowledged, "why": if moved { "mouvement soutenu détecté" } else if stood_up { "levé (UP) détecté" } else if acknowledged { "confirmé" } else { "réveil détecté" }});
                 if persist {
                     conn.execute("UPDATE smart_wake_sessions SET awake_ts = ?2 WHERE session_id = ?1", params![cfg.id, now])?;
                 }
@@ -1045,6 +1113,7 @@ mod tests {
                 grav: Some(if moving && t % 3 == 0 { [0.3, 0.6, -0.7] } else { [0.0, 0.6, -0.8] }),
                 band: Some(if moving { 0 } else { 2 }),
                 live: true,
+                imu_dyn: None,
             });
         }
         m
@@ -1194,6 +1263,7 @@ mod e2e {
             now_unix: Some(now),
             acknowledged: ack,
             stimulation_failed: false,
+            imu: vec![],
         })
         .unwrap()
     }
@@ -1312,6 +1382,58 @@ mod e2e {
         assert_eq!(r["bedtime"].as_i64().unwrap(), DEADLINE - ((rec + 20.0) * 60.0) as i64);
         assert_eq!(r["latency_min"], 20.0);
     }
+
+    /// Live IMU frame (packet 43, R21 layout) for second `ts`; `walk` = 1.8 Hz vertical bounce.
+    fn imu_frame(ts: i64, walk: bool) -> String {
+        let mut pl = crate::whoop5_records::tests::r21_payload(100, (0, 0, 4096), (0, 0, 0));
+        pl[0] = crate::whoop5_records::PACKET_REALTIME_RAW;
+        pl[15 - 8..19 - 8].copy_from_slice(&(ts as u32).to_le_bytes());
+        for i in 0..100 {
+            let t = ts as f64 + i as f64 / 100.0;
+            let z = if walk { 4096.0 * (1.0 + 0.3 * (2.0 * std::f64::consts::PI * 1.8 * t).sin()) } else { 4096.0 };
+            pl[428 - 8 + 2 * i..428 - 8 + 2 * i + 2].copy_from_slice(&(z as i16).to_le_bytes());
+        }
+        hex::encode(crate::protocol::build_v5_payload_frame(&pl))
+    }
+
+    fn call_imu(path: &str, now: i64, imu: Vec<(i64, String)>) -> Value {
+        update(&UpdateArgs {
+            database_path: path.into(),
+            session: SessionConfig { id: "s1".into(), start_ts: BED, window_start: 0, window_end: DEADLINE, utc_offset_seconds: 3600 },
+            live: vec![], now_unix: Some(now), acknowledged: false, stimulation_failed: false, imu,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn live_imu_walking_stops_alarm_but_vibration_shake_does_not() {
+        let (_d, p) = db();
+        write(&p, BED - 600, DEADLINE + 900, &|t| if t >= DEADLINE - 60 * 60 { St::Deep } else { night(t) });
+        let (ts, r) = run_until_action(&p, BED + 600, DEADLINE + 60).expect("deadline stimulation");
+        assert_eq!(r["action"], "stimulate");
+        // strap shakes during the ramp (looks like motion) -> must NOT count as awake
+        let shake: Vec<(i64, String)> = (ts..ts + 30).map(|t| (t, imu_frame(t, true))).collect();
+        let r1 = call_imu(&p, ts + 30, shake);
+        assert_ne!(r1["action"], "awake", "own vibration must be ignored: {r1}");
+        assert!(r1["epoch"]["quality"]["imu_lag_s"].as_i64().unwrap() <= 2, "{}", r1["epoch"]["quality"]);
+        // real walking after the ramp -> awake through the live IMU, before any R18 sync
+        let walk: Vec<(i64, String)> = (ts + 75..ts + 110).map(|t| (t, imu_frame(t, true))).collect();
+        let r2 = call_imu(&p, ts + 110, walk);
+        assert_eq!(r2["action"], "awake", "{r2}");
+        assert_eq!(r2["why"], "mouvement soutenu détecté");
+    }
+
+    #[test]
+    fn live_imu_walking_in_window_needs_no_alarm() {
+        let (_d, p) = db();
+        write(&p, BED - 600, DEADLINE + 600, &|t| if t >= DEADLINE - 60 * 60 { St::Deep } else { night(t) });
+        let now = DEADLINE - 20 * 60; // inside the automatic window
+        let _ = call_imu(&p, now - 600, vec![]);
+        let walk: Vec<(i64, String)> = (now - 30..now).map(|t| (t, imu_frame(t, true))).collect();
+        let r = call_imu(&p, now, walk);
+        assert_eq!(r["action"], "awake", "{r}");
+        assert_eq!(r["why"], "marche détectée avant l'alarme");
+    }
 }
 
 #[cfg(test)]
@@ -1327,7 +1449,7 @@ mod latency_real {
             let r = super::update(&super::UpdateArgs {
                 database_path: db.clone(),
                 session: super::SessionConfig { id: format!("lat-{label}"), start_ts: wake - 10 * 3600, window_start: 0, window_end: wake, utc_offset_seconds: 3600 },
-                live: vec![], now_unix: Some(now), acknowledged: false, stimulation_failed: false,
+                live: vec![], now_unix: Some(now), acknowledged: false, stimulation_failed: false, imu: vec![],
             }).unwrap();
             println!("{label}: wall {:?} engine {} ms action {} post {} window {} fresh {}", t.elapsed(), r["latency_ms"], r["action"], r["epoch"]["posterior"], r["window"], r["epoch"]["quality"]["fresh"]);
         }

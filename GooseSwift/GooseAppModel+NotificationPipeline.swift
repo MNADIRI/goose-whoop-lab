@@ -383,6 +383,10 @@ extension GooseAppModel {
     // parse pipeline routes it off-main and never exposes its HR / R-R (smart wake needs both).
     for frame in frames {
       Self.forwardRealtimeHeartRate(hex: frame.hex, ble: context.ble, at: event.capturedAt)
+      context.ble.rawFrameSink?(frame.hex, event.capturedAt)
+      if frame.hex.count == 2 * 1244, frame.hex.dropFirst(16).prefix(4) == "2b15" {
+        context.ble.liveIMUSink?(frame.hex, event.capturedAt)
+      }
     }
     let parser = notificationFrameParser
     let deviceType = context.deviceType

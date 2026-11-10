@@ -16,6 +16,8 @@ pub const DECODER_VERSION: &str = "whoop5-records.v1";
 pub const HEADER_LEN: usize = 8;
 
 pub const PACKET_REALTIME: u8 = 40;
+/// Realtime raw stream; with TOGGLE_IMU_MODE (106) it carries the R21 IMU layout at 1 record/s.
+pub const PACKET_REALTIME_RAW: u8 = 43;
 pub const PACKET_HISTORY: u8 = 47;
 pub const PACKET_EVENT: u8 = 48;
 pub const PACKET_METADATA: u8 = 49;
@@ -482,7 +484,8 @@ impl R21Record {
 }
 
 pub fn decode_r21(pl: &[u8]) -> Option<R21Record> {
-    if pl.len() != R21_FRAME_LEN - 12 || pl[0] != PACKET_HISTORY || pl[1] != LAYOUT_R21 {
+    // history (47) or live (43, TOGGLE_IMU_MODE): same 1244-byte layout, verified on fw 50.38.1
+    if pl.len() != R21_FRAME_LEN - 12 || (pl[0] != PACKET_HISTORY && pl[0] != PACKET_REALTIME_RAW) || pl[1] != LAYOUT_R21 {
         return None;
     }
     let mut warnings = Vec::new();
@@ -645,6 +648,7 @@ pub fn decode_payload(pl: &[u8]) -> Option<Record> {
             _ => None,
         },
         PACKET_REALTIME => decode_live_hr(pl).map(Record::LiveHr),
+        PACKET_REALTIME_RAW if layout == LAYOUT_R21 => decode_r21(pl).map(Record::R21),
         PACKET_EVENT => decode_event(pl).map(Record::Event),
         PACKET_METADATA => decode_metadata(pl).map(Record::Metadata),
         PACKET_CONSOLE => decode_console(pl).map(|text| Record::Console { text }),
