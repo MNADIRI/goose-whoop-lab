@@ -12,7 +12,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
-pub const DECODER_VERSION: &str = "whoop5-records.v2"; // v2: R26 base is signed (i32)
+pub const DECODER_VERSION: &str = "whoop5-records.v3"; // v2: signed R26 base; v3: console text offset, battery %
 pub const HEADER_LEN: usize = 8;
 
 pub const PACKET_REALTIME: u8 = 40;
@@ -576,11 +576,16 @@ pub fn decode_event(pl: &[u8]) -> Option<StrapEvent> {
     let decoded = match event_id {
         // goose observation on 5.0: status byte + two u32 words, the second tracks pack voltage.
         // NOOP's 4.0 layout (soc@17/10, mV@21) does not match 5.0 frames, so it is not applied.
+        // BATTERY_LEVEL: u16@1 / 10 = state of charge (max 99.7 % matches the firmware log
+        // "SUPERVISOR: SOC report: 99.70"), u16@5 = pack voltage in mV (3442-4421 observed)
         3 if data.len() >= 9 => {
-            let mv = u32_at(data, 5).unwrap_or(0);
-            json!({"status_raw": data[0], "word1_raw": u32_at(data, 1), "voltage_mv_candidate": mv,
-                   "voltage_plausible": (3000..=4400).contains(&mv), "status": Status::DecodedUnvalidated})
+            let soc = u16_at(data, 1).map(|v| f64::from(v) / 10.0).filter(|v| *v <= 100.0);
+            let mv = u16_at(data, 5).unwrap_or(0);
+            json!({"status_raw": data[0], "battery_pct": soc, "voltage_mv": (3000..=4500).contains(&mv).then_some(mv),
+                   "status": Status::DecodedUnvalidated})
         }
+        // EXTENDED_BATTERY_INFORMATION: u16@5 / 10 looks like a battery temperature (20-44 degC)
+        63 if data.len() >= 7 => json!({"battery_temp_c_candidate": u16_at(data, 5).map(|v| f64::from(v) / 10.0), "status": Status::Experimental}),
         17 if data.len() >= 2 => json!({"level_raw": u16_at(data, 0), "status": Status::DecodedUnvalidated}),
         _ => Value::Null,
     };
@@ -616,10 +621,11 @@ pub fn decode_metadata(pl: &[u8]) -> Option<HistoryMeta> {
 }
 
 pub fn decode_console(pl: &[u8]) -> Option<String> {
-    if pl.first() != Some(&PACKET_CONSOLE) || pl.len() < p(10) {
+    if pl.first() != Some(&PACKET_CONSOLE) || pl.len() < p(21) {
         return None;
     }
-    let body = &pl[p(10)..];
+    // text starts at frame byte 21 (frame 8-20: header, timestamp, counters)
+    let body = pl.get(p(21)..).unwrap_or(&[]);
     let end = body.iter().position(|b| *b == 0).unwrap_or(body.len());
     Some(String::from_utf8_lossy(&body[..end]).chars().take(2048).collect())
 }
@@ -840,10 +846,19 @@ pub(crate) mod tests {
         pl[0] = PACKET_EVENT;
         put(&mut pl, 10, &3u16.to_le_bytes());
         put(&mut pl, 12, &1_794_000_000u32.to_le_bytes());
-        put(&mut pl, 25, &3900u32.to_le_bytes());
+        put(&mut pl, 21, &611u16.to_le_bytes());
+        put(&mut pl, 25, &3900u16.to_le_bytes());
         let e = decode_event(&pl).unwrap();
         assert_eq!(e.name, "BATTERY_LEVEL");
-        assert_eq!(e.decoded["voltage_mv_candidate"], 3900);
+        assert_eq!(e.decoded["battery_pct"], 61.1);
+        assert_eq!(e.decoded["voltage_mv"], 3900);
         assert_eq!(event_name(200), "EVENT_200");
+    }
+
+    #[test]
+    fn console_text_starts_at_frame_byte_21() {
+        // real payload prefix (10 Nov): "...BLE Conn: ..."
+        let pl = hex::decode("3250020082a01a6ac21534000120424c4520436f6e6e3a20").unwrap();
+        assert_eq!(decode_console(&pl).unwrap(), " BLE Conn: ");
     }
 }

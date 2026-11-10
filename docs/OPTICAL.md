@@ -114,3 +114,30 @@ La démarche honnête est celle de WHOOP : **des tendances personnelles étalonn
 
 Précision attendue : inconnue tant que des mesures de contrôle au brassard n'ont pas été comparées. La littérature sur la
 pression sans brassard à partir du PPG seul rapporte des erreurs de l'ordre de 8 à 15 mmHg, même après étalonnage.
+
+## Signaux présents mais pas encore exploités (analyse du 10 novembre)
+
+| Source | Signal | Lecture probable | Indice | Usage possible |
+|---|---|---|---|---|
+| R18 `cadence_raw` | période du pas | arrêt 138, marche 128, course 81 | course/marche = 0,63 ≈ rapport des périodes de pas réelles ; en 1/256 s : ~120 pas/min en marche, ~190 en course | cadence, intensité de la marche |
+| R18 `optical_amplitude_a/b` | amplitude optique **chaque seconde, 24 h/24** | indice de perfusion continu candidat | corr. 0,57 avec la FC, sensible au mouvement | tendance de vasoconstriction nocturne (plus dense que les rafales R26) |
+| R18 `hr_quality_raw` | confiance dans la FC | plus haute la nuit | corr. 0,45 avec la présence de R-R | pondérer FC et VFC, contrôle qualité |
+| R18 `aux_temp1/2` | températures carte / environnement | 29–30 °C le jour, 31–32 °C la nuit | toujours présentes | écart peau − environnement (couette, chambre), correction de la température de peau |
+| R18 `unknown_f32` | énergie de mouvement (log) | corr. 0,66 avec log(accélération dynamique) | | redondant avec `dyn_accel` |
+| R18 octet 35, octet 40 | indicateurs de mode | octet 35 : 7 le jour → 71 la nuit | | mode nuit du firmware |
+| R18 `cardiac_flags_raw` | champ de bits (0, 1, 32, 64, 96, 128…) | inconnu | | à étudier |
+| Événement 3 `BATTERY_LEVEL` | **batterie en %** (u16@1 / 10) et **tension en mV** (u16@5) | décodé (v3) | 99,7 % = « SOC report: 99.70 » du journal | autonomie, coût réel de l'IMU / R20 |
+| Événement 63 | température de la batterie candidate (u16@5 / 10) | 20–44 °C | | sécurité de charge |
+| Événement 29 `STRAP_CONDITION_REPORT` (428 fois) | contient le mot d'état optique (2816–2819) | état des capteurs | | suivi du mode |
+| Événements 110, 120 | inconnus (8 et 32 octets) | | | à étudier |
+| Journal du firmware (paquet 50) | texte, **décodé à partir de l'octet 21 de la trame** (v3) | sous-systèmes `SLEEPFLAG` (états du sommeil), `SIGPROC-WEAR-DETECT V5` (port), `SENSORS: AFE configuration changed`, `SUPERVISOR: SOC report`, capteur de peau AMS **AS6221**, statistiques de transfert | | états internes du firmware, à reconstituer dans l'ordre (morceaux de 55 octets) |
+
+Les noms des états de `SLEEPFLAG` et de la détection de port apparaissent dans le journal, mais les lignes sont souvent
+coupées : il faut les réassembler dans l'ordre des trames pour les exploiter.
+
+## Test optique de nuit
+
+Onglet Alarme → « Test optique de nuit ». Avec le réveil intelligent armé, l'app active R20 en historique (commande 153)
+pendant 30 min, environ 2 h après l'endormissement détecté et au moins 40 min avant la fenêtre de réveil, puis le coupe.
+Les données remontent aux synchronisations suivantes et dans l'export iCloud (`whoop-lab/raw`). On saura alors si les
+blocs 1 et 2 (source 3, candidate infrarouge) s'allument pendant le sommeil.

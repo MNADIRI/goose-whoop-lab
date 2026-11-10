@@ -442,6 +442,9 @@ final class SmartWakeController: ObservableObject {
     windowStart = nil
     defaults.set(try? JSONEncoder().encode(s), forKey: Self.sessionKey)
     deadlineConfirmed = false
+    opticalStartedAt = nil
+    opticalDone = false
+    nightOpticalStatus = ""
     lastDeadlineAttempt = .distantPast
     lastLiveRequest = .distantPast
     ensureStrapSetup(now: now)
@@ -453,6 +456,9 @@ final class SmartWakeController: ObservableObject {
 
   func disarm(reason: String = "désactivé") {
     ramp.stop(disableStrap: false)
+    if let ble, opticalStartedAt != nil, !opticalDone { setPersistentR20(false, ble: ble); opticalDone = true }
+    opticalStartedAt = nil
+    onsetDate = nil
     session = nil
     windowStart = nil
     heartbeat?.invalidate()
@@ -525,6 +531,14 @@ final class SmartWakeController: ObservableObject {
   @Published private(set) var deadlineConfirmed = false
   @Published private(set) var liveStreamOK = false
   @Published private(set) var imuStreamOK = false
+  /// Night optical test: persistent R20 for 30 min, ~2 h after sleep onset (looks for the red / IR LED).
+  @Published var nightOpticalTest: Bool = UserDefaults.standard.bool(forKey: "smartWake.nightOpticalTest") {
+    didSet { UserDefaults.standard.set(nightOpticalTest, forKey: "smartWake.nightOpticalTest") }
+  }
+  @Published private(set) var nightOpticalStatus = ""
+  private var onsetDate: Date?
+  private var opticalStartedAt: Date?
+  private var opticalDone = false
   private var lastIMURequest = Date.distantPast
   private var imuRequested = false
   private var lastDeadlineAttempt = Date.distantPast
@@ -549,6 +563,7 @@ final class SmartWakeController: ObservableObject {
       imuRequested = true
       ble.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")], requestedStatus: "Smart wake: live IMU", updatePhysiologyStatus: false)
     }
+    runNightOpticalTest(now: now, ble: ble)
     if !deadlineConfirmed, now.timeIntervalSince(lastDeadlineAttempt) >= 20, ble.isFreeForCommands, !ramp.isPlaying {
       lastDeadlineAttempt = now
       let end = Date(timeIntervalSince1970: TimeInterval(s.windowEnd))
@@ -560,6 +575,37 @@ final class SmartWakeController: ObservableObject {
           ble.record(source: "smart_wake", title: "deadline.confirmed", body: "\(s.windowEnd)")
         }
       }
+    }
+  }
+
+  private func setPersistentR20(_ on: Bool, ble: GooseBLEClient) {
+    let cmd = GooseBLEClient.SensorStreamCommandKind(commandNumber: 153, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(on), name: on ? "TOGGLE_PERSISTENT_R20_ON" : "TOGGLE_PERSISTENT_R20_OFF")
+    ble.whenFreeForCommands(timeout: 120) { $0.writeSensorStreamCommands([cmd], requestedStatus: "Night optical test", updatePhysiologyStatus: false) }
+    ble.record(source: "smart_wake", title: on ? "night_optical.start" : "night_optical.stop", body: "")
+  }
+
+  private func runNightOpticalTest(now: Date, ble: GooseBLEClient) {
+    guard nightOpticalTest, !opticalDone else { return }
+    if let start = opticalStartedAt {
+      nightOpticalStatus = "Capture optique en cours (\(Int(now.timeIntervalSince(start) / 60))/30 min)"
+      if now.timeIntervalSince(start) >= 30 * 60 {
+        setPersistentR20(false, ble: ble)
+        opticalDone = true
+        nightOpticalStatus = "Capture optique terminée (30 min)"
+      }
+      return
+    }
+    guard let onset = onsetDate else { nightOpticalStatus = "Capture optique : en attente de l'endormissement"; return }
+    let begin = onset.addingTimeInterval(2 * 3600)
+    let latest = (windowStart ?? begin.addingTimeInterval(4 * 3600)).addingTimeInterval(-40 * 60)
+    if now >= begin, now < latest, ble.isFreeForCommands, !ramp.isPlaying {
+      opticalStartedAt = now
+      setPersistentR20(true, ble: ble)
+    } else if now >= latest {
+      opticalDone = true
+      nightOpticalStatus = "Capture optique annulée : trop près de la fenêtre de réveil"
+    } else {
+      nightOpticalStatus = "Capture optique prévue vers \(begin.formatted(date: .omitted, time: .shortened))"
     }
   }
 
@@ -613,6 +659,7 @@ final class SmartWakeController: ObservableObject {
     engineState = r["state"] as? String ?? engineState
     if let w = r["window"] as? [String: Any], let ws = w["start"] as? Int {
       windowStart = Date(timeIntervalSince1970: TimeInterval(ws))
+      if let o = w["onset_estimate"] as? Int { onsetDate = Date(timeIntervalSince1970: TimeInterval(o)) }
     }
     if let epoch = r["epoch"] as? [String: Any] {
       posterior = epoch["posterior"] as? [Double] ?? posterior
@@ -679,6 +726,7 @@ struct AlarmView: View {
         if controller.feedbackPendingSessionID != nil { feedbackCard }
         if controller.session != nil { liveCard }
         tonightCard
+        nightOpticalCard
         nightsCard
         vibrationCard
         MotionProbeCard(probe: controller.motionProbe, keepLiveHR: controller.session != nil)
@@ -848,6 +896,19 @@ struct AlarmView: View {
     let label: String
     let kind: String
     let hours: Double
+  }
+
+  private var nightOpticalCard: some View {
+    card(title: "Test optique de nuit", icon: "light.max") {
+      Toggle(isOn: $controller.nightOpticalTest) {
+        Text("Enregistrer l'optique brute 30 min, environ 2 h après l'endormissement").font(.subheadline)
+      }
+      Text("Cherche la LED rouge / infrarouge utilisée pour la SpO₂. Fonctionne si le réveil intelligent est armé. Aucune vibration.")
+        .font(.caption).foregroundStyle(.secondary)
+      if !controller.nightOpticalStatus.isEmpty {
+        Text(controller.nightOpticalStatus).font(.caption)
+      }
+    }
   }
 
   private var nightsCard: some View {
