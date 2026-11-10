@@ -379,6 +379,11 @@ extension GooseAppModel {
     event: GooseNotificationEvent,
     context: NotificationParseContext
   ) {
+    // Live packet 40 (realtime HR + R-R) is decoded here, before any filtering, because the
+    // parse pipeline routes it off-main and never exposes its HR / R-R (smart wake needs both).
+    for frame in frames {
+      Self.forwardRealtimeHeartRate(hex: frame.hex, ble: context.ble, at: event.capturedAt)
+    }
     let parser = notificationFrameParser
     let deviceType = context.deviceType
     let healthCaptureActive = context.healthCaptureActive
@@ -673,6 +678,29 @@ extension GooseAppModel {
 
   struct NotificationFrame {
     let hex: String
+  }
+
+  /// WHOOP 5.0 packet 40 (lab/whoop5/records.py decode_live_hr): HR at frame byte 16, R-R count at 17,
+  /// 1/1024 s R-R ticks from byte 18. Verified frames are 32 bytes, CRC checked by the caller's parser.
+  nonisolated static func forwardRealtimeHeartRate(hex: String, ble: GooseBLEClient, at date: Date) {
+    guard hex.count >= 44, hex.hasPrefix("aa"), hex.dropFirst(16).prefix(2) == "28" else { return }
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(hex.count / 2)
+    var i = hex.startIndex
+    while i < hex.endIndex, let j = hex.index(i, offsetBy: 2, limitedBy: hex.endIndex), let b = UInt8(hex[i..<j], radix: 16) {
+      bytes.append(b)
+      i = j
+    }
+    guard bytes.count >= 22, bytes[8] == 40 else { return }
+    let hr = Int(bytes[16])
+    let available = (bytes.count - 4 - 18) / 2
+    let count = min(Int(bytes[17]), max(available, 0), 4)
+    let rr: [Double] = (0..<count).compactMap { k in
+      let ticks = Int(bytes[18 + 2 * k]) | Int(bytes[19 + 2 * k]) << 8
+      return ticks > 0 ? Double((ticks * 1000 + 512) / 1024) : nil
+    }
+    if hr > 0 { ble.recordLiveHeartRate(hr, source: "whoop.packet40", at: date) }
+    if !rr.isEmpty { ble.recordRRIntervals(rr, source: "whoop.packet40", at: date) }
   }
 
   struct CaptureFrameRowBuildRequest {

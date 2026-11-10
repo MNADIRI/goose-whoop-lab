@@ -9,6 +9,7 @@ extension GooseBLEClient {
       record(level: .warn, source: source, title: "heart_rate.rejected", body: "\(bpm) bpm outside expected range")
       return
     }
+    liveSampleSink?(date, bpm, [], source)
 
     realtimeVitalsQueue.async { [weak self] in
       self?.processLiveHeartRate(bpm, source: source, at: date)
@@ -90,6 +91,7 @@ extension GooseBLEClient {
     guard !validIntervals.isEmpty else {
       return
     }
+    liveSampleSink?(date, nil, validIntervals, source)
 
     realtimeVitalsQueue.async { [weak self] in
       self?.processRRIntervals(validIntervals, source: source, at: date)

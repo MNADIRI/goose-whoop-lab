@@ -350,7 +350,7 @@ extension GooseBLEClient {
     writeAlarmCommand(.get(alarmID: alarmID))
   }
 
-  func setWhoopAlarm(at localWakeTime: Date, alarmID: Int = 1) {
+  func setWhoopAlarm(at localWakeTime: Date, alarmID: Int = 1, pattern: AlarmHapticsPattern = .whoopDefault) {
     let targetDate = Self.nextFutureAlarmDate(from: localWakeTime)
     record(
       source: "ui.alarm",
@@ -360,7 +360,7 @@ extension GooseBLEClient {
     guard let alarmID = validatedAlarmID(alarmID) else {
       return
     }
-    writeAlarmCommand(.set(alarmID: alarmID, date: targetDate, pattern: .whoopDefault))
+    writeAlarmCommand(.set(alarmID: alarmID, date: targetDate, pattern: pattern))
   }
 
   func runWhoopAlarmNow(alarmID: Int = 1) {

@@ -218,6 +218,15 @@ struct TimelineArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct SmartWakeFeedbackArgs {
+    database_path: String,
+    session_id: String,
+    rating: f64,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct StorageCheckArgs {
     database_path: String,
     #[serde(default)]
@@ -2464,6 +2473,25 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "timeline.from_decoded_frames" => request_args::<TimelineArgs>(&request)
             .and_then(timeline_from_decoded_frames_bridge)
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "smart_wake.update" => request_args::<crate::smart_wake::UpdateArgs>(&request)
+            .and_then(|args| crate::smart_wake::update(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "smart_wake.plan" => request_args::<crate::smart_wake::PlanArgs>(&request)
+            .and_then(|args| crate::smart_wake::plan(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "smart_wake.replay" => request_args::<crate::smart_wake::ReplayArgs>(&request)
+            .and_then(|args| crate::smart_wake::replay(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "smart_wake.feedback" => request_args::<SmartWakeFeedbackArgs>(&request)
+            .and_then(|args| {
+                let conn = rusqlite::Connection::open(&args.database_path)?;
+                crate::smart_wake::feedback(&conn, &args.session_id, args.rating, args.note.as_deref())
+            })
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "whoop5.field_catalog" => bridge_ok(&request.request_id, crate::whoop5_records::field_catalog_json()),

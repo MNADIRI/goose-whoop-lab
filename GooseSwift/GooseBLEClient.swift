@@ -4,6 +4,8 @@ import OSLog
 
 
 final class GooseBLEClient: NSObject, ObservableObject {
+  /// Live HR / R-R tap for the smart-wake engine (called from the realtime vitals path).
+  var liveSampleSink: ((Date, Int?, [Double], String) -> Void)?
   @Published var bluetoothState = "not requested"
   @Published var connectionState = "disconnected"
   @Published var isScanning = false
@@ -593,6 +595,11 @@ final class GooseBLEClient: NSObject, ObservableObject {
     let loopControl: UInt16
     let overallLoop: UInt8
     let durationSeconds: UInt8
+
+    /// Smart-wake escalation levels: same waveform effects as the WHOOP default (the only ones
+    /// known), shorter / fewer loops for the gentle levels. Effect intensity semantics are unknown.
+    static let smartWakeGentle = AlarmHapticsPattern(waveformEffects: [47, 152, 0, 0, 0, 0, 0, 0], loopControl: 0, overallLoop: 2, durationSeconds: 8)
+    static let smartWakeMedium = AlarmHapticsPattern(waveformEffects: [47, 152, 0, 0, 0, 0, 0, 0], loopControl: 0, overallLoop: 4, durationSeconds: 15)
 
     static let whoopDefault = AlarmHapticsPattern(
       waveformEffects: [47, 152, 0, 0, 0, 0, 0, 0],

@@ -55,6 +55,7 @@ final class GooseAppModel: ObservableObject {
   let ble: GooseBLEClient
   let whoopLabExport = WhoopLabAutoExport()
   let labResults = WhoopLabResultsStore()
+  let smartWake = SmartWakeController()
   let packetMonitor = PacketMonitorModel()
   let activitySession = ActivitySessionModel()
   let activityLocationTracker = ActivityLocationTracker()
@@ -311,6 +312,7 @@ final class GooseAppModel: ObservableObject {
 
   init(startBLE: Bool = true) {
     ble = GooseBLEClient(startCentral: startBLE)
+    smartWake.attach(ble: ble)
     whoopDataSignalPipeline = WhoopDataSignalPipeline(
       ble: ble,
       packetUIStateAggregator: packetUIStateAggregator,
