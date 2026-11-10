@@ -873,7 +873,8 @@ extension GooseBLEClient {
         break
       }
       let declaredLength = Int(UInt16(bytes[2]) | UInt16(bytes[3]) << 8)
-      guard declaredLength >= 4 else {
+      let headerCRC = UInt16(bytes[6]) | UInt16(bytes[7]) << 8
+      guard declaredLength >= 4, crc16Modbus(Array(bytes[0..<6])) == headerCRC else {
         bytes.removeFirst()
         continue
       }

@@ -61,6 +61,27 @@ Non disponible : SpO₂ (aucun champ fiable dans les trames, rien n'est inventé
 | **Qualité** | Toutes les secondes R18, R26 | Couverture 1 Hz ; % de fenêtres optiques acceptées | Aujourd'hui › Qualité |
 | **Batterie** | Événements 48 | Dernière tension rapportée | Rapport Mac |
 
+### Ajouts de l'algorithme 4 (intégration de NOOP, voir `docs/WHOOP5_NOOP_AUDIT.md`)
+
+Toutes ces valeurs sont dans le JSON de `whoop_lab.analyze` (pas encore affichées dans l'app). Chacune porte
+un statut et une provenance (`provenance` à la racine).
+
+| Valeur | Entrées | Méthode | Statut |
+|---|---|---|---|
+| `hrv_qc` | R-R | Rejets par plage (300–2000 ms), Malik 20 % et médiane locale ±2 (20 %), comptés séparément ; part d'artefacts et note de qualité | Expérimental |
+| `hrv_rolling_5min` | R-R nettoyés | RMSSD par tranche de 5 min (≥ 30 différences), médiane, p10, p90 | Expérimental |
+| `baselines` | Nuits précédentes | EWMA winsorisée (NOOP) : demi-vie 14 nuits ; calibrage < 4 nuits, provisoire, fiable ≥ 14, périmée | Expérimental |
+| `recovery` | RMSSD, FC repos, respiration, efficacité | Portage de NOOP : poids 0,60 / 0,20 / 0,05 / 0,15, renormalisés si un terme manque, logistique (Z = 0 → 58 %), chaque composante exposée | Expérimental |
+| `skin_temp` | Peau (R18) | Écart-type, pente °C/h, médiane horaire, écart à la référence ; température de peau, pas centrale | Décodé, non validé |
+| `sleep_detail` | Stades, gravité, FC | Minutes de sommeil selon le firmware et selon l'inférence locale, WASO, réveils par heure, % de mouvement, FC nocturne | Inféré |
+| `sleep_regularity` | 7 dernières nuits | Écart-type des heures d'endormissement et de réveil | Expérimental |
+| `optical` | R26 | Rafales, fréquence estimée (~25 Hz), filtre passe-bande 0,5–4 Hz, pouls par autocorrélation et pics, IBI, amplitude, temps de montée, SNR ; « validé » si l'écart à la FC R18 est ≤ 5 bpm | Validé contre la FC (pouls) ; amplitude expérimentale |
+| `training` | FC, accélération dynamique | Karvonen (%RFC), TRIMP d'Edwards sur %RFC et de Banister, échelle NOOP 0–21, détection d'entraînement, récupération de FC (60 et 120 s), dérive cardiaque | Expérimental |
+| `load.foster` | TRIMP quotidiens | Monotonie = moyenne / écart-type sur 7 jours, contrainte = charge hebdomadaire × monotonie | Expérimental |
+
+Couche décodée (tables `whoop5_*`) et export : `whoop5.ingest`, `whoop5.inventory`, `whoop5.export` (JSONL, CSV,
+binaire brut et `schema.json` avec unités, statuts et provenance).
+
 ## 3. Cohérence et redondances traitées
 
 - **Une seule valeur par mesure.** Les cartes goose (Sleep, Recovery, Strain, Stress, Cardio Load, FC repos,

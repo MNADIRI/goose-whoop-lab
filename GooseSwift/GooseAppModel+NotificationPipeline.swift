@@ -813,7 +813,13 @@ extension GooseAppModel {
       } else {
         declaredLength = Int(bytes[2]) | Int(bytes[3]) << 8
       }
-      guard declaredLength >= 4,
+      // A 0xaa inside a payload is not a frame start: on WHOOP 5.0 the declared length is only
+      // trusted once the CRC16-Modbus over header bytes 0..<6 matches bytes 6..7. Otherwise a
+      // spurious start would swallow (and lose) the real frames that follow it.
+      let headerValid = event.rustDeviceType == "GEN4"
+        || GooseBLEClient.crc16Modbus(Array(bytes[0..<6])) == (UInt16(bytes[6]) | UInt16(bytes[7]) << 8)
+      guard headerValid,
+            declaredLength >= 4,
             declaredLength + headerLength <= Self.maximumBufferedFrameBytes else {
         droppedBytes += 1
         bytes.removeFirst()

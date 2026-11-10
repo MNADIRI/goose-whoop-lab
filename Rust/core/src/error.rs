@@ -45,3 +45,15 @@ impl GooseError {
         }
     }
 }
+
+impl From<std::io::Error> for GooseError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Message(format!("I/O error: {source}"))
+    }
+}
+
+impl From<serde_json::Error> for GooseError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Message(format!("JSON error: {source}"))
+    }
+}

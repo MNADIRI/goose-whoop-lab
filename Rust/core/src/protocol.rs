@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{GooseError, GooseResult};
 
 pub const FRAME_START: u8 = 0xaa;
+/// Largest frame the reassembler accepts (the biggest known WHOOP 5.0 record, R20, is 2140 B).
+pub const MAX_FRAME_LEN: usize = 64 * 1024;
 pub const PACKET_TYPE_COMMAND: u8 = 35;
 pub const PACKET_TYPE_COMMAND_RESPONSE: u8 = 36;
 pub const PACKET_TYPE_PUFFIN_COMMAND: u8 = 37;
@@ -268,6 +270,17 @@ impl FrameAccumulator {
             let Some(expected_len) = self.device_type.expected_frame_len(&self.buffer) else {
                 break;
             };
+            // WHOOP 5.0: only trust the declared length once the CRC16-Modbus header check
+            // passes; a 0xaa inside a payload would otherwise swallow the following frames.
+            let header_ok = match self.device_type {
+                DeviceType::Gen4 => true,
+                _ => crc16_modbus(&self.buffer[..6]) == u16::from_le_bytes([self.buffer[6], self.buffer[7]]),
+            };
+            if !header_ok || expected_len > MAX_FRAME_LEN {
+                self.buffer.drain(..1);
+                dropped += 1 + self.drop_until_frame_start();
+                continue;
+            }
             if self.buffer.len() < expected_len {
                 break;
             }

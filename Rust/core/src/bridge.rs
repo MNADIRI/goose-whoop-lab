@@ -2466,6 +2466,26 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(timeline_from_decoded_frames_bridge)
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "whoop5.field_catalog" => bridge_ok(&request.request_id, crate::whoop5_records::field_catalog_json()),
+        "whoop5.ingest" | "whoop5.inventory" | "whoop5.rebuild" => request_args::<StorageCheckArgs>(&request)
+            .and_then(|args| {
+                let conn = rusqlite::Connection::open(&args.database_path)?;
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                match request.method.as_str() {
+                    "whoop5.ingest" => Ok(serde_json::to_value(crate::whoop5_store::ingest(&conn)?)?),
+                    "whoop5.rebuild" => Ok(serde_json::to_value(crate::whoop5_store::rebuild(&conn)?)?),
+                    _ => {
+                        crate::whoop5_store::ingest(&conn)?;
+                        crate::whoop5_store::inventory(&conn)
+                    }
+                }
+            })
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "whoop5.export" => request_args::<crate::whoop5_store::ExportArgs>(&request)
+            .and_then(|args| crate::whoop5_store::export(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "whoop_lab.analyze" => request_args::<crate::whoop_lab_analysis::AnalyzeOptions>(&request)
             .and_then(|args| crate::whoop_lab_analysis::analyze(&args))
             .map(|value| bridge_ok(&request.request_id, value))

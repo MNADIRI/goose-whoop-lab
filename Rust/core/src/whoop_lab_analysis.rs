@@ -17,10 +17,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::baselines::{self, Baseline};
+use crate::hrv_qc::{self, Beat};
+use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "3";
+const ALGORITHM_VERSION: &str = "4";
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
@@ -210,6 +213,7 @@ fn std_sample(v: &[f64]) -> Option<f64> {
 // ------------------------------------------------------------------ HRV / respiration
 
 /// Runs of consecutive device seconds carrying R-R, split at implausible values or >20 % jumps.
+#[allow(dead_code)]
 fn successive_segments(samples: &[Sample]) -> Vec<Vec<f64>> {
     let mut segs = Vec::new();
     let mut cur: Vec<f64> = Vec::new();
@@ -246,6 +250,32 @@ fn successive_segments(samples: &[Sample]) -> Vec<Vec<f64>> {
     segs
 }
 
+/// Contiguous runs of beats (consecutive device seconds), uncleaned: hrv_qc does the cleaning.
+fn beat_runs(samples: &[Sample]) -> Vec<Vec<Beat>> {
+    let mut runs: Vec<Vec<Beat>> = Vec::new();
+    let mut prev: Option<i64> = None;
+    for s in samples {
+        if s.rr.is_empty() {
+            continue;
+        }
+        if prev.is_none_or(|p| s.ts != p && s.ts != p + 1) {
+            runs.push(Vec::new());
+        }
+        prev = Some(s.ts);
+        runs.last_mut().unwrap().extend(s.rr.iter().map(|v| Beat { ts: s.ts, rr_ms: *v }));
+    }
+    runs
+}
+
+/// HRV with QC; `null` when insufficient (the app decodes a present object as complete metrics).
+fn hrv_with_qc(samples: &[Sample]) -> (Value, Value, Vec<Vec<Beat>>) {
+    let (segs, qc) = hrv_qc::clean(&beat_runs(samples));
+    let m = hrv_qc::time_domain(&segs, &qc);
+    let qc_json = serde_json::to_value(&qc).unwrap_or(Value::Null);
+    if m.get("rmssd_ms").is_some() { (m, qc_json, segs) } else { (Value::Null, qc_json, segs) }
+}
+
+#[allow(dead_code)]
 fn hrv_metrics(segs: &[Vec<f64>]) -> Value {
     let diffs: Vec<f64> = segs.iter().flat_map(|s| s.windows(2).map(|w| w[1] - w[0])).collect();
     if diffs.len() < 100 {
@@ -477,8 +507,13 @@ fn stage_epochs(s: &[Sample], onset: usize, wake: usize) -> (Vec<&'static str>, 
     (labels, t0)
 }
 
-fn analyze_night(s: &[Sample], history: &[Value]) -> Value {
-    let Some(sp) = sleep_period(s) else { return json!({ "available": false }) };
+fn baseline_of(prev: &[&Value], pick: impl Fn(&Value) -> Option<f64>, cfg: &baselines::MetricCfg) -> Option<Baseline> {
+    let vals: Vec<Option<f64>> = prev.iter().map(|h| pick(h)).collect();
+    baselines::fold(&vals, cfg)
+}
+
+fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record]) -> Value {
+    let Some(sp) = sleep_period(s) else { return json!({ "available": false, "firmware_sleep_min": s.iter().filter(|x| x.band == "sleep").count() / 60 }) };
     let (stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
     let count = |k: &str| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round();
     let (wake_m, light, deep, rem) = (count("wake"), count("light"), count("deep"), count("rem"));
@@ -495,13 +530,46 @@ fn analyze_night(s: &[Sample], history: &[Value]) -> Value {
     let last_third: Vec<Sample> = night.iter().filter(|x| x.ts >= third).cloned().collect();
     let skin_vals: Vec<f64> = night.iter().filter_map(|x| x.skin).collect();
     let skin = median(&skin_vals).map(|v| round(v, 2));
-    let hrv = hrv_metrics(&successive_segments(night));
+    let (hrv, hrv_qc_json, clean_segs) = hrv_with_qc(night);
+    let (hrv_last, _, _) = hrv_with_qc(&last_third);
     let prev: Vec<&Value> = history.iter().filter(|h| h["available"] == true).collect();
     let prev_skin: Vec<f64> = prev.iter().filter_map(|h| h["skin_temp_c"].as_f64()).collect();
     let skin_delta = match (skin, prev_skin.len() >= 3) {
         (Some(v), true) => Some(round(v - mean(&prev_skin).unwrap(), 2)),
         _ => None,
     };
+    let respiration = respiratory_rate(night);
+    // personal baselines from previous nights (NOOP winsorised EWMA)
+    let b_hrv = baseline_of(&prev, |h| h["hrv_night"]["rmssd_ms"].as_f64(), &baselines::HRV);
+    let b_rhr = baseline_of(&prev, |h| h["resting_hr_bpm"].as_f64(), &baselines::RESTING_HR);
+    let b_resp = baseline_of(&prev, |h| h["respiration"]["rpm"].as_f64(), &baselines::RESP);
+    let b_skin = baseline_of(&prev, |h| h["skin_temp_c"].as_f64(), &baselines::SKIN_TEMP);
+    // temperature: variability, linear trend over the night, hourly profile
+    let skin_pts: Vec<(f64, f64)> = night.iter().filter_map(|x| x.skin.map(|t| ((x.ts - s[sp.onset].ts) as f64 / 3600.0, t))).collect();
+    let skin_trend = (skin_pts.len() > 600).then(|| {
+        let n = skin_pts.len() as f64;
+        let (mx, my) = (skin_pts.iter().map(|p| p.0).sum::<f64>() / n, skin_pts.iter().map(|p| p.1).sum::<f64>() / n);
+        let sxy: f64 = skin_pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+        let sxx: f64 = skin_pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        round(sxy / sxx.max(1e-9), 3)
+    });
+    let mut skin_hourly = serde_json::Map::new();
+    for x in night.iter().filter(|x| x.skin.is_some()) {
+        let h = ((x.ts - s[sp.onset].ts) / 3600).to_string();
+        skin_hourly.entry(h).or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(x.skin));
+    }
+    for v in skin_hourly.values_mut() {
+        let vals: Vec<f64> = v.as_array().unwrap().iter().filter_map(Value::as_f64).collect();
+        *v = json!(median(&vals).map(|m| round(m, 2)));
+    }
+    // movement: share of 30 s epochs with gravity change > 10 mg
+    let moved = night.windows(2).filter(|w| match (w[0].grav, w[1].grav) {
+        (Some(a), Some(b)) => ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() > 0.01,
+        _ => false,
+    }).count();
+    let hr_by_ts: std::collections::HashMap<i64, f64> = night.iter().map(|x| (x.ts, x.hr)).collect();
+    let night_optical: Vec<crate::whoop5_records::R26Record> = optical_windows.iter().filter(|w| w.ts >= s[sp.bed].ts && w.ts <= s[sp.wake].ts).cloned().collect();
+    let optical = optical::summarize(&night_optical, &|t| hr_by_ts.get(&t).copied());
     let code: String = stages.iter().map(|x| match *x { "wake" => 'W', "rem" => 'R', "deep" => 'D', _ => 'L' }).collect();
     let rr_count: usize = night.iter().map(|x| x.rr.len()).sum();
     let mut out = json!({
@@ -516,16 +584,50 @@ fn analyze_night(s: &[Sample], history: &[Value]) -> Value {
         "resting_hr_bpm": round(resting, 1),
         "mean_sleep_hr_bpm": round(mean(&hr).unwrap_or(0.0), 1),
         "hrv_night": hrv,
-        "hrv_last_third": hrv_metrics(&successive_segments(&last_third)),
-        "respiration": respiratory_rate(night),
+        "hrv_last_third": hrv_last,
+        "hrv_qc": hrv_qc_json,
+        "hrv_rolling_5min": hrv_qc::rolling_rmssd(&clean_segs, 300, 30),
+        "respiration": respiration,
         "skin_temp_c": skin,
         "skin_temp_delta_c": skin_delta,
+        "skin_temp": {
+            "kind": "skin (wrist), not core body temperature",
+            "sd_c": std_sample(&skin_vals).map(|v| round(v, 2)),
+            "trend_c_per_h": skin_trend,
+            "hourly_median_c": skin_hourly,
+            "baseline": baselines::deviation_json(skin, b_skin, 2),
+            "status": if skin.is_some() { "DECODED_UNVALIDATED" } else { "UNAVAILABLE" },
+        },
+        "baselines": {
+            "hrv_rmssd": baselines::deviation_json(hrv["rmssd_ms"].as_f64(), b_hrv, 1),
+            "resting_hr": baselines::deviation_json(Some(round(resting, 1)), b_rhr, 1),
+            "respiration": baselines::deviation_json(respiration["rpm"].as_f64(), b_resp, 1),
+        },
+        "sleep_detail": {
+            "source": "inferred locally (band state + Cole-Kripke + HR/HRV rules); firmware band state shown separately",
+            "firmware_sleep_min": night.iter().filter(|x| x.band == "sleep").count() / 60,
+            "waso_min": wake_m,
+            "fragmentation_per_h": round(stages.windows(2).filter(|w| w[0] != "wake" && w[1] == "wake").count() as f64 / (asleep / 60.0).max(0.1), 2),
+            "movement_pct": round(100.0 * moved as f64 / night.len().max(1) as f64, 1),
+            "nocturnal_hr": {"mean": round(mean(&hr).unwrap_or(0.0), 1), "min_5min": round(resting, 1), "p95": percentile(&hr, 95.0).map(|v| round(v, 1))},
+            "stages_status": "EXPERIMENTAL (65-73 % epoch agreement ceiling without EEG)",
+        },
+        "optical": optical,
         "rr_coverage_pct": round(100.0 * rr_count as f64 / (hr.iter().sum::<f64>() / 60.0).max(1.0), 1),
     });
-    out["recovery"] = recovery(&out, &prev);
+    out["recovery"] = baselines::recovery(&baselines::RecoveryInputs {
+        rmssd: hrv["rmssd_ms"].as_f64(),
+        resting_hr: Some(round(resting, 1)),
+        resp: respiration["rpm"].as_f64(),
+        efficiency_pct: out["efficiency_pct"].as_f64(),
+        hrv_base: b_hrv,
+        rhr_base: b_rhr,
+        resp_base: b_resp,
+    });
     out
 }
 
+#[allow(dead_code)]
 fn recovery(night: &Value, prev: &[&Value]) -> Value {
     let hist: Vec<&&Value> = prev.iter().filter(|p| p["hrv_night"].is_object()).collect();
     let (Some(ln), Some(rhr)) = (night["hrv_night"]["ln_rmssd"].as_f64(), night["resting_hr_bpm"].as_f64()) else {
@@ -626,6 +728,28 @@ fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, restin
         "hourly": hourly,
         "stress": stress(s, rhr, hrmax),
         "age_default_used": profile.age.is_none(),
+        "training": training_block(s, rhr, age, profile),
+    })
+}
+
+fn training_block(s: &[Sample], rhr: f64, age: f64, profile: &Profile) -> Value {
+    let hrs: Vec<f64> = s.iter().map(|x| x.hr).filter(|h| *h > 0.0).collect();
+    let (hrmax, source) = training::hrmax_used(age, &hrs);
+    let female = profile.sex.as_deref() == Some("female");
+    let triples: Vec<(i64, f64, Option<f64>)> = s.iter().map(|x| (x.ts, x.hr, x.dyn_g)).collect();
+    let mut w = training::workouts(&triples, rhr, hrmax, female);
+    if let Some(sessions) = w["sessions"].as_array_mut() {
+        for sess in sessions {
+            let (a, b) = (sess["start"].as_i64().unwrap_or(0), sess["end"].as_i64().unwrap_or(0));
+            let hr: Vec<f64> = s.iter().filter(|x| x.ts >= a && x.ts <= b).map(|x| x.hr).collect();
+            sess["cardiac_drift_pct"] = json!(training::cardiac_drift(&hr));
+            sess["hr_recovery"] = training::hr_recovery(&triples, b);
+        }
+    }
+    json!({
+        "hrmax_source": source,
+        "load_karvonen": training::load(&hrs, rhr, hrmax, female),
+        "workouts": w,
     })
 }
 
@@ -671,7 +795,32 @@ fn training_load(days: &[Value]) -> Value {
     let acwr = (vals.len() >= 21 && chronic > 0.0).then(|| round(acute / chronic, 2));
     json!({
         "acute_7d": round(acute, 1), "chronic_28d_weekly": round(chronic, 1), "acwr": acwr, "days": vals.len(),
+        "foster": training::foster(&vals),
         "daily": series.iter().rev().take(28).rev().map(|(d, v)| json!({"date": d, "trimp": round(*v, 1)})).collect::<Vec<_>>(),
+    })
+}
+
+// ------------------------------------------------------------------ provenance
+
+/// Source, method, unit and status of every value in the results (see lab/METRICS.md).
+fn provenance() -> Value {
+    let p = |src: &str, method: &str, unit: &str, status: &str| json!({"source": src, "method": method, "unit": unit, "status": status, "algorithm_version": ALGORITHM_VERSION});
+    json!({
+        "night.bed_time/sleep_onset/wake_time": p("R18 band state + gravity", "longest firmware sleep block (gaps <= 20 min), extended back over still", "unix s", "INFERRED"),
+        "night.stages_min": p("R18 HR, R-R, gravity", "Cole-Kripke (te Lindert) + transparent HR/HRV rules", "min", "EXPERIMENTAL"),
+        "night.resting_hr_bpm": p("R18 HR", "lowest 5-min rolling mean during sleep", "bpm", "DECODED_UNVALIDATED"),
+        "night.hrv_night": p("R18 R-R", "range + Malik 20 % + local-median 20 % QC, successive beats only, Task Force time domain", "ms", "EXPERIMENTAL"),
+        "night.respiration": p("R18 R-R", "RSA: 1 Hz tachogram, 120 s Hann periodogram, 0.13-0.45 Hz peak", "breaths/min", "INFERRED"),
+        "night.skin_temp_c": p("R18 skin temperature (raw/100)", "night median; skin, not core", "degC", "DECODED_UNVALIDATED"),
+        "night.recovery": p("night HRV, resting HR, respiration, efficiency", "NOOP RecoveryScorer port (winsorised EWMA baselines, logistic)", "0-100", "EXPERIMENTAL"),
+        "night.optical": p("R26 compact optical windows", "burst reconstruction, 0.5-4 Hz band-pass, ACF pulse rate checked against R18 HR", "bpm / ADC code", "EXPERIMENTAL"),
+        "day.steps": p("R18 step counter", "sum of positive increments < 300/s", "steps", "DECODED_UNVALIDATED"),
+        "day.edwards_trimp": p("R18 HR", "Edwards zones on %HRmax (Tanaka)", "a.u.", "EXPERIMENTAL"),
+        "day.training": p("R18 HR + dynamic accel", "Karvonen %HRR, Edwards/Banister TRIMP, NOOP workout detector", "a.u.", "EXPERIMENTAL"),
+        "day.stress": p("R18 HR, activity, dynamic accel", "HR elevation at rest vs 40 % HR reserve, 5-min buckets", "0-100", "EXPERIMENTAL"),
+        "day.energy": p("R18 HR + profile", "Mifflin-St Jeor resting + Keytel 2005 active", "kcal", "EXPERIMENTAL"),
+        "load": p("daily Edwards TRIMP", "7 d acute, 28 d chronic, ACWR after 21 d, Foster monotony", "a.u.", "EXPERIMENTAL"),
+        "spo2": p("none", "no reliable field in WHOOP 5.0 frames", "", "UNAVAILABLE"),
     })
 }
 
@@ -702,6 +851,7 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     sync_biometric_table(&conn)?;
+    let layer_b = whoop5_store::ingest(&conn)?;
     let off = options.utc_offset_seconds;
     let now = options.now_unix.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0));
     let (first, last, total): (Option<i64>, Option<i64>, i64) =
@@ -734,7 +884,8 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
             serde_json::from_str(j).unwrap_or(Value::Null)
         } else {
             let night_samples = load_samples(&conn, n0, n1)?;
-            let night = analyze_night(&night_samples, &nights_hist);
+            let optical_windows = whoop5_store::load_r26(&conn, n0, n1)?;
+            let night = analyze_night(&night_samples, &nights_hist, &optical_windows);
             let day_samples = load_samples(&conn, d0, d1)?;
             let rhr = night["resting_hr_bpm"].as_f64();
             let day = analyze_day(&day_samples, d0, now, &options.profile, rhr);
@@ -757,12 +908,26 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
         day_start += DAY;
     }
     let load = training_load(&days);
+    // sleep regularity: SD of onset / wake clock times over the last 7 nights (minutes)
+    let clock = |v: &Value| v.as_i64().map(|t| (((t + off).rem_euclid(DAY) + DAY / 2) % DAY) as f64 / 60.0);
+    let recent: Vec<&Value> = days.iter().rev().filter(|d| d["night"]["available"] == true).take(7).map(|d| &d["night"]).collect();
+    let onsets: Vec<f64> = recent.iter().filter_map(|n| clock(&n["sleep_onset"])).collect();
+    let wakes: Vec<f64> = recent.iter().filter_map(|n| clock(&n["wake_time"])).collect();
+    let regularity = json!({
+        "nights": recent.len(),
+        "onset_sd_min": std_sample(&onsets).map(|v| round(v, 0)),
+        "wake_sd_min": std_sample(&wakes).map(|v| round(v, 0)),
+        "status": if recent.len() >= 3 { "EXPERIMENTAL" } else { "UNAVAILABLE" },
+    });
     Ok(json!({
         "schema": RESULTS_SCHEMA,
         "generated": now,
         "first_day": days.first().map(|d| d["date"].clone()),
         "days": days,
         "load": load,
+        "sleep_regularity": regularity,
+        "layer_b_ingest": serde_json::to_value(&layer_b).unwrap_or(Value::Null),
+        "provenance": provenance(),
         "device": {"records": total, "first": first, "last": last,
                    "coverage_pct": round(100.0 * total as f64 / ((last - first + 1) as f64).max(1.0), 1)},
     }))
@@ -794,5 +959,24 @@ mod tests {
         let p = hann_periodogram(&x);
         let k = (16..=54).max_by(|a, b| p[*a].total_cmp(&p[*b])).unwrap();
         assert_eq!(k, 30);
+    }
+}
+
+#[cfg(test)]
+mod real_data {
+    /// GOOSE_DB=/path/to/copy.sqlite cargo test --release --lib real_db -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_db() {
+        let Ok(db) = std::env::var("GOOSE_DB") else { return };
+        let t = std::time::Instant::now();
+        let v = super::analyze(&super::AnalyzeOptions { database_path: db.clone(), utc_offset_seconds: 3600, now_unix: None, profile: Default::default() }).unwrap();
+        println!("first run {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = super::analyze(&super::AnalyzeOptions { database_path: db.clone(), utc_offset_seconds: 3600, now_unix: None, profile: Default::default() }).unwrap();
+        println!("cached run {:?}", t.elapsed());
+        std::fs::write(format!("{db}.results.json"), serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        println!("{}", serde_json::to_string_pretty(&crate::whoop5_store::inventory(&conn).unwrap()).unwrap());
     }
 }

@@ -42,5 +42,13 @@ pub mod ui_coverage;
 pub mod validation_labels;
 pub mod whoop_lab_analysis;
 pub mod whoop_lab_k18;
+pub mod baselines;
+pub mod dsp;
+pub mod hrv_qc;
+pub mod imu;
+pub mod optical;
+pub mod training;
+pub mod whoop5_records;
+pub mod whoop5_store;
 
 pub use error::{GooseError, GooseResult};
