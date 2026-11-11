@@ -131,3 +131,29 @@ vérifier par une nuit sans réveil intelligent armé.
    vieux de plusieurs mois : ne pas les mélanger au jour courant (filtrer par date).
 6. **Retard de 2,7 min en médiane** : acceptable pour l'analyse de la journée. Pour le temps réel, seuls les flux sur
    commande conviennent (FC, IMU, R20 : environ 1 s).
+
+## 8. Cause du mode optique « jour » la 2e nuit (analyse du 11 novembre)
+
+Chronologie des commandes et des changements de mode (mot d'état R18 / R26, ne sont gardés que les modes tenus ≥ 60 s) :
+
+| | Nuit 1 (9 → 10) | Nuit 2 (10 → 11) |
+|---|---|---|
+| `TOGGLE_REALTIME_HR` | par moments 21 h 04 – 22 h 13, puis plus rien | actif tout la nuit (réveil intelligent armé à 22 h 31) |
+| Passage en mode nuit | 00 h 46 (2816 → 2656), 02 h 03 (→ 2832) | jamais pendant le flux |
+| Après l'arrêt des flux (6 h 59) | — | rendormi à 7 h 02, mode nuit à **7 h 56** (2896 → 2464) |
+
+Causes écartées :
+- **2896** est un mode de jour ordinaire : il est apparu le 10 à 10 h 27 sans aucun flux, après le réveil.
+- **Tests capteurs du 10** (IMU, optique, R20, synchro haute fréquence) : chaque activation a reçu une désactivation
+  réussie ; aucun réglage n'est resté actif.
+- **Synchronisations toutes les 6 min** : présentes les deux nuits.
+
+**Cause retenue** : tant que le flux FC temps réel est actif, le firmware garde sa configuration optique de jour et ne passe
+pas dans sa configuration de nuit, celle de la SpO₂. Il y passe environ 30 à 55 min après l'arrêt du flux.
+
+**Correction** (`SmartWake.swift`) : la FC temps réel et l'IMU ne sont plus activées au coucher, mais **5 min avant
+l'ouverture de la fenêtre de réveil**. Avant, le moteur travaille sur R18, synchronisé toutes les 5 min. La nuit 1 montre
+que l'app reste active en arrière-plan sans flux (22 synchros par heure).
+
+Le test optique de nuit (R20 en historique, 30 min) pourrait avoir le même effet : il est optionnel et reste désactivé par
+défaut.

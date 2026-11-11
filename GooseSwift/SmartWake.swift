@@ -548,16 +548,20 @@ final class SmartWakeController: ObservableObject {
   /// live HR stream re-enabled whenever it stops (e.g. after a reconnection).
   private func ensureStrapSetup(now: Date = Date()) {
     guard let ble, let s = session else { return }
+    // Live HR only from 5 min before the window: while TOGGLE_REALTIME_HR streams, the strap keeps
+    // its daytime optical configuration and never switches to its night (SpO2) mode (audit 11 Nov:
+    // night mode came 55 min after the stream stopped). Before the window the engine uses R18.
+    let opens = windowStart ?? Date(timeIntervalSince1970: TimeInterval(s.windowEnd - 2700))
+    let streamPhase = now >= opens.addingTimeInterval(-300) || engineState == "stimulating"
     lock.lock(); let liveAge = now.timeIntervalSince1970 - lastLiveSample; lock.unlock()
     liveStreamOK = liveAge < 15
-    if !liveStreamOK, now.timeIntervalSince(lastLiveRequest) >= 30, ble.isFreeForCommands {
+    if streamPhase, !liveStreamOK, now.timeIntervalSince(lastLiveRequest) >= 30, ble.isFreeForCommands {
       lastLiveRequest = now
       ble.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 3, payload: [1], name: "TOGGLE_REALTIME_HR_ON")], requestedStatus: "Smart wake: live HR", updatePhysiologyStatus: false)
     }
     // live IMU (1 frame/s, ~1 s latency) only from 5 min before the window opens: battery
     lock.lock(); let imuAge = now.timeIntervalSince1970 - lastIMU; lock.unlock()
     imuStreamOK = imuAge < 10
-    let opens = windowStart ?? Date(timeIntervalSince1970: TimeInterval(s.windowEnd - 2700))
     if now >= opens.addingTimeInterval(-300), !imuStreamOK, now.timeIntervalSince(lastIMURequest) >= 30, ble.isFreeForCommands, !ramp.isPlaying {
       lastIMURequest = now
       imuRequested = true
@@ -618,7 +622,8 @@ final class SmartWakeController: ObservableObject {
     let nearWindow = Int(now.timeIntervalSince1970) >= (windowStart.map { Int($0.timeIntervalSince1970) } ?? s.windowEnd - 2700) - 300
     // R18 (movement, band state incl. "up") only arrives through a history sync; never while a
     // ramp is playing (alarm writes are blocked during a sync)
-    let interval: TimeInterval = engineState == "stimulating" ? 45 : nearWindow ? 120 : 600
+    // before the live phase the engine relies on R18: keep it at most ~5 min old
+    let interval: TimeInterval = engineState == "stimulating" ? 45 : nearWindow ? 120 : 300
     if let ble, ble.canSyncHistorical, !ramp.isPlaying, now.timeIntervalSince(lastSyncRequest) >= interval {
       lastSyncRequest = now
       ble.syncHistoricalPackets()
@@ -805,7 +810,7 @@ struct AlarmView: View {
   private var liveCard: some View {
     card(title: "Cette nuit", icon: "waveform.path.ecg") {
       HStack(spacing: 14) {
-        Label(controller.liveStreamOK ? "FC en direct" : "FC en attente", systemImage: controller.liveStreamOK ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+        Label(controller.liveStreamOK ? "FC en direct" : "FC en direct : activée 5 min avant la fenêtre", systemImage: controller.liveStreamOK ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
           .foregroundStyle(controller.liveStreamOK ? .green : .orange)
         Label(controller.deadlineConfirmed ? "Alarme limite sur le bracelet" : "Alarme limite en cours d'envoi", systemImage: controller.deadlineConfirmed ? "checkmark.seal.fill" : "hourglass")
           .foregroundStyle(controller.deadlineConfirmed ? .green : .orange)
