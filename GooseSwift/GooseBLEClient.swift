@@ -6,6 +6,8 @@ import OSLog
 final class GooseBLEClient: NSObject, ObservableObject {
   /// Live HR / R-R tap for the smart-wake engine (called from the realtime vitals path).
   var liveSampleSink: ((Date, Int?, [Double], String) -> Void)?
+  var silentSyncRetryCount = 0
+  var silentSyncRetryWindowStart = Date.distantPast
   /// Every reassembled frame (hex, arrival time); used by diagnostics such as the motion probe.
   var rawFrameSink: ((String, Date) -> Void)?
   /// Live IMU frames (packet 43, R21 layout, TOGGLE_IMU_MODE) for the smart-wake engine.
