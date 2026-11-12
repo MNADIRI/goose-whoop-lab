@@ -25,8 +25,17 @@ Per-minute features → minute score (logistic on %HR reserve + motion, `minute_
 - motion = max(steps, R18 dynamic accel, IMU dynamic accel, gravity-vector change).
 - ≥ 120 steps/min or firmware "run" → active.
 
-State machine: `idle → watch` (any minute > 0.35 in the last 3) · `watch → active` (≥ 4 active of 6; start backdated to
-the first active minute, gaps ≤ 2 min, minus pre-buffer) · `watch → idle` after 10 min unconfirmed · `active → ending`
+Heart rate + motion only open the **watch** (IMU on). A session needs the **signature of a sport** (`signature`), because
+an active life is full of short efforts (stairs, running to the kitchen / the office) — 11 Nov 16:53 was one:
+- running: ≥ 3 of the last 5 minutes at ≥ 140 steps/min or firmware "run";
+- tennis: ≥ 3 isolated strokes in the last 5 minutes (IMU);
+- strength: ≥ 2 periodic sets of ≥ 4 reps in the last 10 minutes (IMU);
+- sustained: ≥ 8 of the last 10 minutes at ≥ 50 % HRR (other sports, days without IMU).
+Replay 10–12 Nov (R18 only): 24 watch episodes, 23 dropped, 1 session = the tennis match (11:57–13:35, tennis 0.90).
+
+State machine: `idle → watch` (any minute > 0.35 in the last 3) · `watch → active` (≥ 3 active of 6 **and** a sport
+signature; start backdated to the first active minute, gaps ≤ 2 min, minus pre-buffer) · `watch → idle` after 8 quiet
+minutes or 20 min without signature (logged with the signature values as a negative example) · `active → ending`
 after 6 min quiet (rests between sets / games) · `→ ended` after 10 min quiet (end = last active minute + post-buffer) ·
 sessions shorter than 8 min are discarded (stairs, a sprint to the bus). Manual start/stop overrides everything and is a
 label.

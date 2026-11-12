@@ -293,6 +293,22 @@ final class SportController: ObservableObject {
     }
   }
 
+  /// Permanently removes a session started by mistake (its deletion stays in the annotation log).
+  func delete(_ id: String) {
+    call("sport.delete", ["id": id]) { [weak self] r in
+      guard let self else { return }
+      if r["stopped"] as? Bool == true {
+        self.state = "idle"
+        self.current = [:]
+        if self.capturing { self.setStreams(false) }
+      }
+      self.sessions.removeAll { $0.id == id }
+      self.reviewQueue.removeAll { $0 == id }
+      self.refresh()
+      self.exportDataset()
+    }
+  }
+
   func annotate(_ target: String, _ id: String, _ field: String, _ value: String? = nil) {
     var args: [String: Any] = ["target": target, "id": id, "field": field]
     if let value { args["value"] = value }
@@ -349,6 +365,7 @@ final class SportController: ObservableObject {
 struct SportView: View {
   @ObservedObject var controller: SportController
   @State private var tick = Date()
+  @State private var pendingDelete: String?
   private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
   private var queue: [SportSession] { controller.reviewQueue.compactMap { id in controller.sessions.first { $0.id == id } } }
@@ -360,12 +377,16 @@ struct SportView: View {
         liveCard
         if !queue.isEmpty {
           sectionTitle("À vérifier", count: queue.count)
-          ForEach(queue) { s in ReviewCard(session: s, controller: controller) }
+          ForEach(queue) { s in
+            ReviewCard(session: s, controller: controller)
+              .contextMenu { Button("Supprimer la séance", systemImage: "trash", role: .destructive) { pendingDelete = s.id } }
+          }
         }
         if !history.isEmpty {
           sectionTitle("Séances", count: nil)
           ForEach(history) { s in
             NavigationLink(value: s) { SessionRow(session: s) }.buttonStyle(.plain)
+              .contextMenu { Button("Supprimer la séance", systemImage: "trash", role: .destructive) { pendingDelete = s.id } }
           }
         }
         datasetCard
@@ -382,6 +403,12 @@ struct SportView: View {
     }
     .onAppear { controller.refresh() }
     .onReceive(clock) { tick = $0 }
+    .confirmationDialog("Supprimer cette séance ?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), titleVisibility: .visible) {
+      Button("Supprimer", role: .destructive) { if let id = pendingDelete { controller.delete(id) }; pendingDelete = nil }
+      Button("Annuler", role: .cancel) { pendingDelete = nil }
+    } message: {
+      Text("Elle disparaît de l'historique et du jeu de données. Cette action est définitive.")
+    }
     .refreshable { controller.refresh() }
   }
 
@@ -414,9 +441,14 @@ struct SportView: View {
           if kind == .tennis { metric("Frappes", "\(controller.current["strokes_last10"] as? Int ?? 0)", "10 min") }
           metric("Capteurs", controller.capturing ? "100 Hz" : "1 Hz", controller.capturing ? "IMU" : "historique")
         }
-        Button(role: .destructive) { controller.stopManual() } label: {
-          Label("Terminer la séance", systemImage: "stop.fill").frame(maxWidth: .infinity)
-        }.buttonStyle(.bordered).controlSize(.large)
+        HStack(spacing: 10) {
+          Button(role: .destructive) { controller.stopManual() } label: {
+            Label("Terminer la séance", systemImage: "stop.fill").frame(maxWidth: .infinity)
+          }.buttonStyle(.bordered).controlSize(.large)
+          if let id = controller.current["id"] as? String {
+            Button { pendingDelete = id } label: { Label("Annuler", systemImage: "trash") }.buttonStyle(.bordered).controlSize(.large).tint(.gray)
+          }
+        }
       } else {
         HStack {
           VStack(alignment: .leading, spacing: 2) {
@@ -553,6 +585,8 @@ struct SessionRow: View {
 struct SessionDetailView: View {
   let sessionID: String
   @ObservedObject var controller: SportController
+  @Environment(\.dismiss) private var dismiss
+  @State private var confirmDelete = false
   @State private var newExerciseFor: SportSegment?
   @State private var newExercise = ""
 
@@ -579,6 +613,12 @@ struct SessionDetailView: View {
     .gooseScreenBackground()
     .navigationTitle(SportKind.of(session?.type).title)
     .navigationBarTitleDisplayMode(.inline)
+    .confirmationDialog("Supprimer cette séance ?", isPresented: $confirmDelete, titleVisibility: .visible) {
+      Button("Supprimer", role: .destructive) { controller.delete(sessionID); dismiss() }
+      Button("Annuler", role: .cancel) {}
+    } message: {
+      Text("Elle disparaît de l'historique et du jeu de données. Cette action est définitive.")
+    }
     .alert("Nouvel exercice", isPresented: Binding(get: { newExerciseFor != nil }, set: { if !$0 { newExerciseFor = nil } })) {
       TextField("Nom", text: $newExercise)
       Button("Enregistrer") {
@@ -597,7 +637,9 @@ struct SessionDetailView: View {
       HStack {
         Menu {
           ForEach(SportKind.allCases) { k in Button(k.title) { controller.annotate("session", s.id, "type", k.rawValue) } }
-          Button("Pas une séance", role: .destructive) { controller.annotate("session", s.id, "reject") }
+          Button("Pas une séance") { controller.annotate("session", s.id, "reject") }
+          Divider()
+          Button("Supprimer la séance", systemImage: "trash", role: .destructive) { confirmDelete = true }
         } label: {
           Label(SportKind.of(s.type).title, systemImage: SportKind.of(s.type).icon).font(.title3.weight(.semibold))
         }

@@ -204,11 +204,12 @@ impl Profile {
 
 fn profile(conn: &Connection, now: i64, age: Option<f64>) -> GooseResult<Profile> {
     if let Some(p) = state_get(conn, "profile")? {
-        if p["computed_at"].as_i64().unwrap_or(0) > now - 86_400 && p["age"].as_f64() == age {
+        if p["v"].as_i64() == Some(2) && p["computed_at"].as_i64().unwrap_or(0) > now - 86_400 && p["age"].as_f64() == age {
             return Ok(Profile { rest: p["rest"].as_f64().unwrap_or(55.0), hrmax: p["hrmax"].as_f64().unwrap_or(190.0) });
         }
     }
     let mut rest = 55.0;
+    let mut awake: Option<f64> = None;
     let mut observed_max = 0.0;
     let has_r18: bool = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whoop5_r18'", [], |_| Ok(true)).optional()?.unwrap_or(false);
     if has_r18 {
@@ -219,6 +220,15 @@ fn profile(conn: &Connection, now: i64, age: Option<f64>) -> GooseResult<Profile
         if sleep_hr.len() > 3600 {
             rest = percentile(&sleep_hr, 5.0).unwrap_or(rest);
         }
+        // activity is judged against the awake, still heart rate (sleep HR would make any walk an
+        // effort: 11 Nov replay, sleep p5 = 44 bpm vs ~60 awake)
+        let awake_hr: Vec<f64> = conn
+            .prepare("SELECT hr FROM whoop5_r18 WHERE ts > ?1 AND band_state != 'sleep' AND dyn_accel_g < 0.03 AND hr > 30")?
+            .query_map([now - 7 * 86_400], |r| r.get::<_, i64>(0).map(|v| v as f64))?
+            .collect::<Result<_, _>>()?;
+        if awake_hr.len() > 7200 {
+            awake = percentile(&awake_hr, 10.0);
+        }
         let all_hr: Vec<f64> = conn
             .prepare("SELECT hr FROM whoop5_r18 WHERE ts > ?1 AND hr > 30")?
             .query_map([now - 30 * 86_400], |r| r.get::<_, i64>(0).map(|v| v as f64))?
@@ -226,8 +236,8 @@ fn profile(conn: &Connection, now: i64, age: Option<f64>) -> GooseResult<Profile
         observed_max = percentile(&all_hr, 99.98).unwrap_or(0.0);
     }
     let tanaka = 208.0 - 0.7 * age.unwrap_or(30.0);
-    let p = Profile { rest, hrmax: tanaka.max(observed_max) };
-    state_set(conn, "profile", &json!({"rest": p.rest, "hrmax": p.hrmax, "age": age, "computed_at": now}))?;
+    let p = Profile { rest: awake.unwrap_or(rest + 12.0).max(rest), hrmax: tanaka.max(observed_max) };
+    state_set(conn, "profile", &json!({"rest": p.rest, "sleep_rest": rest, "hrmax": p.hrmax, "age": age, "computed_at": now, "v": 2}))?;
     Ok(p)
 }
 
@@ -238,7 +248,8 @@ pub fn minute_score(m: &Minute, p: &Profile) -> f64 {
     }
     let hrr = m.hr.map(|h| p.hrr(h)).unwrap_or(0.0);
     let motion = ((m.steps - 30.0) / 70.0)
-        .max((m.dyn_mean.unwrap_or(0.0) - 0.04) / 0.12)
+        // R18 dynamic acceleration: ~0.2-0.35 g walking, 0.6-0.8 g tennis (11 Nov)
+        .max((m.dyn_mean.unwrap_or(0.0) - 0.10) / 0.40)
         .max((m.imu_dyn.unwrap_or(0.0) - 0.05) / 0.15)
         .max((m.grav_var - 3.0) / 10.0)
         .clamp(0.0, 1.0);
@@ -606,14 +617,20 @@ pub fn rules_v1(f: &BTreeMap<&str, f64>) -> Vec<f64> {
     let tennis = if imu {
         3.0 * clamp01(g("strokes_pm") / 3.0) + 1.0 * clamp01((g("steps_pm") - 15.0) / 30.0) * clamp01((110.0 - g("steps_pm")) / 30.0) - 1.0 * g("periodic_frac")
     } else {
-        1.5 * clamp01((g("steps_pm") - 20.0) / 30.0) * clamp01((110.0 - g("steps_pm")) / 30.0) + 1.0 * clamp01((g("dyn_cv") - 0.8) / 0.8) + 0.5 * clamp01(g("hrr_mean") / 0.5)
+        // without IMU a brisk walk has the same steps: require the intensity of a match
+        (1.5 * clamp01((g("steps_pm") - 20.0) / 30.0) * clamp01((130.0 - g("steps_pm")) / 30.0) + 1.0 * clamp01((g("dyn_cv") - 0.4) / 0.6) + 1.0 * clamp01((g("dyn_mean") - 0.3) / 0.3))
+            * clamp01((g("hrr_mean") - 0.3) / 0.25)
     };
     let strength = if imu {
         2.0 * clamp01(g("sets_per_10min") / 2.5) + 1.5 * g("periodic_frac") + 1.0 * clamp01((25.0 - g("steps_pm")) / 25.0) - 1.0 * clamp01(g("strokes_pm") / 3.0)
     } else {
-        1.5 * clamp01((25.0 - g("steps_pm")) / 25.0) + 1.0 * clamp01(g("active_alt") / 0.4) + 0.7 * clamp01((g("grav_var") - 4.0) / 8.0)
+        // sets are done standing: few steps; a walk alternates too, so steps and intensity gate it
+        (1.5 * clamp01((25.0 - g("steps_pm")) / 25.0) + 1.0 * clamp01(g("active_alt") / 0.4) + 0.7 * clamp01((g("grav_var") - 4.0) / 8.0))
+            * clamp01((45.0 - g("steps_pm")) / 20.0)
+            * clamp01((g("hrr_mean") - 0.25) / 0.2)
     };
-    let other = 1.2;
+    // a walk (firmware "walk" most of the time, moderate heart rate) is "autre"
+    let other = 1.2 + 1.5 * clamp01((g("walk_frac") - 0.4) / 0.3) * clamp01((0.5 - g("hrr_mean")) / 0.15);
     softmax(&[1.6 * run, 1.6 * tennis, 1.6 * strength, other])
 }
 
@@ -764,6 +781,72 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
     Ok(json!({"id": id, "predicted_type": predicted, "probs": CLASSES.iter().zip(&probs).map(|(c, p)| (c.to_string(), json!(round(*p, 3)))).collect::<serde_json::Map<_, _>>(), "model_version": model_version, "features": feats, "summary": summary}))
 }
 
+/// Tightens an auto session to its effort core: the approach walk and the walk home keep the heart
+/// rate up (EPOC) but are not the sport. Core = minutes above 0.5; effort minute = HRR >= 60 % of
+/// the core's p75 HRR and motion (dynamic accel or steps) >= 40-50 % of the core's p75.
+fn refine_bounds(conn: &Connection, p: &Profile, s: i64, e: i64) -> GooseResult<(i64, i64)> {
+    let secs = load_secs(conn, s, e + 1)?;
+    let mins = minutes(&secs, &BTreeMap::new());
+    let core: Vec<&Minute> = mins.iter().filter(|m| minute_score(m, p) > 0.5).collect();
+    if core.len() < 5 {
+        return Ok((s, e));
+    }
+    let q = |v: Vec<f64>| percentile(&v, 75.0).unwrap_or(0.0);
+    let hrr75 = q(core.iter().filter_map(|m| m.hr.map(|h| p.hrr(h))).collect());
+    let dyn75 = q(core.iter().filter_map(|m| m.dyn_mean).collect());
+    let st75 = q(core.iter().map(|m| m.steps).collect());
+    let effort = |m: &Minute| {
+        m.hr.map(|h| p.hrr(h)).unwrap_or(0.0) >= 0.6 * hrr75
+            // steps only count for running cadences: walking off the court keeps 50-60 steps/min
+            && (m.dyn_mean.unwrap_or(0.0) >= 0.5 * dyn75 || (st75 >= 140.0 && m.steps >= 0.8 * st75) || m.run_frac > 0.5)
+    };
+    let flags: Vec<bool> = mins.iter().map(effort).collect();
+    // first / last effort minute that starts / ends a run of >= 3 effort minutes out of 4
+    let dense = |i: usize| flags[i..(i + 4).min(flags.len())].iter().filter(|f| **f).count() >= 3;
+    let first = (0..flags.len()).find(|&i| flags[i] && dense(i));
+    let last = (0..flags.len()).rev().find(|&i| flags[i] && dense(i.saturating_sub(3)));
+    match (first, last) {
+        (Some(a), Some(b)) if b > a => Ok(((mins[a].t - PRE_BUFFER_S).max(s), (mins[b].t + 60 + POST_BUFFER_S).min(e))),
+        _ => Ok((s, e)),
+    }
+}
+
+fn imu_window(imu: &Imu, from: f64) -> Imu {
+    let k = imu.t.partition_point(|t| *t < from);
+    Imu { t: imu.t[k..].to_vec(), a: [0, 1, 2].map(|i| imu.a[i][k..].to_vec()), g: [0, 1, 2].map(|i| imu.g[i][k..].to_vec()) }
+}
+
+/// A session is only opened on the signature of a sport, never on heart rate and motion alone
+/// (an active life has many short efforts: stairs, running to the kitchen or to the office —
+/// 11 Nov 16:53 replay). Any one of:
+///   running     >= 3 of the last 5 minutes at >= 140 steps/min (or firmware "run");
+///   tennis      >= 3 isolated strokes in the last 5 minutes (IMU);
+///   strength    >= 2 periodic sets in the last 10 minutes (IMU);
+///   sustained   >= 8 of the last 10 minutes at >= 50 % heart-rate reserve (other sports, and
+///               days without IMU): daily-life bursts do not last that long.
+pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, now: i64) -> Value {
+    let last = |k: usize| -> Vec<&Minute> { mins.iter().rev().take(k).collect() };
+    let run_min = last(5).iter().filter(|m| m.steps >= 140.0 || m.run_frac > 0.5).count();
+    let sustained = last(10).iter().filter(|m| m.n >= 30 && m.hr.map(|h| p.hrr(h)).unwrap_or(0.0) >= 0.5).count();
+    let w5 = imu_window(imu, (now - 300) as f64);
+    let w10 = imu_window(imu, (now - 600) as f64);
+    let imu_s = w10.len() as f64 / IMU_FS;
+    let strokes5 = strokes(&w5).len();
+    let sets10 = sets_and_reps(&w10).iter().filter(|s| s.periodic && s.reps >= 4).count();
+    let kind = if run_min >= 3 {
+        Some("course")
+    } else if strokes5 >= 3 {
+        Some("tennis")
+    } else if sets10 >= 2 {
+        Some("musculation")
+    } else if sustained >= 8 {
+        Some("effort soutenu")
+    } else {
+        None
+    };
+    json!({"confirmed": kind.is_some(), "by": kind, "run_minutes": run_min, "strokes_5min": strokes5, "sets_10min": sets10, "sustained_minutes": sustained, "imu_s_10min": round(imu_s, 0)})
+}
+
 // ------------------------------------------------------------------ online engine
 
 #[derive(Debug, Deserialize)]
@@ -785,6 +868,9 @@ pub struct UpdateArgs {
     /// detection paused (smart wake owns the streams, user disabled it)
     #[serde(default)]
     pub paused: bool,
+    /// replay only: R18 seconds newer than now - lag are not visible yet (history arrives by sync)
+    #[serde(default)]
+    pub history_lag_s: Option<i64>,
 }
 
 fn store_live(conn: &Connection, args: &UpdateArgs, arrival: f64) -> GooseResult<(usize, usize)> {
@@ -813,6 +899,17 @@ fn store_live(conn: &Connection, args: &UpdateArgs, arrival: f64) -> GooseResult
 }
 
 fn new_session(conn: &Connection, start: i64, source: &str, label: Option<&str>, now: i64) -> GooseResult<String> {
+    // an auto session that ended less than 5 min before this start is resumed, never duplicated
+    if source == "auto" {
+        let prev: Option<String> = conn
+            .query_row("SELECT id FROM sport_sessions WHERE source = 'auto' AND status IN ('ended','active') AND label_status = 'pending' AND COALESCE(end_ts, ?1) >= ?2 ORDER BY start_ts DESC LIMIT 1", params![now, start - 300], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = prev {
+            conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [&id])?;
+            conn.execute("UPDATE sport_sessions SET status = 'active', end_ts = NULL, updated_at = ?2 WHERE id = ?1", params![id, now])?;
+            return Ok(id);
+        }
+    }
     let id = format!("sp-{start}");
     conn.execute(
         "INSERT OR IGNORE INTO sport_sessions (id, start_ts, status, source, engine_version, label_type, label_status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?7)",
@@ -844,9 +941,13 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
     let p = profile(&conn, now, args.age)?;
     let from = now - 40 * 60;
     let imu = load_imu(&conn, from as f64, (now + 1) as f64)?;
-    let secs = load_secs(&conn, from, now + 1)?;
+    let mut secs = load_secs(&conn, from, now + 1)?;
+    if let Some(lag) = args.history_lag_s {
+        secs.retain(|t, _| *t <= now - lag);
+    }
     let mins = minutes(&secs, &imu_dyn_per_minute(&imu));
-    let scores: Vec<(i64, f64)> = mins.iter().map(|m| (m.t, minute_score(m, &p))).collect();
+    let after = st["after"].as_i64().unwrap_or(0);
+    let scores: Vec<(i64, f64)> = mins.iter().filter(|m| state != "idle" && state != "watch" || m.t >= after).map(|m| (m.t, minute_score(m, &p))).collect();
     let data_until = secs.keys().next_back().copied().unwrap_or(0);
     let recent = |k: usize| -> Vec<f64> { scores.iter().rev().take(k).map(|s| s.1).collect() };
     let active_recent = |k: usize| recent(k).iter().filter(|v| **v > 0.5).count();
@@ -862,14 +963,17 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
         match state.as_str() {
             "idle" => {
                 // speculative capture on the first sign (HR reserve or sustained motion)
-                if recent(3).iter().any(|v| *v > 0.35) && data_until > now - 15 * 60 {
+                if now >= st["cooldown_until"].as_i64().unwrap_or(0) && recent(3).iter().any(|v| *v > 0.35) && data_until > now - 15 * 60 {
                     next = "watch".into();
                     st["watch_since"] = json!(now);
                     event = Some("watch");
                 }
             }
             "watch" => {
-                if active_recent(6) >= 4 {
+                let sig = signature(&mins, &p, &imu, now);
+                st["signature"] = sig.clone();
+                let quiet_watch = recent(8).iter().all(|v| *v <= 0.35);
+                if active_recent(6) >= 3 && sig["confirmed"].as_bool() == Some(true) {
                     // backdate to the first active minute of this run (gaps <= 2 min tolerated)
                     let mut start = scores.last().map(|s| s.0).unwrap_or(now);
                     let mut gap = 0;
@@ -889,7 +993,9 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                     st["active_start"] = json!(start);
                     next = "active".into();
                     event = Some("start");
-                } else if now - st["watch_since"].as_i64().unwrap_or(now) > 10 * 60 {
+                } else if quiet_watch || now - st["watch_since"].as_i64().unwrap_or(now) > 20 * 60 {
+                    // daily-life bursts (stairs, running to the kitchen): no sport signature
+                    conn.execute("UPDATE sport_acquisition SET reason = ?1 WHERE end_ts IS NULL", [format!("watch_dropped {sig}")])?;
                     next = "idle".into();
                     event = Some("watch_dropped");
                 }
@@ -927,13 +1033,18 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
         if let Some(id) = &session_id {
             // discard bouts too short to be a session (stairs, a sprint to the bus)
             let (s, e): (i64, i64) = conn.query_row("SELECT start_ts, COALESCE(end_ts, ?2) FROM sport_sessions WHERE id = ?1", params![id, now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (s, e) = if manual { (s, e) } else { refine_bounds(&conn, &p, s, e)? };
+            if !manual {
+                conn.execute("UPDATE sport_sessions SET start_ts = ?2, end_ts = ?3 WHERE id = ?1", params![id, s, e])?;
+            }
             if !manual && e - s < 8 * 60 + PRE_BUFFER_S + POST_BUFFER_S {
                 conn.execute("UPDATE sport_sessions SET status = 'discarded', label_status = 'auto_discarded', updated_at = ?2 WHERE id = ?1", params![id, now])?;
             } else {
                 analysis = analyze_session(&conn, id, args.age)?;
             }
         }
-        st = json!({"state": "idle"});
+        // minutes of the session just closed cannot open the next one
+        st = json!({"state": "idle", "after": st["last_active"].as_i64().unwrap_or(now) + 120});
         next = "idle".into();
     }
     if next == "watch" && state == "idle" {
@@ -963,7 +1074,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
     Ok(json!({
         "state": next, "event": event, "want_streams": want, "sync_interval_s": if want { 120 } else { 300 },
         "data_until": data_until, "lag_s": now - data_until, "minute_scores": scores.iter().rev().take(10).map(|s| json!([s.0, round(s.1, 2)])).collect::<Vec<_>>(),
-        "current": current, "analysis": analysis, "stored": {"live": stored.0, "imu": stored.1},
+        "current": current, "analysis": analysis, "signature": st["signature"].clone(), "stored": {"live": stored.0, "imu": stored.1},
         "profile": {"rest": round(p.rest, 0), "hrmax": round(p.hrmax, 0)}, "engine_version": ENGINE_VERSION,
         "latency_ms": round(t0.elapsed().as_secs_f64() * 1000.0, 1),
     }))
@@ -1102,6 +1213,95 @@ pub fn annotate(args: &AnnotateArgs) -> GooseResult<Value> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ReplayArgs {
+    pub database_path: String,
+    pub from_ts: i64,
+    pub to_ts: i64,
+    #[serde(default)]
+    pub age: Option<f64>,
+}
+
+/// Offline replay of the online engine over past history (R18 + any IMU stored), one step per
+/// minute, with the history lag of the real app (sync every 300 s at rest, 120 s while a session is
+/// plausible). Run it on a copy of the database: it rewrites the engine state and adds sessions.
+pub fn replay(args: &ReplayArgs) -> GooseResult<Value> {
+    {
+        let conn = Connection::open(&args.database_path)?;
+        ensure_tables(&conn)?;
+        state_set(&conn, "engine", &json!({"state": "idle"}))?;
+    }
+    let mut events = Vec::new();
+    let mut timeline = Vec::new();
+    let mut state = "idle".to_string();
+    let mut last_sync = args.from_ts;
+    for now in (args.from_ts..=args.to_ts).step_by(60) {
+        let every = if state == "idle" { 300 } else { 120 };
+        if now - last_sync >= every {
+            last_sync = now;
+        }
+        let r = update(&UpdateArgs {
+            database_path: args.database_path.clone(),
+            now_unix: Some(now),
+            live: vec![],
+            imu: vec![],
+            age: args.age,
+            capturing: state != "idle",
+            paused: false,
+            history_lag_s: Some(now - last_sync + 20),
+        })?;
+        state = r["state"].as_str().unwrap_or("idle").to_string();
+        if let Some(e) = r["event"].as_str() {
+            events.push(json!({"ts": now, "event": e, "state": state, "data_until": r["data_until"]}));
+        }
+        if let Some(sc) = r["minute_scores"].as_array().and_then(|a| a.first()) {
+            timeline.push(json!([now, state, sc[1]]));
+        }
+    }
+    let conn = Connection::open(&args.database_path)?;
+    let sessions: Vec<Value> = conn
+        .prepare("SELECT id, start_ts, end_ts, status, source, predicted_type, probs_json, confidence, summary_json, model_version, label_type, label_status FROM sport_sessions WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts")?
+        .query_map(params![args.from_ts - 3600, args.to_ts], row_session)?
+        .collect::<Result<_, _>>()?;
+    let features: Vec<Value> = conn
+        .prepare("SELECT id, features_json FROM sport_sessions WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts")?
+        .query_map(params![args.from_ts - 3600, args.to_ts], |r| Ok(json!({"id": r.get::<_, String>(0)?, "features": r.get::<_, Option<String>>(1)?.and_then(|s| serde_json::from_str::<Value>(&s).ok())})))?
+        .collect::<Result<_, _>>()?;
+    Ok(json!({"events": events, "sessions": sessions, "features": features, "timeline": timeline}))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteArgs {
+    pub database_path: String,
+    pub id: String,
+}
+
+/// Removes a session started by mistake (and its segments). The deletion itself is kept in
+/// sport_annotations so the dataset history stays auditable; the exported folder is removed at
+/// the next export. Deleting the running session stops it.
+pub fn delete_session(args: &DeleteArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    let now = now_s();
+    let row: Option<(String, Option<String>)> = conn.query_row("SELECT COALESCE(label_type, predicted_type, ''), source FROM sport_sessions WHERE id = ?1", [&args.id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let Some((ty, source)) = row else { return Ok(json!({"ok": false, "reason": "not_found"})) };
+    conn.execute(
+        "INSERT INTO sport_annotations (ts, target, target_id, field, old_value, new_value, engine_version, source) VALUES (?1, 'session', ?2, 'deleted', ?3, NULL, ?4, ?5)",
+        params![now, args.id, ty, ENGINE_VERSION, source.unwrap_or_default()],
+    )?;
+    conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [&args.id])?;
+    conn.execute("DELETE FROM sport_sessions WHERE id = ?1", [&args.id])?;
+    conn.execute("UPDATE sport_acquisition SET session_id = NULL WHERE session_id = ?1", [&args.id])?;
+    let mut stopped = false;
+    if let Some(st) = state_get(&conn, "engine")? {
+        if st["session_id"].as_str() == Some(args.id.as_str()) {
+            state_set(&conn, "engine", &json!({"state": "idle", "cooldown_until": now + 300}))?;
+            stopped = true;
+        }
+    }
+    Ok(json!({"ok": true, "stopped": stopped}))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListArgs {
     pub database_path: String,
     #[serde(default)]
@@ -1202,6 +1402,14 @@ pub fn export_dataset(args: &DatasetArgs) -> GooseResult<Value> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let mut exported = 0;
+    if let Ok(entries) = std::fs::read_dir(root.join("sessions")) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !sessions.iter().any(|(id, _, _)| *id == name) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
     for (id, s, e) in &sessions {
         let dir = root.join("sessions").join(id);
         if dir.join("imu.csv").exists() {
@@ -1378,7 +1586,7 @@ mod tests {
         }
         let mut states = Vec::new();
         for now in (t0 + 60..t0 + 3000).step_by(60) {
-            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false }).unwrap();
+            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false, history_lag_s: None }).unwrap();
             states.push((now - t0, r["state"].as_str().unwrap().to_string(), r["event"].clone()));
         }
         let start_evt = states.iter().find(|s| s.2 == "start").expect("start");
@@ -1415,5 +1623,51 @@ mod tests {
             for i in 0..imu.len() { all.t.push(imu.t[i]); for k in 0..3 { all.a[k].push(imu.a[k][i]); all.g[k].push(imu.g[k][i]); } }
         }
         println!("ALL strokes {} sets {:?}", strokes(&all).len(), sets_and_reps(&all).iter().map(|s| (round(s.end - s.start, 1), s.periodic, s.reps, s.period_s)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[ignore]
+    fn replay_real_day() {
+        // GOOSE_DB (a copy!), GOOSE_FROM, GOOSE_TO (unix), optional GOOSE_OUT (json path)
+        let (Ok(db), Ok(a), Ok(b)) = (std::env::var("GOOSE_DB"), std::env::var("GOOSE_FROM"), std::env::var("GOOSE_TO")) else { return };
+        let r = replay(&ReplayArgs { database_path: db, from_ts: a.parse().unwrap(), to_ts: b.parse().unwrap(), age: None }).unwrap();
+        if let Ok(out) = std::env::var("GOOSE_OUT") {
+            std::fs::write(out, serde_json::to_string_pretty(&r).unwrap()).unwrap();
+        }
+        println!("events {}", r["events"]);
+        for s in r["sessions"].as_array().unwrap() {
+            println!("session {} {}..{} {} p={} {}", s["id"], s["start_ts"], s["end_ts"], s["predicted_type"], s["confidence"], s["probs"]);
+        }
+    }
+
+    #[test]
+    fn daily_life_bursts_do_not_open_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        ensure_tables(&conn).unwrap();
+        crate::whoop5_store::ensure_tables(&conn).unwrap();
+        let t0: i64 = 1_800_000_000;
+        // 30 min of an active life: every 3 min, 1 min of stairs (HR 140, 150 steps/min), else walking at HR 90
+        let mut steps = 0i64;
+        for t in t0..t0 + 3600 {
+            let k = t - t0;
+            let burst = k >= 600 && k < 2400 && (k / 60) % 3 == 0;
+            let walk = k >= 600 && k < 2400;
+            steps += if burst { 150 } else if walk { 60 } else { 0 };
+            conn.execute(
+                "INSERT INTO whoop5_r18 (ts, record_index, frame_id, hr, rr_ms, steps, dyn_accel_g, activity, band_state, decoder_version) VALUES (?1, ?2, 'f', ?3, '', ?4, ?5, ?6, 'wake', 'v')",
+                params![t, k, if burst { 140 } else if walk { 90 } else { 60 }, (steps / 60) % 65536, if burst { 0.6 } else if walk { 0.25 } else { 0.01 }, if walk { "walk" } else { "still" }],
+            ).unwrap();
+        }
+        let mut watched = false;
+        for now in (t0 + 60..t0 + 3600).step_by(60) {
+            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false, history_lag_s: None }).unwrap();
+            watched |= r["state"] == "watch";
+            assert_ne!(r["event"], "start", "at {}: {}", now - t0, r["signature"]);
+        }
+        assert!(watched, "bursts should at least trigger the IMU watch");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM sport_sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 }

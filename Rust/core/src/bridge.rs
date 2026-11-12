@@ -2475,6 +2475,14 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(timeline_from_decoded_frames_bridge)
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.delete" => request_args::<crate::sport::DeleteArgs>(&request)
+            .and_then(|args| crate::sport::delete_session(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.replay" => request_args::<crate::sport::ReplayArgs>(&request)
+            .and_then(|args| crate::sport::replay(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "sport.update" => request_args::<crate::sport::UpdateArgs>(&request)
             .and_then(|args| crate::sport::update(&args))
             .map(|value| bridge_ok(&request.request_id, value))
