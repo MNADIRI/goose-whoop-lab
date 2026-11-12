@@ -479,6 +479,22 @@ pub struct SetResult {
 /// Strength sets: bouts of movement energy separated by rests >= 15 s, then repetitions from the
 /// autocorrelation of the most periodic axis, and up / down / hold phases from vertical velocity.
 pub fn sets_and_reps(imu: &Imu) -> Vec<SetResult> {
+    sets_and_reps_with(imu, &|_| None)
+}
+
+fn sign_norm(v: [f64; 3]) -> [f64; 3] {
+    let k = (0..3).max_by(|a, b| v[*a].abs().total_cmp(&v[*b].abs())).unwrap_or(0);
+    if v[k] < 0.0 { v.map(|x| -x) } else { v }
+}
+
+/// Number of shape dimensions (orientation, movement axes, rotation share) at the head of
+/// SetResult::features; then tempo, rotation and velocity amplitudes.
+pub const SHAPE_DIMS: usize = 14;
+
+/// Sets / reps with an optional expected period per set (from the shape of the movement and the
+/// user's labelled sets of the same exercise): constrains the autocorrelation search to
+/// [0.6 T, 1.7 T], which removes the half / double period errors of an unconstrained search.
+pub fn sets_and_reps_with(imu: &Imu, period_hint: &dyn Fn(&[f64]) -> Option<f64>) -> Vec<SetResult> {
     let w = work25(imu);
     let n = w.t.len();
     if n < 25 * 20 {
@@ -526,9 +542,32 @@ pub fn sets_and_reps(imu: &Imu) -> Vec<SetResult> {
         let gyr: Vec<[f64; 3]> = (s..=e_idx).map(|i| [w.g[0][i], w.g[1][i], w.g[2][i]]).collect();
         let gx = pca1(&gyr);
         let pg: Vec<f64> = gyr.iter().map(|v| v[0] * gx[0] + v[1] * gx[1] + v[2] * gx[2]).collect();
+        // shape of the movement, independent of tempo: wrist orientation and its spread, movement
+        // axis (accel) and rotation axis (gyro) in the strap frame, vertical share, rotation share
+        let nn = (e_idx - s + 1) as f64;
+        let gsd = [0, 1, 2].map(|k| {
+            let m = gu[k];
+            ((s..=e_idx).map(|i| {
+                let g = [w.grav[0][i], w.grav[1][i], w.grav[2][i]];
+                let n = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-6);
+                (g[k] / n - m).powi(2)
+            }).sum::<f64>() / nn).sqrt()
+        });
+        let axn = sign_norm(ax);
+        let gxn = sign_norm(gx);
+        let gyro_rms0 = (gyr.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / gyr.len() as f64).sqrt();
+        let acc_rms0 = (seg_dyn.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / seg_dyn.len() as f64).sqrt();
+        let shape: Vec<f64> = vec![
+            gu[0], gu[1], gu[2], 2.0 * gsd[0], 2.0 * gsd[1], 2.0 * gsd[2], axn[0], axn[1], axn[2], gxn[0], gxn[1], gxn[2],
+            (ax[0] * gu[0] + ax[1] * gu[1] + ax[2] * gu[2]).abs(), (gyro_rms0 / (acc_rms0 * 300.0).max(1e-3)).min(5.0) / 2.0,
+        ];
+        let (lo_s, hi_s) = match period_hint(&shape) {
+            Some(t) => ((0.6 * t).max(0.6), (1.7 * t).min(10.0)),
+            None => (0.8, 8.0),
+        };
         let mut best: Option<(f64, f64, Vec<f64>)> = None;
         for sig in [moving_avg(&vert, 5), moving_avg(&pa, 5), moving_avg(&pg, 5)] {
-            if let Some((p, r)) = autocorr_peak(&sig, fs, 0.8, 8.0f64.min(dur / 2.0)) {
+            if let Some((p, r)) = autocorr_peak(&sig, fs, lo_s, hi_s.min(dur / 2.0)) {
                 if best.as_ref().is_none_or(|b| r > b.1) {
                     best = Some((p, r, sig));
                 }
@@ -576,9 +615,26 @@ pub fn sets_and_reps(imu: &Imu) -> Vec<SetResult> {
             down_s = Some(round(fd * period, 2));
             hold_s = Some(round((1.0 - fu - fd).max(0.0) * period, 2));
         }
-        let gyro_rms = (gyr.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / gyr.len() as f64).sqrt();
-        let acc_rms = (seg_dyn.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / seg_dyn.len() as f64).sqrt();
-        let axis_vert = (ax[0] * gu[0] + ax[1] * gu[1] + ax[2] * gu[2]).abs();
+        // amplitudes per repetition: rotation (deg) about the main gyro axis, vertical velocity
+        let (mut rot_amp, mut vel_amp) = (0.0, 0.0);
+        if periodic {
+            let mut ang = vec![0.0; pg.len()];
+            for i in 1..pg.len() {
+                ang[i] = ang[i - 1] + pg[i] / fs;
+            }
+            let tr = moving_avg(&ang, (period * fs) as usize);
+            let hp: Vec<f64> = ang.iter().zip(&tr).map(|(a, b)| a - b).collect();
+            rot_amp = percentile(&hp, 95.0).unwrap_or(0.0) - percentile(&hp, 5.0).unwrap_or(0.0);
+            let mut v = vec![0.0; vert.len()];
+            for i in 1..vert.len() {
+                v[i] = v[i - 1] + 9.81 * vert[i] / fs;
+            }
+            let tv = moving_avg(&v, (period * fs) as usize);
+            let hv: Vec<f64> = v.iter().zip(&tv).map(|(a, b)| a - b).collect();
+            vel_amp = percentile(&hv, 95.0).unwrap_or(0.0) - percentile(&hv, 5.0).unwrap_or(0.0);
+        }
+        let mut features = shape.clone();
+        features.extend([(period.max(0.3)).ln() / 1.5, (rot_amp / 90.0).min(3.0), vel_amp.min(2.0)]);
         out.push(SetResult {
             start: w.t[s],
             end: w.t[e_idx],
@@ -589,8 +645,7 @@ pub fn sets_and_reps(imu: &Imu) -> Vec<SetResult> {
             up_s,
             down_s,
             hold_s,
-            // exercise signature: wrist orientation, movement axis vs gravity, tempo, rotation share
-            features: vec![gu[0], gu[1], gu[2], axis_vert, period / 4.0, (gyro_rms / (acc_rms * 300.0).max(1e-3)).min(5.0) / 2.0],
+            features,
         });
     }
     out
@@ -689,26 +744,90 @@ pub fn session_features(mins: &[Minute], p: &Profile, imu: &Imu, sets: &[SetResu
     f
 }
 
-fn exercise_library(conn: &Connection) -> GooseResult<Vec<(String, Vec<f64>)>> {
-    let mut st = conn.prepare("SELECT exercise_label, detail_json FROM sport_segments WHERE kind = 'set' AND exercise_label IS NOT NULL")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+/// One labelled set of the personal exercise library: label, signature, period, labelled reps.
+#[derive(Debug, Clone)]
+pub struct LibSet {
+    pub label: String,
+    pub features: Vec<f64>,
+    pub period: Option<f64>,
+}
+
+fn exercise_library(conn: &Connection) -> GooseResult<Vec<LibSet>> {
+    let mut st = conn.prepare("SELECT exercise_label, detail_json, reps_label, start_ts, end_ts FROM sport_segments WHERE kind = 'set' AND exercise_label IS NOT NULL AND label_status IN ('confirmed','corrected')")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, f64>(3)?, r.get::<_, f64>(4)?)))?;
     let mut out = Vec::new();
     for row in rows {
-        let (label, d) = row?;
-        let f: Option<Vec<f64>> = d.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| serde_json::from_value(v["features"].clone()).ok());
+        let (label, d, reps, s, e) = row?;
+        let v: Value = d.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+        let f: Option<Vec<f64>> = serde_json::from_value(v["features"].clone()).ok();
+        // the user's rep count is the truth for the period of that exercise
+        let period = reps.filter(|r| *r >= 2).map(|r| (e - s) / r as f64).or_else(|| v["period_s"].as_f64());
         if let Some(f) = f {
-            out.push((label, f));
+            out.push(LibSet { label, features: f, period });
         }
     }
     Ok(out)
 }
 
-fn nearest_exercise(lib: &[(String, Vec<f64>)], f: &[f64]) -> Option<(String, f64)> {
+fn dist(a: &[f64], b: &[f64], dims: usize) -> f64 {
+    a.iter().zip(b).take(dims).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt()
+}
+
+/// Few-shot exercise recognition: distance-weighted vote of the 3 nearest labelled sets
+/// (prototype / metric approach — the personal library is the training set). Confidence falls
+/// with the distance to the closest example; unseen movements stay unnamed.
+pub fn recognize_exercise(lib: &[LibSet], f: &[f64]) -> Option<(String, f64)> {
+    let mut d: Vec<(&LibSet, f64)> = lib.iter().filter(|l| l.features.len() == f.len()).map(|l| (l, dist(&l.features, f, f.len()))).collect();
+    if d.is_empty() {
+        return None;
+    }
+    d.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut votes: BTreeMap<&str, f64> = BTreeMap::new();
+    for (l, x) in d.iter().take(3) {
+        *votes.entry(l.label.as_str()).or_default() += 1.0 / (x + 0.05);
+    }
+    let total: f64 = votes.values().sum();
+    let (label, v) = votes.into_iter().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let conf = (v / total) * (-1.2 * d[0].1).exp();
+    Some((label.to_string(), round(conf, 3)))
+}
+
+/// Expected period for a movement shape: the closest labelled set of similar shape.
+fn period_for_shape(lib: &[LibSet], shape: &[f64]) -> Option<f64> {
     lib.iter()
-        .filter(|(_, g)| g.len() == f.len())
-        .map(|(l, g)| (l.clone(), g.iter().zip(f).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()))
+        .filter(|l| l.features.len() >= SHAPE_DIMS && l.period.is_some())
+        .map(|l| (l, dist(&l.features, shape, SHAPE_DIMS)))
+        .filter(|(_, d)| *d < 0.6)
         .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(l, d)| (l, round((-2.0 * d).exp(), 3)))
+        .and_then(|(l, _)| l.period)
+}
+
+/// Groups the sets of one session by exercise (sets of the same exercise are usually
+/// consecutive): one label from the user then names the whole group.
+pub fn cluster_sets(sets: &[&SetResult]) -> Vec<usize> {
+    let mut centroids: Vec<(Vec<f64>, usize)> = Vec::new();
+    let mut out = Vec::new();
+    let mut prev: Option<usize> = None;
+    for s in sets {
+        let f = &s.features;
+        let best = centroids.iter().enumerate().map(|(k, (c, _))| (k, dist(c, f, f.len().min(c.len())))).min_by(|a, b| a.1.total_cmp(&b.1));
+        let k = match (best, prev) {
+            (Some((k, d)), Some(p)) if k == p && d < 1.1 => k,
+            (Some((k, d)), _) if d < 0.8 => k,
+            _ => {
+                centroids.push((f.clone(), 0));
+                centroids.len() - 1
+            }
+        };
+        let (c, n) = &mut centroids[k];
+        *n += 1;
+        for (ci, fi) in c.iter_mut().zip(f) {
+            *ci += (fi - *ci) / *n as f64;
+        }
+        out.push(k);
+        prev = Some(k);
+    }
+    out
 }
 
 /// Full analysis of one session: features, classification, segments. Human-labelled segments are
@@ -723,7 +842,8 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
     let secs = load_secs(conn, start, end + 1)?;
     let mins = minutes(&secs, &imu_dyn_per_minute(&imu));
     let st = strokes(&imu);
-    let sets = sets_and_reps(&imu);
+    let lib = exercise_library(conn)?;
+    let sets = sets_and_reps_with(&imu, &|shape| period_for_shape(&lib, shape));
     let f = session_features(&mins, &p, &imu, &sets, st.len(), start, end);
     let (model_version, probs) = match active_model(conn)? {
         Some((v, params_json)) => match model_predict(&params_json, &f) {
@@ -739,6 +859,7 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
         "duration_min": f["dur_min"], "hr_mean": mean(&hr).map(|v| round(v, 0)), "hr_max": hr.iter().copied().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.max(b)))),
         "imu_minutes": round(imu.len() as f64 / IMU_FS / 60.0, 1), "strokes": st.len(),
         "sets": sets.iter().filter(|s| s.periodic).count(), "reps": sets.iter().filter(|s| s.periodic).map(|s| s.reps).sum::<usize>(),
+        "exercise_groups": cluster_sets(&sets.iter().filter(|s| s.periodic).collect::<Vec<_>>()).iter().copied().max().map(|m| m + 1).unwrap_or(0),
         "cadence_spm": f["cad_spm"], "profile": {"rest_hr": round(p.rest, 0), "hr_max": round(p.hrmax, 0)},
         "hr_series": mins.iter().filter_map(|m| m.hr.map(|h| json!([m.t, round(h, 0)]))).collect::<Vec<_>>(),
     });
@@ -750,15 +871,18 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
     let labelled: i64 = conn.query_row("SELECT COUNT(*) FROM sport_segments WHERE session_id = ?1 AND label_status != 'pending'", [id], |r| r.get(0))?;
     if labelled == 0 {
         conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [id])?;
-        let lib = exercise_library(conn)?;
         let label_type: Option<String> = conn.query_row("SELECT label_type FROM sport_sessions WHERE id = ?1", [id], |r| r.get(0))?;
         let kind_of = label_type.as_deref().unwrap_or(predicted);
         let mut ins = conn.prepare("INSERT INTO sport_segments (id, session_id, kind, start_ts, end_ts, reps_pred, exercise_pred, exercise_conf, confidence, detail_json, engine_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
         if kind_of == "musculation" || (kind_of == "autre" && !sets.is_empty() && source == "manual") {
+            let periodic: Vec<&SetResult> = sets.iter().filter(|s| s.periodic).collect();
+            let clusters = cluster_sets(&periodic);
+            let mut ci = 0;
             for (k, s) in sets.iter().enumerate() {
-                let ex = if s.periodic { nearest_exercise(&lib, &s.features) } else { None };
-                let detail = json!({"periodic": s.periodic, "period_s": s.period_s, "up_s": s.up_s, "down_s": s.down_s, "hold_s": s.hold_s, "features": s.features});
-                ins.execute(params![format!("{id}-s{k}"), id, if s.periodic { "set" } else { "effort" }, s.start, s.end, s.periodic.then_some(s.reps as i64), ex.as_ref().filter(|e| e.1 >= 0.5).map(|e| e.0.clone()), ex.as_ref().map(|e| e.1), s.confidence, detail.to_string(), ENGINE_VERSION])?;
+                let ex = if s.periodic { recognize_exercise(&lib, &s.features) } else { None };
+                let cluster = if s.periodic { ci += 1; Some(clusters[ci - 1]) } else { None };
+                let detail = json!({"periodic": s.periodic, "period_s": s.period_s, "up_s": s.up_s, "down_s": s.down_s, "hold_s": s.hold_s, "features": s.features, "cluster": cluster});
+                ins.execute(params![format!("{id}-s{k}"), id, if s.periodic { "set" } else { "effort" }, s.start, s.end, s.periodic.then_some(s.reps as i64), ex.as_ref().filter(|e| e.1 >= 0.35).map(|e| e.0.clone()), ex.as_ref().map(|e| e.1), s.confidence, detail.to_string(), ENGINE_VERSION])?;
             }
         } else if kind_of == "tennis" && !st.is_empty() {
             // rallies / games: strokes closer than 25 s belong to the same exchange block
@@ -1070,7 +1194,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
             let f = session_features(&mins, &p, &recent_imu, &rs, rk.len(), start.max(now - 600), now);
             let pr = rules_v1(&f);
             let b = pr.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(3);
-            json!({"id": id, "start_ts": start, "label_type": label, "guess": CLASSES[b], "guess_p": round(pr[b], 2), "reps_last10": rs.iter().filter(|s| s.periodic).map(|s| s.reps).sum::<usize>(), "strokes_last10": rk.len()})
+            json!({"id": id, "start_ts": start, "label_type": label, "guess": CLASSES[b], "guess_p": round(pr[b], 2), "reps_last10": rs.iter().filter(|s| s.periodic).map(|s| s.reps).sum::<usize>(), "sets_last10": rs.iter().filter(|s| s.periodic).count(), "strokes_last10": rk.len()})
         }
         _ => Value::Null,
     };
@@ -1197,6 +1321,18 @@ pub fn annotate(args: &AnnotateArgs) -> GooseResult<Value> {
         ("segment", "exercise") => {
             conn.execute("UPDATE sport_segments SET exercise_label = ?2, label_status = 'corrected' WHERE id = ?1", params![args.id, v])?;
             annotate_row(&conn, "segment", &args.id, "exercise", None, v, "correct")?;
+            // the other sets of the same group in this session get it as a prediction
+            let (sid, d): (String, Option<String>) = conn.query_row("SELECT session_id, detail_json FROM sport_segments WHERE id = ?1", [&args.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let cluster = d.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v["cluster"].as_i64());
+            if let Some(c) = cluster {
+                let mut st = conn.prepare("SELECT id, detail_json FROM sport_segments WHERE session_id = ?1 AND id != ?2 AND label_status = 'pending'")?;
+                let others: Vec<(String, Option<String>)> = st.query_map(params![sid, args.id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+                for (oid, od) in others {
+                    if od.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v["cluster"].as_i64()) == Some(c) {
+                        conn.execute("UPDATE sport_segments SET exercise_pred = ?2, exercise_conf = 0.9 WHERE id = ?1", params![oid, v])?;
+                    }
+                }
+            }
         }
         ("segment", "concentric") => {
             // "up" (default) or "down": which vertical direction is the concentric phase
@@ -1787,6 +1923,43 @@ mod tests {
         println!("backfill {:.1} s: windows {} replayed {} labelled {}", t.elapsed().as_secs_f64(), r["windows"], r["replayed"], r["labelled"]);
         for s in r["sessions"].as_array().unwrap() {
             println!("  {} {}..{} {} {} label {} {}", s["id"], s["start_ts"], s["end_ts"], s["status"], s["predicted_type"], s["label_type"], s["label_status"]);
+        }
+    }
+
+    #[test]
+    fn groups_sets_by_exercise_and_recognises_them_next_time() {
+        // exercise A: vertical press, wrist flat (gravity on z), 2.5 s reps; exercise B: curl-like
+        // rotation about x, wrist on its side (gravity on y), 3.2 s reps; 3 sets each, 60 s rests
+        let mk = |which: u8, t: f64| -> ([f64; 3], [f64; 3]) {
+            if which == 0 {
+                let v = 0.25 * (2.0 * PI * t / 2.5).sin();
+                ([0.0, 0.05, 1.0 + v], [40.0 * (2.0 * PI * t / 2.5).cos(), 0.0, 0.0])
+            } else {
+                let a = 0.6 * (2.0 * PI * t / 3.2).sin();
+                ([0.2 * a, 1.0 * a.cos(), 0.15 * a.sin()], [150.0 * (2.0 * PI * t / 3.2).cos(), 10.0, 0.0])
+            }
+        };
+        let session = |order: &[u8]| {
+            imu_from(
+                |t| {
+                    let k = (t / 90.0) as usize;
+                    let ph = t % 90.0;
+                    if k < order.len() && ph < 30.0 { mk(order[k], ph) } else { ([0.0, 0.05, 1.0], [0.3, 0.0, 0.0]) }
+                },
+                order.len() as f64 * 90.0,
+            )
+        };
+        let s1 = sets_and_reps(&session(&[0, 0, 0, 1, 1, 1]));
+        let per: Vec<&SetResult> = s1.iter().filter(|s| s.periodic).collect();
+        assert_eq!(per.len(), 6, "{s1:?}");
+        let c = cluster_sets(&per);
+        assert_eq!(c, vec![0, 0, 0, 1, 1, 1], "{c:?}");
+        let lib: Vec<LibSet> = per.iter().zip(&c).map(|(s, k)| LibSet { label: if *k == 0 { "développé".into() } else { "curl".into() }, features: s.features.clone(), period: s.period_s }).collect();
+        let s2 = sets_and_reps_with(&session(&[1, 0, 1]), &|shape| period_for_shape(&lib, shape));
+        let names: Vec<String> = s2.iter().filter(|s| s.periodic).map(|s| recognize_exercise(&lib, &s.features).map(|e| e.0).unwrap_or_default()).collect();
+        assert_eq!(names, vec!["curl", "développé", "curl"], "{s2:?}");
+        for s in s2.iter().filter(|s| s.periodic) {
+            assert!((9..=13).contains(&s.reps), "{s:?}");
         }
     }
 }

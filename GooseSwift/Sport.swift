@@ -22,6 +22,7 @@ struct SportSegment: Identifiable, Hashable {
   let holdS: Double?
   let concentric: String
   let strokes: Int?
+  let cluster: Int?
 
   init(_ d: [String: Any]) {
     id = d["id"] as? String ?? UUID().uuidString
@@ -42,6 +43,7 @@ struct SportSegment: Identifiable, Hashable {
     holdS = detail["hold_s"] as? Double
     concentric = detail["concentric"] as? String ?? "up"
     strokes = detail["strokes"] as? Int
+    cluster = detail["cluster"] as? Int
   }
 
   var reps: Int? { repsLabel ?? repsPred }
@@ -104,6 +106,25 @@ struct SportSession: Identifiable, Hashable {
   func hash(into h: inout Hasher) { h.combine(id) }
 
   var type: String { label ?? predicted ?? "autre" }
+
+  /// Valid strength sets grouped by exercise (named, else the engine's movement group), in order.
+  var exerciseGroups: [(name: String?, key: String, sets: [SportSegment])] {
+    var out: [(name: String?, key: String, sets: [SportSegment])] = []
+    for s in segments where s.kind == "set" && s.labelStatus != "rejected" {
+      let key = s.exercise ?? "groupe-\(s.cluster ?? -1)"
+      if let i = out.firstIndex(where: { $0.key == key }) { out[i].sets.append(s) } else { out.append((s.exercise, key, [s])) }
+    }
+    return out
+  }
+
+  /// "3 exercices · 9 séries · 84 rép." for strength sessions with sets.
+  var strengthLine: String? {
+    let g = exerciseGroups
+    guard SportKind.of(type) == .musculation, !g.isEmpty else { return nil }
+    let sets = g.reduce(0) { $0 + $1.sets.count }
+    let reps = g.reduce(0) { $0 + $1.sets.reduce(0) { $0 + ($1.reps ?? 0) } }
+    return "\(g.count) exercice\(g.count > 1 ? "s" : "") · \(sets) série\(sets > 1 ? "s" : "") · \(reps) rép."
+  }
   var isValidated: Bool { ["confirmed", "corrected", "manual", "rejected"].contains(labelStatus) }
 }
 
@@ -329,7 +350,7 @@ final class SportController: ObservableObject {
     if let value { args["value"] = value }
     call("sport.annotate", args) { [weak self] _ in
       self?.refresh()
-      self?.exportDataset()
+      self?.scheduleExport()
     }
   }
 
@@ -341,6 +362,15 @@ final class SportController: ObservableObject {
       self.exercises = r["exercises"] as? [String] ?? []
       self.dataset = (r["dataset"] as? [String: Any] ?? [:]).compactMapValues { $0 as? Int }
     }
+  }
+
+  private var exportWork: DispatchWorkItem?
+  /// Several answers in a row (a whole exercise group) give a single export.
+  private func scheduleExport() {
+    exportWork?.cancel()
+    let w = DispatchWorkItem { [weak self] in self?.exportDataset() }
+    exportWork = w
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: w)
   }
 
   /// Dataset to the whoop-lab folder (iCloud) under sport/, else to the app's Documents.
@@ -455,7 +485,10 @@ struct SportView: View {
         }
         HStack(spacing: 10) {
           metric("FC", controller.liveHR.map { "\($0)" } ?? "–", "bpm")
-          if kind == .musculation { metric("Rép.", "\(controller.current["reps_last10"] as? Int ?? 0)", "10 min") }
+          if kind == .musculation {
+            metric("Séries", "\(controller.current["sets_last10"] as? Int ?? 0)", "10 min")
+            metric("Rép.", "\(controller.current["reps_last10"] as? Int ?? 0)", "10 min")
+          }
           if kind == .tennis { metric("Frappes", "\(controller.current["strokes_last10"] as? Int ?? 0)", "10 min") }
           metric("Capteurs", controller.capturing ? "100 Hz" : "1 Hz", controller.capturing ? "IMU" : "historique")
         }
@@ -549,6 +582,7 @@ struct ReviewCard: View {
           VStack(alignment: .leading, spacing: 2) {
             Text("\(kind.title) ?").font(.headline)
             Text(timeRange(session)).font(.caption).foregroundStyle(.secondary)
+            if let line = session.strengthLine { Text(line).font(.caption.weight(.medium)).foregroundStyle(kind.tint) }
           }
           Spacer()
           VStack(alignment: .trailing, spacing: 2) {
@@ -590,6 +624,7 @@ struct SessionRow: View {
       VStack(alignment: .leading, spacing: 2) {
         Text(session.labelStatus == "rejected" ? "Pas une séance" : kind.title).font(.subheadline.weight(.semibold))
         Text(timeRange(session)).font(.caption).foregroundStyle(.secondary)
+        if let line = session.strengthLine { Text(line).font(.caption.weight(.medium)).foregroundStyle(kind.tint) }
       }
       Spacer()
       if let d = session.durationMin { Text("\(Int(d)) min").font(.subheadline).foregroundStyle(.secondary) }
@@ -606,6 +641,7 @@ struct SessionDetailView: View {
   @Environment(\.dismiss) private var dismiss
   @State private var confirmDelete = false
   @State private var newExerciseFor: SportSegment?
+  @State private var newExerciseGroup: [SportSegment]?
   @State private var newExercise = ""
 
   private var session: SportSession? { controller.sessions.first { $0.id == sessionID } }
@@ -637,16 +673,18 @@ struct SessionDetailView: View {
     } message: {
       Text("Elle disparaît de l'historique et du jeu de données. Cette action est définitive.")
     }
-    .alert("Nouvel exercice", isPresented: Binding(get: { newExerciseFor != nil }, set: { if !$0 { newExerciseFor = nil } })) {
+    .alert("Nouvel exercice", isPresented: Binding(get: { newExerciseFor != nil || newExerciseGroup != nil }, set: { if !$0 { newExerciseFor = nil; newExerciseGroup = nil } })) {
       TextField("Nom", text: $newExercise)
       Button("Enregistrer") {
-        if let seg = newExerciseFor, !newExercise.trimmingCharacters(in: .whitespaces).isEmpty {
-          controller.annotate("segment", seg.id, "exercise", newExercise.trimmingCharacters(in: .whitespaces))
+        let name = newExercise.trimmingCharacters(in: .whitespaces)
+        if !name.isEmpty {
+          for seg in newExerciseGroup ?? (newExerciseFor.map { [$0] } ?? []) { controller.annotate("segment", seg.id, "exercise", name) }
         }
         newExercise = ""
         newExerciseFor = nil
+        newExerciseGroup = nil
       }
-      Button("Annuler", role: .cancel) { newExerciseFor = nil }
+      Button("Annuler", role: .cancel) { newExerciseFor = nil; newExerciseGroup = nil }
     }
   }
 
@@ -695,18 +733,44 @@ struct SessionDetailView: View {
   }
 
   @ViewBuilder private func setsSection(_ s: SportSession) -> some View {
-    let sets = s.segments.filter { $0.kind == "set" && $0.labelStatus != "rejected" }
-    VStack(alignment: .leading, spacing: 10) {
-      Text("Séries").font(.headline)
-      if sets.isEmpty {
+    let groups = s.exerciseGroups
+    VStack(alignment: .leading, spacing: 12) {
+      HStack {
+        Text("Exercices").font(.headline)
+        Spacer()
+        if let line = s.strengthLine { Text(line).font(.subheadline).foregroundStyle(.secondary) }
+      }
+      if groups.isEmpty {
         Text(s.imuMinutes ?? 0 > 0 ? "Aucune série répétitive trouvée" : "Pas de capteurs 100 Hz sur cette séance").font(.subheadline).foregroundStyle(.secondary)
       }
-      ForEach(Array(sets.enumerated()), id: \.element.id) { i, seg in
-        SetRow(index: i + 1, seg: seg, exercises: controller.exercises, controller: controller) { newExerciseFor = seg }
+      ForEach(Array(groups.enumerated()), id: \.element.key) { gi, g in
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(alignment: .firstTextBaseline) {
+            Menu {
+              ForEach(controller.exercises, id: \.self) { e in
+                Button(e) { for set in g.sets { controller.annotate("segment", set.id, "exercise", e) } }
+              }
+              Button("Nouvel exercice…") { newExerciseGroup = g.sets }
+            } label: {
+              HStack(spacing: 4) {
+                Text(g.name ?? "Exercice \(gi + 1) ?").font(.title3.weight(.semibold))
+                Image(systemName: "chevron.up.chevron.down").font(.caption)
+              }
+              .foregroundStyle(g.name == nil ? .orange : .primary)
+            }
+            Spacer()
+            Text("\(g.sets.count) × " + g.sets.map { "\($0.reps ?? 0)" }.joined(separator: " / ")).font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+          }
+          ForEach(Array(g.sets.enumerated()), id: \.element.id) { i, seg in
+            SetRow(index: i + 1, seg: seg, exercises: controller.exercises, controller: controller) { newExerciseFor = seg }
+          }
+        }
+        .padding(.bottom, 4)
       }
-      let rests = zip(sets, sets.dropFirst()).map { $1.start.timeIntervalSince($0.end) }
+      let all = groups.flatMap(\.sets).sorted { $0.start < $1.start }
+      let rests = zip(all, all.dropFirst()).map { $1.start.timeIntervalSince($0.end) }
       if !rests.isEmpty {
-        Text("Repos médian \(Int(rests.sorted()[rests.count / 2])) s").font(.caption).foregroundStyle(.secondary)
+        Text("Repos médian entre séries \(Int(rests.sorted()[rests.count / 2])) s").font(.caption).foregroundStyle(.secondary)
       }
     }
   }

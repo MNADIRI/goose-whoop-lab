@@ -51,8 +51,22 @@ label.
   duration / T when they disagree by > 30 %. Confidence = r.
 - **Phases**: vertical velocity (integrated, high-passed over one period) → up / down / hold time per repetition;
   concentric = up by default, switchable per set ("concentrique en descente": pull-downs…).
-- **Exercise**: per-set signature (wrist orientation vs gravity, movement axis vs gravity, tempo, rotation share) →
-  nearest human-labelled set (confidence exp(−2d), shown when ≥ 0.5). No guess before the first labelled example.
+- **Exercise** (few-shot, personal library = the training set): 17-d set signature — shape (14: wrist orientation
+  and its spread, movement axis and rotation axis in the strap frame, vertical share, rotation share), tempo (ln period),
+  rotation per rep, vertical velocity per rep. Recognition = distance-weighted vote of the 3 nearest validated sets,
+  confidence × exp(−1.2 d), named when ≥ 0.35; unseen movements stay "Exercice n ?".
+- **Groups**: sets of one session are clustered by signature (consecutive sets favoured): naming one set names its
+  group (prediction 0.9 for the others), the group header renames all its sets at once.
+- **Personal rep counting**: the shape of a set finds the closest validated set; its true period (duration / reps
+  given by the user) bounds the autocorrelation search to [0.6 T, 1.7 T] — no half / double period errors.
+- Literature (Nov 2026): no open-weight wrist model recognises arbitrary gym exercises; closed-set CNN / 1D-ResNet reach
+  F1 ≈ 0.97 with ±1 rep in ~90 % of sets once trained on the target exercises (Soro 2019, MDPI 2024, Processes 2025);
+  few-shot metric learning (arXiv 2410.00407) and exemplar-based class-agnostic counting (CaRaCount, TPAMI 2025, code
+  without published weights) are the closest to a personal library. Next step once ~5 labelled sets per exercise exist:
+  a 1D-ResNet / prototypical network on 6-axis 100 Hz windows trained on the exported dataset, compared offline with
+  this signature + autocorrelation baseline.
+- IMU check (12 Nov watch, 10 min): 626 frames at 1.000 s, 100 accel + 100 gyro samples each, |a| 1.001 g, 3.5 s
+  latency, 98 % coverage (gaps = app reinstalls only) — sufficient for sets, reps and phases.
 - **Session type**: feature vector `FEATURES` (16 values) → active personal model if installed, else `rules-v1`.
   Probabilities and the model version are stored with the session.
 
