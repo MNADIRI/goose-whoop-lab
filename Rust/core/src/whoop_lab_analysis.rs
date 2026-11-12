@@ -24,7 +24,7 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "8"; // 8: spectral HRV, CPC-refined stages, health indices // 5: signed R26 base, optical gain state; 6: on-strap SpO2
+const ALGORITHM_VERSION: &str = "9"; // 9: split-beat merge + adaptive R-R artefact threshold, IMU start-up sentinel; 8: spectral HRV, CPC-refined stages, health indices // 5: signed R26 base, optical gain state; 6: on-strap SpO2
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];

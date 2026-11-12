@@ -186,9 +186,9 @@ pub const FIELD_CATALOG: &[FieldSpec] = &[
     f!("R21", "record_index", 11, 4, "u32", "1", "count", "", DecodedUnvalidated, ""),
     f!("R21", "timestamp", 15, 6, "u32+u16", "1 + 1/32768", "s (unix)", "", DecodedUnvalidated, ""),
     f!("R21", "accel_count", 24, 2, "u16", "1", "samples", "0-100", DecodedUnvalidated, ""),
-    f!("R21", "accel_x/y/z", 28, 600, "i16[100] x3", "1/4096 (tentative)", "g", "", DecodedUnvalidated, "planar blocks at 28, 228, 428; scale verified on 4.0 only"),
+    f!("R21", "accel_x/y/z", 28, 600, "i16[100] x3", "1/4096", "g", "+-8 g (saturates at +-32767)", Validated, "planar blocks at 28, 228, 428; 100 Hz; |a| = 1.001 g still (sensor session 12 Nov); i16::MIN = start-up sentinel"),
     f!("R21", "gyro_count", 630, 2, "u16", "1", "samples", "0-100", DecodedUnvalidated, ""),
-    f!("R21", "gyro_x/y/z", 640, 600, "i16[100] x3", "2000/32768 (tentative)", "deg/s", "", DecodedUnvalidated, "planar blocks at 640, 840, 1040"),
+    f!("R21", "gyro_x/y/z", 640, 600, "i16[100] x3", "2000/32768", "deg/s", "+-2000 deg/s", Validated, "planar blocks at 640, 840, 1040; 100 Hz; scale checked against gravity rotation (ratio 1.01); first ~4 samples after IMU start = i16::MIN"),
     // packet 40: live HR
     f!("LIVE40", "timestamp", 10, 4, "u32", "1", "s (unix)", "", Validated, ""),
     f!("LIVE40", "time_word", 14, 2, "u16", "1", "raw", "", DecodedUnvalidated, ""),
@@ -498,14 +498,34 @@ pub fn decode_r21(pl: &[u8]) -> Option<R21Record> {
         warnings.push("imu_count_exceeds_100".into());
     }
     let block = |fo: usize, n: u16| -> Vec<i16> { (0..usize::from(n.min(100))).filter_map(|i| i16_at(pl, p(fo) + 2 * i)).collect() };
+    // i16::MIN is not a measurement: the gyro emits it for its first samples after TOGGLE_IMU_MODE
+    // (start-up, sensor session 12 Nov). Hold the next valid sample so the planar axes stay aligned.
+    let mut sentinels = 0usize;
+    let mut fix = |mut v: Vec<i16>| -> Vec<i16> {
+        let mut next = v.iter().rev().find(|x| **x != i16::MIN).copied().unwrap_or(0);
+        for x in v.iter_mut().rev() {
+            if *x == i16::MIN {
+                *x = next;
+                sentinels += 1;
+            } else {
+                next = *x;
+            }
+        }
+        v
+    };
+    let accel_raw = [fix(block(28, accel_count_raw)), fix(block(228, accel_count_raw)), fix(block(428, accel_count_raw))];
+    let gyro_raw = [fix(block(640, gyro_count_raw)), fix(block(840, gyro_count_raw)), fix(block(1040, gyro_count_raw))];
+    if sentinels > 0 {
+        warnings.push(format!("imu_startup_sentinel_{sentinels}"));
+    }
     Some(R21Record {
         ts: f64::from(u32_at(pl, p(15))?) + f64::from(u16_at(pl, p(19))?) / 32768.0,
         record_index: u32_at(pl, p(11))?,
         marker_raw: pl[p(10)],
         accel_count_raw,
         gyro_count_raw,
-        accel_raw: [block(28, accel_count_raw), block(228, accel_count_raw), block(428, accel_count_raw)],
-        gyro_raw: [block(640, gyro_count_raw), block(840, gyro_count_raw), block(1040, gyro_count_raw)],
+        accel_raw,
+        gyro_raw,
         warnings,
     })
 }

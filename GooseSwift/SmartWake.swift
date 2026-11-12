@@ -1,3 +1,4 @@
+import AVFoundation
 import Charts
 import Foundation
 import SwiftUI
@@ -343,6 +344,241 @@ final class MotionProbe: ObservableObject {
   }
 }
 
+// MARK: - Full sensor session
+
+/// Guided ~11 min session that switches every safe strap stream on one at a time (then all
+/// together, then the on-strap persistent recorders) while the user performs scripted actions.
+/// Every frame received is appended to Documents/sensor_session.tsv (unix time, phase, step, hex);
+/// the timeline of steps and commands goes to Documents/sensor_session_meta.json.
+@MainActor
+final class SensorSession: ObservableObject {
+  struct Step { let seconds: Int; let instruction: String }
+  struct Phase { let id: String; let title: String; let on: [GooseBLEClient.SensorStreamCommandKind]; let off: [GooseBLEClient.SensorStreamCommandKind]; let steps: [Step]; let syncAfter: Bool }
+
+  @Published private(set) var running = false
+  @Published private(set) var phaseTitle = ""
+  @Published private(set) var instruction = ""
+  @Published private(set) var remaining = 0
+  @Published private(set) var progress = 0.0
+  @Published private(set) var frameCount = 0
+  @Published private(set) var summary = ""
+
+  private weak var ble: GooseBLEClient?
+  private var phases: [Phase] = []
+  private var timeline: [[String: Any]] = []
+  private var timer: Timer?
+  private var phaseIndex = 0, stepIndex = 0, stepLeft = 0, elapsed = 0, total = 0
+  nonisolated(unsafe) private var tag = "idle|-"
+  nonisolated(unsafe) private var handle: FileHandle?
+  nonisolated(unsafe) private var counts: [String: Int] = [:]
+  nonisolated private let io = DispatchQueue(label: "sensor-session.io")
+  private let speech = AVSpeechSynthesizer()
+
+  func attach(ble: GooseBLEClient) { self.ble = ble }
+
+  private static func build() -> [Phase] {
+    typealias K = GooseBLEClient.SensorStreamCommandKind
+    let on = K.revisionBoolean(true), off = K.revisionBoolean(false)
+    let hrOn = K(commandNumber: 3, payload: [1], name: "TOGGLE_REALTIME_HR_ON"), hrOff = K(commandNumber: 3, payload: [0], name: "TOGGLE_REALTIME_HR_OFF")
+    let imuOn = K(commandNumber: 106, payload: on, name: "TOGGLE_IMU_MODE_ON"), imuOff = K(commandNumber: 106, payload: off, name: "TOGGLE_IMU_MODE_OFF")
+    let optOn = [K(commandNumber: 107, payload: on, name: "ENABLE_OPTICAL_DATA_ON"), K(commandNumber: 108, payload: on, name: "TOGGLE_OPTICAL_MODE_ON")]
+    let optOff = [K(commandNumber: 108, payload: off, name: "TOGGLE_OPTICAL_MODE_OFF"), K(commandNumber: 107, payload: off, name: "ENABLE_OPTICAL_DATA_OFF")]
+    let persOn = [K(commandNumber: 153, payload: on, name: "TOGGLE_PERSISTENT_R20_ON"), K(commandNumber: 154, payload: on, name: "TOGGLE_PERSISTENT_R21_ON")]
+    return [
+      Phase(id: "P0_baseline", title: "Référence sans flux", on: [], off: [], steps: [
+        Step(seconds: 60, instruction: "Avant-bras posé à plat, immobile, respiration normale")], syncAfter: false),
+      Phase(id: "P1_hr_live", title: "Fréquence cardiaque temps réel", on: [hrOn], off: [hrOff], steps: [
+        Step(seconds: 60, instruction: "Immobile, respiration normale"),
+        Step(seconds: 60, instruction: "Respiration lente : inspire 5 secondes, expire 5 secondes"),
+        Step(seconds: 30, instruction: "Retiens ta respiration 15 secondes si c'est confortable, puis respire normalement")], syncAfter: false),
+      Phase(id: "P2_imu_live", title: "Accéléromètre et gyroscope temps réel", on: [imuOn], off: [imuOff], steps: [
+        Step(seconds: 15, instruction: "Bras posé à plat, immobile"),
+        Step(seconds: 15, instruction: "Tourne lentement le poignet, paume vers le haut puis vers le bas"),
+        Step(seconds: 15, instruction: "Lève le bras à la verticale, puis redescends-le, lentement"),
+        Step(seconds: 20, instruction: "Marche sur place, bras le long du corps"),
+        Step(seconds: 10, instruction: "Tape deux fois sur le bracelet, pause, puis trois fois"),
+        Step(seconds: 15, instruction: "Secoue la main vivement"),
+        Step(seconds: 15, instruction: "Bras posé à plat, immobile")], syncAfter: false),
+      Phase(id: "P3_optical_live", title: "Capteur optique temps réel", on: optOn, off: optOff, steps: [
+        Step(seconds: 45, instruction: "Bras posé à plat, immobile"),
+        Step(seconds: 20, instruction: "Appuie fermement sur le bracelet avec deux doigts"),
+        Step(seconds: 20, instruction: "Serre le poing fort, relâche, recommence"),
+        Step(seconds: 30, instruction: "Bras posé à plat, immobile")], syncAfter: false),
+      Phase(id: "P4_all_live", title: "Tous les flux en même temps", on: [hrOn, imuOn] + optOn, off: [imuOff] + optOff + [hrOff], steps: [
+        Step(seconds: 30, instruction: "Immobile"),
+        Step(seconds: 30, instruction: "Marche sur place")], syncAfter: false),
+      Phase(id: "P5_persistent", title: "Enregistrement brut sur le bracelet", on: persOn, off: GooseBLEClient.SensorStreamCommandKind.stopPhysiologyCapture, steps: [
+        Step(seconds: 60, instruction: "Immobile"),
+        Step(seconds: 30, instruction: "Marche sur place")], syncAfter: true),
+      Phase(id: "P6_fetch", title: "Récupération de l'historique", on: [], off: [], steps: [
+        Step(seconds: 60, instruction: "Immobile, la session se termine")], syncAfter: false),
+    ]
+  }
+
+  func start() {
+    guard !running, let ble else { return }
+    phases = Self.build()
+    total = phases.flatMap(\.steps).reduce(0) { $0 + $1.seconds }
+    timeline = []; elapsed = 0; frameCount = 0; summary = ""
+    let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    let url = dir.appendingPathComponent("sensor_session.tsv")
+    try? Data("unix\tphase\tstep\thex\n".utf8).write(to: url)
+    io.sync { handle = try? FileHandle(forWritingTo: url); _ = try? handle?.seekToEnd(); counts = [:] }
+    ble.rawFrameSink = { [weak self] hex, date in self?.write(hex: hex, at: date) }
+    UIApplication.shared.isIdleTimerDisabled = true
+    running = true
+    phaseIndex = 0; stepIndex = -1
+    enterPhase()
+    timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
+  }
+
+  func stop() { finish(aborted: true) }
+
+  /// Every stream and recorder off, in the order that is known to stop the on-strap R20/R21
+  /// recorders (153 off then optical mode/data off; 154 off then IMU off). Repeated after 20 s.
+  func stopAllStreams() {
+    for delay in [0.0, 20.0] {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        self?.send(GooseBLEClient.SensorStreamCommandKind.stopPhysiologyCapture, label: "stop all")
+      }
+    }
+    summary = "Flux de test arrêtés"
+  }
+
+  nonisolated private func write(hex: String, at date: Date) {
+    io.async { [self] in
+      let line = String(format: "%.3f", date.timeIntervalSince1970) + "\t" + tag.replacingOccurrences(of: "|", with: "\t") + "\t" + hex + "\n"
+      handle?.write(Data(line.utf8))
+      let k = String(hex.dropFirst(16).prefix(4)) + "/\(hex.count / 2)"
+      counts[k, default: 0] += 1
+    }
+    Task { @MainActor in self.frameCount += 1 }
+  }
+
+  private func mark(_ event: String, _ extra: [String: Any] = [:]) {
+    var e: [String: Any] = ["unix": Date().timeIntervalSince1970, "event": event]
+    e.merge(extra) { a, _ in a }
+    timeline.append(e)
+    let payload: [String: Any] = ["timeline": timeline]
+    if JSONSerialization.isValidJSONObject(payload), let d = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
+      try? d.write(to: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("sensor_session_meta.json"))
+    }
+  }
+
+  private func send(_ cmds: [GooseBLEClient.SensorStreamCommandKind], label: String) {
+    guard !cmds.isEmpty, let ble else { return }
+    let requested = Date().timeIntervalSince1970
+    ble.whenFreeForCommands(timeout: 60) { [weak self] b in
+      b.writeSensorStreamCommands(cmds, requestedStatus: "Sensor session", updatePhysiologyStatus: false)
+      self?.mark("commands", ["label": label, "names": cmds.map(\.name), "requested": requested])
+    }
+  }
+
+  private func enterPhase() {
+    let p = phases[phaseIndex]
+    phaseTitle = p.title
+    mark("phase_start", ["phase": p.id])
+    send(p.on, label: "\(p.id) on")
+    if p.id == "P6_fetch" { ble?.whenFreeForCommands(timeout: 60) { $0.syncHistoricalPackets() } }
+    stepIndex = 0
+    enterStep()
+  }
+
+  private func enterStep() {
+    let p = phases[phaseIndex], s = p.steps[stepIndex]
+    stepLeft = s.seconds
+    instruction = s.instruction
+    tag = "\(p.id)|\(stepIndex)"
+    mark("step", ["phase": p.id, "step": stepIndex, "seconds": s.seconds, "instruction": s.instruction])
+    UINotificationFeedbackGenerator().notificationOccurred(.success)
+    speech.stopSpeaking(at: .immediate)
+    let u = AVSpeechUtterance(string: s.instruction)
+    u.voice = AVSpeechSynthesisVoice(language: "fr-FR")
+    speech.speak(u)
+    remaining = stepLeft
+  }
+
+  private func tick() {
+    guard running else { return }
+    stepLeft -= 1; elapsed += 1
+    remaining = stepLeft
+    progress = Double(elapsed) / Double(max(total, 1))
+    guard stepLeft <= 0 else { return }
+    let p = phases[phaseIndex]
+    if stepIndex + 1 < p.steps.count { stepIndex += 1; enterStep(); return }
+    send(p.off, label: "\(p.id) off")
+    if p.syncAfter { ble?.whenFreeForCommands(timeout: 60) { $0.syncHistoricalPackets() } }
+    mark("phase_end", ["phase": p.id])
+    if phaseIndex + 1 < phases.count { phaseIndex += 1; enterPhase() } else { finish(aborted: false) }
+  }
+
+  private func finish(aborted: Bool) {
+    guard running else { return }
+    timer?.invalidate(); timer = nil
+    running = false
+    // everything off, whatever phase we were in
+    typealias K = GooseBLEClient.SensorStreamCommandKind
+    let off = K.revisionBoolean(false)
+    _ = off
+    stopAllStreams()
+    mark(aborted ? "aborted" : "done")
+    UIApplication.shared.isIdleTimerDisabled = false
+    speech.stopSpeaking(at: .immediate)
+    instruction = ""; phaseTitle = ""
+    // keep capturing late frames (history fetch) for 20 s, then close the files
+    DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+      guard let self else { return }
+      if !self.running { self.ble?.rawFrameSink = nil }
+      self.tag = "after|-"
+      let meta = self.timeline
+      self.io.async { [self] in
+        try? self.handle?.close(); self.handle = nil
+        let c = self.counts
+        Task { @MainActor in
+          let payload: [String: Any] = ["timeline": meta.map { $0.mapValues { v -> Any in (v as? Double).map { $0.isFinite ? $0 : 0 } ?? v } }, "frame_counts": c]
+          let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+          if JSONSerialization.isValidJSONObject(payload), let d = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
+            try? d.write(to: dir.appendingPathComponent("sensor_session_meta.json"))
+          }
+          self.summary = (aborted ? "Session arrêtée" : "Session terminée") + " : \(self.frameCount) trames enregistrées"
+        }
+      }
+    }
+  }
+}
+
+struct SensorSessionCard: View {
+  @ObservedObject var session: SensorSession
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Label("Session capteurs complète", systemImage: "waveform.path.ecg.rectangle").font(.headline)
+      if session.running {
+        Text(session.phaseTitle).font(.subheadline.weight(.semibold))
+        Text(session.instruction).font(.title3.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+        HStack {
+          Text("\(session.remaining) s").font(.system(.largeTitle, design: .rounded).monospacedDigit().weight(.bold))
+          Spacer()
+          Text("\(session.frameCount) trames").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        }
+        ProgressView(value: session.progress)
+        Button("Arrêter", role: .destructive) { session.stop() }.buttonStyle(.bordered)
+      } else {
+        Text("Environ 11 min, bracelet porté, téléphone à côté. Chaque consigne est lue à voix haute.")
+          .font(.footnote).foregroundStyle(.secondary)
+        HStack {
+          Button("Lancer la session") { session.start() }.buttonStyle(.borderedProminent)
+          Button("Arrêter les flux de test") { session.stopAllStreams() }.buttonStyle(.bordered)
+        }
+        if !session.summary.isEmpty { Text(session.summary).font(.caption) }
+      }
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+  }
+}
+
 // MARK: - Controller
 
 /// Smart wake-up: runs the Rust engine (`smart_wake.update`, Rust/core/src/smart_wake.rs) every 30 s
@@ -369,6 +605,7 @@ final class SmartWakeController: ObservableObject {
   @Published private(set) var plan: [String: Any] = [:]
   let ramp = HapticRampPlayer()
   let motionProbe = MotionProbe()
+  let sensorSession = SensorSession()
 
   private weak var ble: GooseBLEClient?
   private let queue = DispatchQueue(label: "smart-wake.engine", qos: .userInitiated)
@@ -409,6 +646,7 @@ final class SmartWakeController: ObservableObject {
     self.ble = ble
     ramp.attach(ble: ble)
     motionProbe.attach(ble: ble)
+    sensorSession.attach(ble: ble)
     if session != nil { startHeartbeat() }
     ble.liveSampleSink = { [weak self] date, hr, rr, source in
       self?.ingest(date: date, hr: hr, rr: rr, source: source)
@@ -734,6 +972,7 @@ struct AlarmView: View {
         nightOpticalCard
         nightsCard
         vibrationCard
+        SensorSessionCard(session: controller.sensorSession)
         MotionProbeCard(probe: controller.motionProbe, keepLiveHR: controller.session != nil)
       }
       .padding(.horizontal, 16)
