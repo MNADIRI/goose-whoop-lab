@@ -179,6 +179,21 @@ final class SportController: ObservableObject {
     ble.sportIMUSink = { [weak self] hex, date in self?.collectIMU(hex: hex, at: date) }
     timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
     refresh()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.backfill() }
+  }
+
+  /// Retrospective detection on the history the phone already holds (incremental, resumes where
+  /// the last run stopped). Labels the user gave outside the app are applied once.
+  private static let seedKey = "sport.seed.v1"
+  private func backfill() {
+    let seeded = UserDefaults.standard.bool(forKey: Self.seedKey)
+    // 11 Nov 2026 tennis match (confirmed by the user)
+    let labels: [[String: Any]] = seeded ? [] : [["ts": 1_794_398_400, "type": "tennis"]]
+    call("sport.backfill", ["days": 14, "labels": labels]) { [weak self] r in
+      if !seeded, r["labelled"] as? Int ?? 0 > 0 { UserDefaults.standard.set(true, forKey: Self.seedKey) }
+      self?.refresh()
+      if (r["sessions"] as? [Any])?.isEmpty == false { self?.exportDataset() }
+    }
   }
 
   nonisolated private func collect(date: Date, hr: Int?, rr: [Double]) {
@@ -312,7 +327,10 @@ final class SportController: ObservableObject {
   func annotate(_ target: String, _ id: String, _ field: String, _ value: String? = nil) {
     var args: [String: Any] = ["target": target, "id": id, "field": field]
     if let value { args["value"] = value }
-    call("sport.annotate", args) { [weak self] _ in self?.refresh() }
+    call("sport.annotate", args) { [weak self] _ in
+      self?.refresh()
+      self?.exportDataset()
+    }
   }
 
   func refresh() {
@@ -487,7 +505,7 @@ struct SportView: View {
         metric("Séries", "\(controller.dataset["labelled_sets"] ?? 0)", "validées")
         metric("Réponses", "\(controller.dataset["annotations"] ?? 0)", "au total")
       }
-      Button("Exporter maintenant") { controller.exportDataset() }.buttonStyle(.bordered)
+      Text("Enregistré automatiquement après chaque séance et chaque validation.").font(.caption).foregroundStyle(.secondary)
     }
     .padding(16)
     .frame(maxWidth: .infinity, alignment: .leading)

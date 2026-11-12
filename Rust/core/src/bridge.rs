@@ -2479,6 +2479,10 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(|args| crate::sport::delete_session(&args))
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.backfill" => request_args::<crate::sport::BackfillArgs>(&request)
+            .and_then(|args| crate::sport::backfill(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "sport.replay" => request_args::<crate::sport::ReplayArgs>(&request)
             .and_then(|args| crate::sport::replay(&args))
             .map(|value| bridge_ok(&request.request_id, value))

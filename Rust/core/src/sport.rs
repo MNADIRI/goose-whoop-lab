@@ -871,6 +871,9 @@ pub struct UpdateArgs {
     /// replay only: R18 seconds newer than now - lag are not visible yet (history arrives by sync)
     #[serde(default)]
     pub history_lag_s: Option<i64>,
+    /// replay / backfill: no stream is really switched, nothing goes to the acquisition log
+    #[serde(default)]
+    pub replay: bool,
 }
 
 fn store_live(conn: &Connection, args: &UpdateArgs, arrival: f64) -> GooseResult<(usize, usize)> {
@@ -995,7 +998,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                     event = Some("start");
                 } else if quiet_watch || now - st["watch_since"].as_i64().unwrap_or(now) > 20 * 60 {
                     // daily-life bursts (stairs, running to the kitchen): no sport signature
-                    conn.execute("UPDATE sport_acquisition SET reason = ?1 WHERE end_ts IS NULL", [format!("watch_dropped {sig}")])?;
+                    if !args.replay { conn.execute("UPDATE sport_acquisition SET reason = ?1 WHERE end_ts IS NULL", [format!("watch_dropped {sig}")])?; }
                     next = "idle".into();
                     event = Some("watch_dropped");
                 }
@@ -1047,10 +1050,10 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
         st = json!({"state": "idle", "after": st["last_active"].as_i64().unwrap_or(now) + 120});
         next = "idle".into();
     }
-    if next == "watch" && state == "idle" {
+    if next == "watch" && state == "idle" && !args.replay {
         log_acq(&conn, None, true, now, "watch")?;
     }
-    if next == "idle" && state != "idle" {
+    if next == "idle" && state != "idle" && !args.replay {
         log_acq(&conn, None, false, now, "stop")?;
     }
     st["state"] = json!(next);
@@ -1248,6 +1251,7 @@ pub fn replay(args: &ReplayArgs) -> GooseResult<Value> {
             capturing: state != "idle",
             paused: false,
             history_lag_s: Some(now - last_sync + 20),
+            replay: true,
         })?;
         state = r["state"].as_str().unwrap_or("idle").to_string();
         if let Some(e) = r["event"].as_str() {
@@ -1267,6 +1271,109 @@ pub fn replay(args: &ReplayArgs) -> GooseResult<Value> {
         .query_map(params![args.from_ts - 3600, args.to_ts], |r| Ok(json!({"id": r.get::<_, String>(0)?, "features": r.get::<_, Option<String>>(1)?.and_then(|s| serde_json::from_str::<Value>(&s).ok())})))?
         .collect::<Result<_, _>>()?;
     Ok(json!({"events": events, "sessions": sessions, "features": features, "timeline": timeline}))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SeedLabel {
+    pub ts: i64,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackfillArgs {
+    pub database_path: String,
+    #[serde(default)]
+    pub days: Option<i64>,
+    #[serde(default)]
+    pub now_unix: Option<i64>,
+    #[serde(default)]
+    pub age: Option<f64>,
+    /// labels given by the user outside the app: the session containing ts gets this type, validated
+    #[serde(default)]
+    pub labels: Vec<SeedLabel>,
+}
+
+/// Retrospective detection on the phone's own history (sessions done before the engine existed or
+/// while the app was not running). Day by day, only around candidate minutes, with the same online
+/// engine and sync lag as `replay`; the live engine state is saved and restored. Incremental:
+/// resumes where the previous backfill stopped.
+pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    ensure_tables(&conn)?;
+    let _ = crate::whoop5_store::ingest(&conn);
+    let now = args.now_unix.unwrap_or_else(now_s);
+    let saved = state_get(&conn, "engine")?;
+    let done_until = state_get(&conn, "backfill")?.and_then(|v| v["done_until"].as_i64()).unwrap_or(0);
+    let to = now - 3600;
+    let from = done_until.max(now - args.days.unwrap_or(14) * 86_400);
+    let p = profile(&conn, to, args.age)?;
+    let mut windows: Vec<(i64, i64)> = Vec::new();
+    let mut day = from;
+    while day < to {
+        let secs = load_secs(&conn, day, (day + 86_400).min(to))?;
+        for m in minutes(&secs, &BTreeMap::new()) {
+            if minute_score(&m, &p) > 0.35 {
+                match windows.last_mut() {
+                    Some(w) if m.t - w.1 <= 30 * 60 => w.1 = m.t,
+                    _ => windows.push((m.t, m.t)),
+                }
+            }
+        }
+        day += 86_400;
+    }
+    drop(conn);
+    let mut replayed = 0;
+    for (a, b) in &windows {
+        let (a, b) = ((a - 20 * 60).max(from), (b + 40 * 60).min(to));
+        let c = Connection::open(&args.database_path)?;
+        let overlaps: i64 = c.query_row("SELECT COUNT(*) FROM sport_sessions WHERE start_ts <= ?2 AND COALESCE(end_ts, start_ts) >= ?1", params![a, b], |r| r.get(0))?;
+        if overlaps > 0 {
+            continue;
+        }
+        state_set(&c, "engine", &json!({"state": "idle"}))?;
+        drop(c);
+        let mut state = "idle".to_string();
+        let mut last_sync = a;
+        for t in (a..=b).step_by(60) {
+            if t - last_sync >= if state == "idle" { 300 } else { 120 } {
+                last_sync = t;
+            }
+            let r = update(&UpdateArgs { database_path: args.database_path.clone(), now_unix: Some(t), live: vec![], imu: vec![], age: args.age, capturing: false, paused: false, history_lag_s: Some(t - last_sync + 20), replay: true })?;
+            state = r["state"].as_str().unwrap_or("idle").to_string();
+        }
+        // a session still open at the end of its window is closed by the next steps
+        let mut t = b;
+        while state != "idle" && t < b + 3 * 3600 && t < to {
+            t += 60;
+            let r = update(&UpdateArgs { database_path: args.database_path.clone(), now_unix: Some(t), live: vec![], imu: vec![], age: args.age, capturing: false, paused: false, history_lag_s: Some(20), replay: true })?;
+            state = r["state"].as_str().unwrap_or("idle").to_string();
+        }
+        replayed += 1;
+    }
+    let conn = Connection::open(&args.database_path)?;
+    state_set(&conn, "engine", &saved.unwrap_or_else(|| json!({"state": "idle"})))?;
+    state_set(&conn, "backfill", &json!({"done_until": to, "at": now}))?;
+    let mut labelled = 0;
+    for l in &args.labels {
+        let id: Option<String> = conn
+            .query_row("SELECT id FROM sport_sessions WHERE start_ts <= ?1 AND COALESCE(end_ts, start_ts) >= ?1 AND status != 'discarded' ORDER BY start_ts DESC LIMIT 1", [l.ts], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = id {
+            let old: Option<String> = conn.query_row("SELECT label_type FROM sport_sessions WHERE id = ?1", [&id], |r| r.get(0))?;
+            if old.as_deref() != Some(l.kind.as_str()) {
+                conn.execute("UPDATE sport_sessions SET label_type = ?2, label_status = 'confirmed', updated_at = ?3 WHERE id = ?1", params![id, l.kind, now])?;
+                annotate_row(&conn, "session", &id, "type", old.as_deref(), Some(&l.kind), "user_outside_app")?;
+                labelled += 1;
+            }
+        }
+    }
+    let sessions: Vec<Value> = conn
+        .prepare("SELECT id, start_ts, end_ts, status, source, predicted_type, probs_json, confidence, summary_json, model_version, label_type, label_status FROM sport_sessions WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts")?
+        .query_map(params![from - 3600, to], row_session)?
+        .collect::<Result<_, _>>()?;
+    Ok(json!({"from": from, "to": to, "windows": windows.len(), "replayed": replayed, "labelled": labelled, "sessions": sessions}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1586,7 +1693,7 @@ mod tests {
         }
         let mut states = Vec::new();
         for now in (t0 + 60..t0 + 3000).step_by(60) {
-            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false, history_lag_s: None }).unwrap();
+            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false, history_lag_s: None, replay: false }).unwrap();
             states.push((now - t0, r["state"].as_str().unwrap().to_string(), r["event"].clone()));
         }
         let start_evt = states.iter().find(|s| s.2 == "start").expect("start");
@@ -1662,12 +1769,24 @@ mod tests {
         }
         let mut watched = false;
         for now in (t0 + 60..t0 + 3600).step_by(60) {
-            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false, history_lag_s: None }).unwrap();
+            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false, history_lag_s: None, replay: false }).unwrap();
             watched |= r["state"] == "watch";
             assert_ne!(r["event"], "start", "at {}: {}", now - t0, r["signature"]);
         }
         assert!(watched, "bursts should at least trigger the IMU watch");
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sport_sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn backfill_real_db() {
+        let (Ok(db), Ok(now)) = (std::env::var("GOOSE_DB"), std::env::var("GOOSE_NOW")) else { return };
+        let t = std::time::Instant::now();
+        let r = backfill(&BackfillArgs { database_path: db, days: Some(14), now_unix: Some(now.parse().unwrap()), age: None, labels: vec![SeedLabel { ts: 1_794_398_400, kind: "tennis".into() }] }).unwrap();
+        println!("backfill {:.1} s: windows {} replayed {} labelled {}", t.elapsed().as_secs_f64(), r["windows"], r["replayed"], r["labelled"]);
+        for s in r["sessions"].as_array().unwrap() {
+            println!("  {} {}..{} {} {} label {} {}", s["id"], s["start_ts"], s["end_ts"], s["status"], s["predicted_type"], s["label_type"], s["label_status"]);
+        }
     }
 }
