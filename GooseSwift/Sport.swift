@@ -361,6 +361,7 @@ final class SportController: ObservableObject {
       self.reviewQueue = r["review_queue"] as? [String] ?? []
       self.exercises = r["exercises"] as? [String] ?? []
       self.dataset = (r["dataset"] as? [String: Any] ?? [:]).compactMapValues { $0 as? Int }
+      if (r["reanalyzed"] as? Int ?? 0) > 0 { self.scheduleExport() }
     }
   }
 
@@ -746,17 +747,22 @@ struct SessionDetailView: View {
       ForEach(Array(groups.enumerated()), id: \.element.key) { gi, g in
         VStack(alignment: .leading, spacing: 8) {
           HStack(alignment: .firstTextBaseline) {
+            let guessed = g.sets.allSatisfy { $0.exerciseLabel == nil }
             Menu {
-              ForEach(controller.exercises, id: \.self) { e in
+              if let name = g.name, guessed {
+                Button("Oui, \(name)", systemImage: "checkmark") { for set in g.sets { controller.annotate("segment", set.id, "exercise", name) } }
+                Divider()
+              }
+              ForEach(controller.exercises.filter { $0 != g.name }, id: \.self) { e in
                 Button(e) { for set in g.sets { controller.annotate("segment", set.id, "exercise", e) } }
               }
               Button("Nouvel exercice…") { newExerciseGroup = g.sets }
             } label: {
               HStack(spacing: 4) {
-                Text(g.name ?? "Exercice \(gi + 1) ?").font(.title3.weight(.semibold))
+                Text(g.name.map { guessed ? "\($0) ?" : $0 } ?? "Exercice \(gi + 1) ?").font(.title3.weight(.semibold))
                 Image(systemName: "chevron.up.chevron.down").font(.caption)
               }
-              .foregroundStyle(g.name == nil ? .orange : .primary)
+              .foregroundStyle(guessed ? .orange : .primary)
             }
             Spacer()
             Text("\(g.sets.count) × " + g.sets.map { "\($0.reps ?? 0)" }.joined(separator: " / ")).font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)

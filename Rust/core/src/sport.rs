@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use crate::dsp::{mean, median, percentile, round};
 use crate::GooseResult;
 
-pub const ENGINE_VERSION: &str = "sport-1";
+pub const ENGINE_VERSION: &str = "sport-2"; // 2: repetition-based set segmentation (12 Nov gym session)
 pub const RULES_MODEL: &str = "rules-v1";
 pub const CLASSES: [&str; 4] = ["course", "tennis", "musculation", "autre"];
 /// Session feature vector (order is the contract with lab/sport/train.py and installed models).
@@ -314,6 +314,17 @@ pub fn load_imu(conn: &Connection, from: f64, to: f64) -> GooseResult<Imu> {
     Ok(imu)
 }
 
+/// Strap step-counter increments per second (the counter also counts arm repetitions, so it only
+/// helps to tell walking — arm hanging, steps — from exercises done in place).
+pub fn steps_per_second(secs: &BTreeMap<i64, Sec>) -> BTreeMap<i64, f64> {
+    let v: Vec<&Sec> = secs.values().collect();
+    v.windows(2)
+        .filter(|p| p[1].ts - p[0].ts == 1)
+        .filter_map(|p| Some((p[1].ts, ((p[1].steps? - p[0].steps?).rem_euclid(65536)) as f64)))
+        .filter(|(_, d)| *d < 10.0)
+        .collect()
+}
+
 /// Mean dynamic acceleration (| |a| - 1 g |) per minute, for the online detector.
 fn imu_dyn_per_minute(imu: &Imu) -> BTreeMap<i64, f64> {
     let mut acc: BTreeMap<i64, (f64, usize)> = BTreeMap::new();
@@ -444,21 +455,48 @@ fn pca1(x: &[[f64; 3]]) -> [f64; 3] {
 
 fn autocorr_peak(x: &[f64], fs: f64, min_s: f64, max_s: f64) -> Option<(f64, f64)> {
     let n = x.len();
-    let m = mean(x)?;
-    let y: Vec<f64> = x.iter().map(|v| v - m).collect();
+    if n < 8 {
+        return None;
+    }
+    // linear detrend: a slow orientation sweep must not look periodic at every lag
+    let nf = n as f64;
+    let mx = (nf - 1.0) / 2.0;
+    let my = mean(x)?;
+    let sxy: f64 = x.iter().enumerate().map(|(i, v)| (i as f64 - mx) * (v - my)).sum();
+    let sxx: f64 = (0..n).map(|i| (i as f64 - mx).powi(2)).sum();
+    let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let y: Vec<f64> = x.iter().enumerate().map(|(i, v)| v - my - slope * (i as f64 - mx)).collect();
     let var: f64 = y.iter().map(|v| v * v).sum();
     if var <= 1e-12 {
         return None;
     }
-    let lo = (min_s * fs) as usize;
+    let lo = ((min_s * fs) as usize).max(2);
     let hi = ((max_s * fs) as usize).min(n / 2);
     if hi <= lo + 2 {
         return None;
     }
-    let r: Vec<(usize, f64)> = (lo..=hi).map(|l| (l, (0..n - l).map(|i| y[i] * y[i + l]).sum::<f64>() / var)).collect();
-    let best = r.iter().map(|v| v.1).fold(f64::MIN, f64::max);
+    // Pearson correlation per lag (normalised on the overlap): a slow movement in a short window
+    // is not penalised against a fast one
+    let r: Vec<(usize, f64)> = (lo - 1..=hi + 1)
+        .map(|l| {
+            let (mut sab, mut saa, mut sbb) = (0.0, 0.0, 0.0);
+            for i in 0..n - l {
+                sab += y[i] * y[i + l];
+                saa += y[i] * y[i];
+                sbb += y[i + l] * y[i + l];
+            }
+            (l, sab / (saa * sbb).sqrt().max(1e-12))
+        })
+        .collect();
+    let _ = var;
+    // interior local maxima only (a maximum at the edge of the range is not a period)
+    let loc: Vec<(usize, f64)> = r.windows(3).filter(|w| w[1].1 >= w[0].1 && w[1].1 > w[2].1).map(|w| w[1]).collect();
+    let best = loc.iter().map(|v| v.1).fold(f64::MIN, f64::max);
+    if best <= 0.0 {
+        return None;
+    }
     // first local maximum reaching 85 % of the best: avoids locking on 2x the true period
-    let pick = r.windows(3).find(|w| w[1].1 >= w[0].1 && w[1].1 >= w[2].1 && w[1].1 >= 0.85 * best).map(|w| w[1]).or_else(|| r.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)))?;
+    let pick = loc.iter().find(|v| v.1 >= 0.85 * best)?;
     Some((pick.0 as f64 / fs, pick.1))
 }
 
@@ -474,12 +512,16 @@ pub struct SetResult {
     pub down_s: Option<f64>,
     pub hold_s: Option<f64>,
     pub features: Vec<f64>,
+    /// orientation change between the first and the last repetition (transition when large)
+    pub net_turn: f64,
+    /// strap steps per second during the set (walking when high with the arm hanging)
+    pub spm: f64,
 }
 
 /// Strength sets: bouts of movement energy separated by rests >= 15 s, then repetitions from the
 /// autocorrelation of the most periodic axis, and up / down / hold phases from vertical velocity.
 pub fn sets_and_reps(imu: &Imu) -> Vec<SetResult> {
-    sets_and_reps_with(imu, &|_| None)
+    sets_and_reps_with(imu, &BTreeMap::new(), &|_| None)
 }
 
 fn sign_norm(v: [f64; 3]) -> [f64; 3] {
@@ -491,47 +533,182 @@ fn sign_norm(v: [f64; 3]) -> [f64; 3] {
 /// SetResult::features; then tempo, rotation and velocity amplitudes.
 pub const SHAPE_DIMS: usize = 14;
 
-/// Sets / reps with an optional expected period per set (from the shape of the movement and the
-/// user's labelled sets of the same exercise): constrains the autocorrelation search to
-/// [0.6 T, 1.7 T], which removes the half / double period errors of an unconstrained search.
-pub fn sets_and_reps_with(imu: &Imu, period_hint: &dyn Fn(&[f64]) -> Option<f64>) -> Vec<SetResult> {
+/// Strength sets from repetitions, not from movement energy (12 Nov gym session: walking between
+/// exercises kept the energy high and welded 20 sets into a few long "efforts"):
+///   1. 8 s windows every second: dominant period (0.8-4 s) and autocorrelation of the most periodic
+///      of {vertical dynamic accel, PCA-1 accel, PCA-1 gyro}, mean wrist orientation, energy;
+///   2. a window repeats when r >= 0.45, energy >= 15 and it is not walking (strap steps >= 1/s with
+///      the arm hanging and a 0.8-1.8 s swing);
+///   3. consecutive repeating windows with the same orientation (< 0.4) and period (± 30 %) form a set
+///      (gaps of up to 2 windows bridged); a change of orientation or tempo starts the next exercise;
+///   4. per set: period re-estimated on the set (bounded by the user's labelled period if any),
+///      peaks counted, start / end at the first / last repetition;
+///   5. rejected: < 5 repetitions, a net orientation change (a transition, not a set), overlaps.
+pub fn sets_and_reps_with(imu: &Imu, steps: &BTreeMap<i64, f64>, period_hint: &dyn Fn(&[f64]) -> Option<f64>) -> Vec<SetResult> {
     let w = work25(imu);
     let n = w.t.len();
-    if n < 25 * 20 {
+    let fs = 25.0;
+    let win = 200usize;
+    let hop = 25usize;
+    if n < win + hop {
         return Vec::new();
     }
-    let fs = 25.0;
     let dynv: Vec<[f64; 3]> = (0..n).map(|i| [0, 1, 2].map(|k| w.a[k][i] - w.grav[k][i])).collect();
-    let e_raw: Vec<f64> = (0..n).map(|i| (w.g[0][i].powi(2) + w.g[1][i].powi(2) + w.g[2][i].powi(2)).sqrt() + 150.0 * (dynv[i][0].powi(2) + dynv[i][1].powi(2) + dynv[i][2].powi(2)).sqrt()).collect();
-    let e = moving_avg(&e_raw, 25);
-    let thr = (2.5 * percentile(&e, 20.0).unwrap_or(10.0)).max(30.0);
-    let mut bouts: Vec<(usize, usize)> = Vec::new();
+    let unit = |i: usize| -> [f64; 3] {
+        let g = [w.grav[0][i], w.grav[1][i], w.grav[2][i]];
+        let m = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-6);
+        g.map(|v| v / m)
+    };
+    struct Win { s: usize, g: [f64; 3], per: f64, k: usize, rep: bool }
+    let mut wins: Vec<Win> = Vec::new();
+    let mut s0 = 0;
+    while s0 + win <= n {
+        // windows never span a data gap
+        if w.t[s0 + win - 1] - w.t[s0] > win as f64 / fs + 0.5 {
+            s0 += hop;
+            continue;
+        }
+        let mut gm = [0.0; 3];
+        for i in s0..s0 + win {
+            let u = unit(i);
+            for k in 0..3 {
+                gm[k] += u[k] / win as f64;
+            }
+        }
+        let gn = (gm[0] * gm[0] + gm[1] * gm[1] + gm[2] * gm[2]).sqrt().max(1e-6);
+        let gm = gm.map(|v| v / gn);
+        let d = &dynv[s0..s0 + win];
+        let ax = pca1(d);
+        let gyr: Vec<[f64; 3]> = (s0..s0 + win).map(|i| [w.g[0][i], w.g[1][i], w.g[2][i]]).collect();
+        let gx = pca1(&gyr);
+        let sigs = [
+            d.iter().map(|v| v[0] * gm[0] + v[1] * gm[1] + v[2] * gm[2]).collect::<Vec<f64>>(),
+            d.iter().map(|v| v[0] * ax[0] + v[1] * ax[1] + v[2] * ax[2]).collect(),
+            gyr.iter().map(|v| v[0] * gx[0] + v[1] * gx[1] + v[2] * gx[2]).collect(),
+        ];
+        let found: Vec<Option<(f64, f64)>> = sigs.iter().map(|sg| autocorr_peak(&moving_avg(sg, 3), fs, 0.8, 4.0)).collect();
+        let mut best = (0.0, 0.0, 0usize);
+        for (k, f) in found.iter().enumerate() {
+            if let Some((p, r)) = f {
+                if *r > best.1 {
+                    best = (*p, *r, k);
+                }
+            }
+        }
+        best = prefer_rotation_period(best, found[2]);
+        let gyro_rms = (gyr.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / win as f64).sqrt();
+        let acc_rms = (d.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / win as f64).sqrt();
+        let energy = gyro_rms + 150.0 * acc_rms;
+        let tc = w.t[s0 + win / 2] as i64;
+        let spm = (-4..4).map(|q| steps.get(&(tc + q)).copied().unwrap_or(0.0)).sum::<f64>() / 8.0;
+        // walking: steps, arm hanging (x) with the palm side out (z > 0; a curl has z < 0), arm swing
+        let walking = spm >= 1.0 && gm[0] >= 0.6 && gm[2] > 0.1 && best.0 < 1.8;
+        wins.push(Win { s: s0, g: gm, per: best.0, k: best.2, rep: best.1 >= 0.45 && energy >= 15.0 && !walking });
+        s0 += hop;
+    }
+    // grow sets over repeating windows of the same orientation and tempo
+    let mut cand: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
-    while i < n {
-        if e[i] < thr {
+    while i < wins.len() {
+        if !wins[i].rep {
             i += 1;
             continue;
         }
-        let s = i;
-        while i < n && (e[i] >= thr || (i + 75 < n && e[i..i + 75].iter().any(|v| *v >= thr))) {
-            i += 1;
+        let (mut last, mut j, mut gap) = (i, i, 0);
+        while j + 1 < wins.len() {
+            let members: Vec<&Win> = wins[i..=last].iter().filter(|x| x.rep).collect();
+            let gref = [0, 1, 2].map(|k| members.iter().map(|x| x.g[k]).sum::<f64>() / members.len() as f64);
+            let pref = median(&members.iter().map(|x| x.per).collect::<Vec<_>>()).unwrap_or(1.0);
+            let nx = &wins[j + 1];
+            let dg = ((nx.g[0] - gref[0]).powi(2) + (nx.g[1] - gref[1]).powi(2) + (nx.g[2] - gref[2]).powi(2)).sqrt();
+            if nx.s > wins[j].s + hop {
+                break; // data gap
+            }
+            if nx.rep && dg < 0.4 && (nx.per - pref).abs() < 0.3 * pref {
+                last = j + 1;
+                gap = 0;
+            } else if gap < 2 && dg < 0.4 {
+                gap += 1;
+            } else {
+                break;
+            }
+            j += 1;
         }
-        // a time gap in the data also closes the bout
-        bouts.push((s, i.min(n) - 1));
+        cand.push((i, last));
+        i = last + 1;
     }
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for b in bouts {
-        match merged.last_mut() {
-            Some(last) if w.t[b.0] - w.t[last.1] < 4.0 => last.1 = b.1,
-            _ => merged.push(b),
+    let mut out: Vec<SetResult> = Vec::new();
+    for (a, b) in cand {
+        let members: Vec<&Win> = wins[a..=b].iter().filter(|x| x.rep).collect();
+        let pw = median(&members.iter().map(|x| x.per).collect::<Vec<_>>()).unwrap_or(1.0);
+        let ks = [0, 1, 2].map(|k| members.iter().filter(|x| x.k == k).count());
+        let kbest = (0..3).max_by_key(|k| ks[*k]).unwrap_or(0);
+        let (s, e_idx) = (wins[a].s, (wins[b].s + win - 1).min(n - 1));
+        // the set's own orientation: mean over the centres of its repeating windows
+        let gref = {
+            let mut g = [0.0; 3];
+            for m in &members {
+                for k in 0..3 {
+                    g[k] += m.g[k];
+                }
+            }
+            let n = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-6);
+            g.map(|v| v / n)
+        };
+        if let Some(set) = describe_set(&w, &dynv, s, e_idx, pw, kbest, gref, period_hint) {
+            out.push(set);
         }
     }
-    let mut out = Vec::new();
-    for (s, e_idx) in merged {
-        let dur = w.t[e_idx] - w.t[s];
-        if !(8.0..=180.0).contains(&dur) {
-            continue;
+    for x in out.iter_mut() {
+        let (a, b) = (x.start as i64, x.end as i64);
+        x.spm = (a..=b).map(|t| steps.get(&t).copied().unwrap_or(0.0)).sum::<f64>() / ((b - a + 1) as f64);
+    }
+    // a set is a stable repetition: a net change of wrist orientation is a transition
+    out.retain(|x| x.reps >= 5 && x.net_turn < 0.5);
+    out.retain(|x| !(x.spm >= 1.0 && x.features[0] >= 0.6 && x.features[2] > 0.1 && x.period_s.unwrap_or(9.0) < 1.8));
+    // a set lasts and repeats cleanly; an unnamed movement must be even cleaner (12 Nov: most of the
+    // remaining false sets were 8 s, r < 0.6 bursts between exercises)
+    out.retain(|x| x.end - x.start >= 9.0 && x.confidence >= 0.5 && (movement_family(x).is_some() || (x.confidence >= 0.6 && x.reps >= 8)));
+    // overlapping candidates: keep the best (autocorrelation x duration)
+    out.sort_by(|p, q| (q.confidence * (q.end - q.start)).total_cmp(&(p.confidence * (p.end - p.start))));
+    let mut keep: Vec<SetResult> = Vec::new();
+    for x in out {
+        if keep.iter().all(|k| (x.end.min(k.end) - x.start.max(k.start)) < 0.3 * (x.end - x.start)) {
+            keep.push(x);
         }
+    }
+    keep.sort_by(|p, q| p.start.total_cmp(&q.start));
+    keep
+}
+
+/// Acceleration of a back-and-forth movement often peaks twice per repetition (a curl: up, then
+/// down), the rotation rate does not: when the gyro sees a clean period twice as long, it is the
+/// repetition.
+fn prefer_rotation_period(best: (f64, f64, usize), gyro: Option<(f64, f64)>) -> (f64, f64, usize) {
+    match gyro {
+        Some((pg, rg)) if best.2 != 2 && best.0 > 0.0 && rg >= 0.6 && (pg / best.0 - 2.0).abs() < 0.3 => (pg, rg, 2),
+        _ => best,
+    }
+}
+
+/// Period, repetitions, phases and signature of one set (indices in the 25 Hz work arrays).
+fn describe_set(w: &Work, dynv: &[[f64; 3]], s: usize, e_idx: usize, window_period: f64, kbest: usize, gref: [f64; 3], period_hint: &dyn Fn(&[f64]) -> Option<f64>) -> Option<SetResult> {
+    let fs = 25.0;
+    let dur = w.t[e_idx] - w.t[s];
+    // unit gravity around a sample (± 0.3 s), relative index
+    let at = |i: usize| -> [f64; 3] {
+        let lo = (s + i).saturating_sub(8);
+        let hi = (s + i + 8).min(e_idx);
+        let mut g = [0.0; 3];
+        for j in lo..=hi {
+            for k in 0..3 {
+                g[k] += w.grav[k][j];
+            }
+        }
+        let m = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-6);
+        g.map(|v| v / m)
+    };
+    let off = |g: [f64; 3]| ((g[0] - gref[0]).powi(2) + (g[1] - gref[1]).powi(2) + (g[2] - gref[2]).powi(2)).sqrt();
         let seg_dyn = &dynv[s..=e_idx];
         let gmean = [0, 1, 2].map(|k| w.grav[k][s..=e_idx].iter().sum::<f64>() / (e_idx - s + 1) as f64);
         let gn = (gmean[0].powi(2) + gmean[1].powi(2) + gmean[2].powi(2)).sqrt().max(1e-6);
@@ -561,23 +738,32 @@ pub fn sets_and_reps_with(imu: &Imu, period_hint: &dyn Fn(&[f64]) -> Option<f64>
             gu[0], gu[1], gu[2], 2.0 * gsd[0], 2.0 * gsd[1], 2.0 * gsd[2], axn[0], axn[1], axn[2], gxn[0], gxn[1], gxn[2],
             (ax[0] * gu[0] + ax[1] * gu[1] + ax[2] * gu[2]).abs(), (gyro_rms0 / (acc_rms0 * 300.0).max(1e-3)).min(5.0) / 2.0,
         ];
+        // the user's period for this movement if known, else the windows' period (± 30 %)
         let (lo_s, hi_s) = match period_hint(&shape) {
-            Some(t) => ((0.6 * t).max(0.6), (1.7 * t).min(10.0)),
-            None => (0.8, 8.0),
+            Some(t) => ((0.75 * t).max(0.6), (1.4 * t).min(10.0)),
+            None => ((0.7 * window_period).max(0.6), 1.35 * window_period),
         };
+        let sigs = [moving_avg(&vert, 5), moving_avg(&pa, 5), moving_avg(&pg, 5)];
         let mut best: Option<(f64, f64, Vec<f64>)> = None;
-        for sig in [moving_avg(&vert, 5), moving_avg(&pa, 5), moving_avg(&pg, 5)] {
-            if let Some((p, r)) = autocorr_peak(&sig, fs, lo_s, hi_s.min(dur / 2.0)) {
-                if best.as_ref().is_none_or(|b| r > b.1) {
-                    best = Some((p, r, sig));
+        for (k, sig) in sigs.iter().enumerate() {
+            if let Some((p, r)) = autocorr_peak(sig, fs, lo_s, hi_s.min(dur / 2.0)) {
+                // the windows' dominant signal wins ties
+                let score = r + if k == kbest { 0.05 } else { 0.0 };
+                if best.as_ref().is_none_or(|b| score > b.1) {
+                    best = Some((p, score, sig.clone()));
                 }
             }
         }
-        let Some((period, r, sig)) = best else { continue };
+        let (period, r, sig) = best?;
+        let r = (r - 0.05).max(r - if r > 0.05 { 0.05 } else { 0.0 });
         let periodic = r >= 0.4 && dur / period >= 2.5;
+        let mut first_last = (0usize, sig.len().saturating_sub(1));
+        let mut inner = first_last;
         let reps = if periodic {
-            let m = mean(&sig).unwrap_or(0.0);
-            let sd = (sig.iter().map(|v| (v - m).powi(2)).sum::<f64>() / sig.len() as f64).sqrt();
+            let base = moving_avg(&sig, (period * fs) as usize);
+            let sig: Vec<f64> = sig.iter().zip(&base).map(|(a, b)| a - b).collect();
+            let m = 0.0;
+            let sd = (sig.iter().map(|v| v * v).sum::<f64>() / sig.len() as f64).sqrt();
             let dist = (0.6 * period * fs) as usize;
             let mut peaks: Vec<usize> = Vec::new();
             for i in 1..sig.len() - 1 {
@@ -592,7 +778,29 @@ pub fn sets_and_reps_with(imu: &Imu, period_hint: &dyn Fn(&[f64]) -> Option<f64>
                     }
                 }
             }
-            let by_period = (dur / period).round() as usize;
+            // keep the longest run of repetitions done in the set's orientation: the 8 s windows
+            // overhang into the transition to the next exercise
+            let mut runs: Vec<Vec<usize>> = vec![Vec::new()];
+            for &pk in &peaks {
+                if off(at(pk)) < 0.4 {
+                    runs.last_mut().unwrap().push(pk);
+                } else if !runs.last().unwrap().is_empty() {
+                    runs.push(Vec::new());
+                }
+            }
+            peaks = runs.into_iter().max_by_key(|r| r.len()).unwrap_or_default();
+            if let (Some(f), Some(l)) = (peaks.first(), peaks.last()) {
+                first_last = (*f, *l);
+            }
+            // orientation is compared one repetition inside the set (getting into position is
+            // not part of it)
+            if peaks.len() >= 4 {
+                inner = (peaks[1], peaks[peaks.len() - 2]);
+            } else {
+                inner = first_last;
+            }
+            let active = if peaks.len() >= 2 { (peaks[peaks.len() - 1] - peaks[0]) as f64 / fs + period } else { dur };
+            let by_period = (active / period).round() as usize;
             if (peaks.len() as f64 - by_period as f64).abs() <= 0.3 * by_period as f64 { peaks.len() } else { by_period }
         } else {
             0
@@ -635,9 +843,19 @@ pub fn sets_and_reps_with(imu: &Imu, period_hint: &dyn Fn(&[f64]) -> Option<f64>
         }
         let mut features = shape.clone();
         features.extend([(period.max(0.3)).ln() / 1.5, (rot_amp / 90.0).min(3.0), vel_amp.min(2.0)]);
-        out.push(SetResult {
-            start: w.t[s],
-            end: w.t[e_idx],
+        // net orientation change between the first and the last repetition (same phase)
+        let (g0, g1) = (at(inner.0), at(inner.1));
+        let net_turn = ((g0[0] - g1[0]).powi(2) + (g0[1] - g1[1]).powi(2) + (g0[2] - g1[2]).powi(2)).sqrt();
+        let (st, en) = if periodic {
+            ((w.t[s + first_last.0] - period / 2.0).max(w.t[s]), (w.t[s + first_last.1] + period / 2.0).min(w.t[e_idx]))
+        } else {
+            (w.t[s], w.t[e_idx])
+        };
+        Some(SetResult {
+            start: st,
+            end: en,
+            net_turn,
+            spm: 0.0,
             periodic,
             reps,
             period_s: periodic.then_some(round(period, 2)),
@@ -646,9 +864,7 @@ pub fn sets_and_reps_with(imu: &Imu, period_hint: &dyn Fn(&[f64]) -> Option<f64>
             down_s,
             hold_s,
             features,
-        });
-    }
-    out
+        })
 }
 
 // ------------------------------------------------------------------ session analysis
@@ -792,6 +1008,29 @@ pub fn recognize_exercise(lib: &[LibSet], f: &[f64]) -> Option<(String, f64)> {
     Some((label.to_string(), round(conf, 3)))
 }
 
+/// Name guess before the user has labelled anything, from the wrist orientation (strap x axis
+/// along the forearm, towards the hand: +1 arm hanging, -1 arm overhead) and the tempo. Shown with
+/// a question mark; the first validation replaces it with the personal library.
+pub fn movement_family(s: &SetResult) -> Option<&'static str> {
+    let (x, y, z) = (s.features[0], s.features[1], s.features[2]);
+    let t = s.period_s?;
+    if x <= -0.85 && t < 2.0 {
+        Some("Tractions")
+    } else if x <= -0.6 && t >= 2.0 {
+        Some("Squats / thrusters")
+    } else if (0.2..=0.75).contains(&x) && y >= 0.6 && z < 0.0 {
+        Some("Curls biceps")
+    } else if x >= 0.85 && s.spm < 0.8 && t < 1.1 {
+        Some("Pompes")
+    } else if x >= 0.85 && s.spm < 0.8 && t < 2.2 {
+        Some("Dips")
+    } else if x >= 0.85 && t >= 2.2 {
+        Some("Squats bulgares / fentes")
+    } else {
+        None
+    }
+}
+
 /// Expected period for a movement shape: the closest labelled set of similar shape.
 fn period_for_shape(lib: &[LibSet], shape: &[f64]) -> Option<f64> {
     lib.iter()
@@ -843,7 +1082,8 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
     let mins = minutes(&secs, &imu_dyn_per_minute(&imu));
     let st = strokes(&imu);
     let lib = exercise_library(conn)?;
-    let sets = sets_and_reps_with(&imu, &|shape| period_for_shape(&lib, shape));
+    let steps = steps_per_second(&load_secs(conn, start - PRE_BUFFER_S, end + POST_BUFFER_S)?);
+    let sets = sets_and_reps_with(&imu, &steps, &|shape| period_for_shape(&lib, shape));
     let f = session_features(&mins, &p, &imu, &sets, st.len(), start, end);
     let (model_version, probs) = match active_model(conn)? {
         Some((v, params_json)) => match model_predict(&params_json, &f) {
@@ -879,10 +1119,10 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
             let clusters = cluster_sets(&periodic);
             let mut ci = 0;
             for (k, s) in sets.iter().enumerate() {
-                let ex = if s.periodic { recognize_exercise(&lib, &s.features) } else { None };
+                let ex = if s.periodic { recognize_exercise(&lib, &s.features).or_else(|| movement_family(s).map(|f| (f.to_string(), 0.3))) } else { None };
                 let cluster = if s.periodic { ci += 1; Some(clusters[ci - 1]) } else { None };
                 let detail = json!({"periodic": s.periodic, "period_s": s.period_s, "up_s": s.up_s, "down_s": s.down_s, "hold_s": s.hold_s, "features": s.features, "cluster": cluster});
-                ins.execute(params![format!("{id}-s{k}"), id, if s.periodic { "set" } else { "effort" }, s.start, s.end, s.periodic.then_some(s.reps as i64), ex.as_ref().filter(|e| e.1 >= 0.35).map(|e| e.0.clone()), ex.as_ref().map(|e| e.1), s.confidence, detail.to_string(), ENGINE_VERSION])?;
+                ins.execute(params![format!("{id}-s{k}"), id, if s.periodic { "set" } else { "effort" }, s.start, s.end, s.periodic.then_some(s.reps as i64), ex.as_ref().filter(|e| e.1 >= 0.3).map(|e| e.0.clone()), ex.as_ref().map(|e| e.1), s.confidence, detail.to_string(), ENGINE_VERSION])?;
             }
         } else if kind_of == "tennis" && !st.is_empty() {
             // rallies / games: strokes closer than 25 s belong to the same exchange block
@@ -1563,6 +1803,15 @@ fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 pub fn list(args: &ListArgs) -> GooseResult<Value> {
     let conn = Connection::open(&args.database_path)?;
     ensure_tables(&conn)?;
+    // a newer engine re-analyses finished sessions once (human-labelled segments are kept)
+    let stale: Vec<String> = conn
+        .prepare("SELECT id FROM sport_sessions WHERE status = 'ended' AND engine_version != ?1")?
+        .query_map([ENGINE_VERSION], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let reanalyzed = stale.len();
+    for id in stale {
+        let _ = analyze_session(&conn, &id, None);
+    }
     let since = now_s() - args.days.unwrap_or(30) * 86_400;
     let mut st = conn.prepare(
         "SELECT id, start_ts, end_ts, status, source, predicted_type, probs_json, confidence, summary_json, model_version, label_type, label_status FROM sport_sessions WHERE start_ts >= ?1 AND status != 'discarded' ORDER BY start_ts DESC",
@@ -1594,7 +1843,7 @@ pub fn list(args: &ListArgs) -> GooseResult<Value> {
         "labelled_sets": conn.query_row("SELECT COUNT(*) FROM sport_segments WHERE label_status IN ('confirmed','corrected')", [], |r| r.get::<_, i64>(0))?,
         "annotations": conn.query_row("SELECT COUNT(*) FROM sport_annotations", [], |r| r.get::<_, i64>(0))?,
     });
-    Ok(json!({"sessions": sessions, "review_queue": queue_ids, "exercises": exercises, "engine": engine, "dataset": counts, "engine_version": ENGINE_VERSION}))
+    Ok(json!({"sessions": sessions, "review_queue": queue_ids, "exercises": exercises, "engine": engine, "dataset": counts, "engine_version": ENGINE_VERSION, "reanalyzed": reanalyzed}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1955,11 +2204,50 @@ mod tests {
         let c = cluster_sets(&per);
         assert_eq!(c, vec![0, 0, 0, 1, 1, 1], "{c:?}");
         let lib: Vec<LibSet> = per.iter().zip(&c).map(|(s, k)| LibSet { label: if *k == 0 { "développé".into() } else { "curl".into() }, features: s.features.clone(), period: s.period_s }).collect();
-        let s2 = sets_and_reps_with(&session(&[1, 0, 1]), &|shape| period_for_shape(&lib, shape));
+        let s2 = sets_and_reps_with(&session(&[1, 0, 1]), &BTreeMap::new(), &|shape| period_for_shape(&lib, shape));
         let names: Vec<String> = s2.iter().filter(|s| s.periodic).map(|s| recognize_exercise(&lib, &s.features).map(|e| e.0).unwrap_or_default()).collect();
         assert_eq!(names, vec!["curl", "développé", "curl"], "{s2:?}");
         for s in s2.iter().filter(|s| s.periodic) {
             assert!((9..=13).contains(&s.reps), "{s:?}");
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_gym_session() {
+        // GOOSE_SESSION_DIR = whoop-lab/sport/sessions/<id> (imu.csv, r18.csv)
+        let Ok(dir) = std::env::var("GOOSE_SESSION_DIR") else { return };
+        let mut imu = Imu::default();
+        for line in std::fs::read_to_string(format!("{dir}/imu.csv")).unwrap().lines().skip(1) {
+            let v: Vec<f64> = line.split(',').map(|x| x.parse().unwrap()).collect();
+            imu.t.push(v[0]);
+            for k in 0..3 {
+                imu.a[k].push(v[1 + k]);
+                imu.g[k].push(v[4 + k]);
+            }
+        }
+        let mut secs: BTreeMap<i64, Sec> = BTreeMap::new();
+        for line in std::fs::read_to_string(format!("{dir}/r18.csv")).unwrap().lines().skip(1) {
+            let c: Vec<&str> = line.split(',').collect();
+            let ts: i64 = c[0].parse().unwrap();
+            secs.insert(ts, Sec { ts, steps: c[2].parse().ok(), ..Default::default() });
+        }
+        let t0 = std::time::Instant::now();
+        let sets = sets_and_reps_with(&imu, &steps_per_second(&secs), &|_| None);
+        println!("{} sets in {:.2} s", sets.len(), t0.elapsed().as_secs_f64());
+        let mut agg: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for s in &sets {
+            let f = movement_family(s).unwrap_or("?").to_string();
+            let h = |t: f64| { let x = (t as i64 + 3600).rem_euclid(86400); format!("{:02}:{:02}:{:02}", x / 3600, x / 60 % 60, x % 60) };
+            println!("{}-{} {:5.1}s T{:.2} reps {:3} g({:+.1},{:+.1},{:+.1}) r{:.2} spm{:.1} turn{:.2} {}", h(s.start), h(s.end), s.end - s.start, s.period_s.unwrap_or(0.0), s.reps, s.features[0], s.features[1], s.features[2], s.confidence, s.spm, s.net_turn, f);
+            let e = agg.entry(f).or_default();
+            e.0 += 1;
+            e.1 += s.reps;
+        }
+        for (k, v) in agg {
+            println!("  {k:28} séries {:3} rép {:4}", v.0, v.1);
+        }
+        let c = cluster_sets(&sets.iter().collect::<Vec<_>>());
+        println!("groups {}", c.iter().max().map(|m| m + 1).unwrap_or(0));
     }
 }

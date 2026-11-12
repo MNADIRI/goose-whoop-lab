@@ -44,8 +44,29 @@ label.
 
 - **Strokes (tennis)**: isolated swing — gyro peak > 600 °/s, acceleration > 3 g within 150 ms, no rival peak within
   ±0.5 s (rejects shaking and strap taps: 0 false strokes on the sensor session), ≥ 0.8 s apart; exchanges = strokes < 25 s apart.
-- **Sets / rests (strength)**: 25 Hz energy (gyro + 150 × dynamic accel), threshold 2.5 × p20 (≥ 30), gaps < 3 s merged,
-  sets 8–180 s, rest = gap between sets.
+- **Sets (strength, engine sport-2)**: from repetitions, not energy — 8 s windows every 1 s, period 0.8–4 s
+  (overlap-normalised, detrended autocorrelation of vertical accel / PCA accel / PCA gyro; the gyro period wins when the
+  accel shows half of it), repeating windows (r ≥ 0.45, energy ≥ 15, not walking) grown while orientation (< 0.4) and
+  tempo (± 30 %) stay the same; per set only the longest run of repetitions in the set's own orientation is kept;
+  rejected: < 5 reps, < 9 s, r < 0.5, net orientation change ≥ 0.5 (transition), walking (strap steps ≥ 1/s, arm hanging
+  palm out, 0.8–1.8 s swing), overlaps. The strap step counter also counts arm repetitions: it only separates walking.
+- **Name guess** before any label (wrist orientation, strap x along the forearm: +1 hanging, −1 overhead; tempo; steps):
+  Tractions, Squats / thrusters, Curls biceps, Pompes, Dips, Squats bulgares / fentes — shown with "?", one tap confirms.
+- **Evaluation, 12 Nov gym session** (49 min, ground truth = the user's programme, 47 sets / 550 reps):
+
+  | Exercise | Truth sets × reps | sport-1 (energy) | sport-2 |
+  |---|---|---|---|
+  | Pull-ups | 13 × 10 | — | 10 sets, 7–12 reps |
+  | Push-ups | 8 × 10 | — | 5 sets, 11–15 reps (over-count until labelled) |
+  | Biceps curls | 5 × 10 + 3 × 20 | — | 5 × 9–10 and 18 / 19 / 18 |
+  | Thrusters | 5 × 10 | — | 3 sets, 8–9 reps |
+  | Weighted squats | 3 × 10 | — | 1 set, 9 reps |
+  | Dips | 5 × 10 | — | 4 sets, 9–11 reps |
+  | Bulgarian split squats | 5 × (10 + 10) | — | 2 sets, 5 reps (slow, little wrist motion) |
+  | total | 47 sets | 13 "sets" (circuits welded by walking), 369 reps | 39 sets (≈ 35 real), 401 reps |
+
+  Circuit 1 of block A found in order (pull-ups 7, push-ups 13, curls 10, thrusters 8). Labelling one set per exercise
+  calibrates its period (search bounded to [0.75 T, 1.4 T]) and fixes the push-up over-count.
 - **Repetitions**: most periodic of {vertical dynamic accel, PCA-1 accel, PCA-1 gyro}; period = first autocorrelation peak
   ≥ 85 % of the best in 0.8–8 s; periodic if r ≥ 0.4 and ≥ 2.5 periods; reps = peak count (distance ≥ 0.6 T) or
   duration / T when they disagree by > 30 %. Confidence = r.
