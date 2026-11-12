@@ -44,6 +44,7 @@
 			D1000000000000000000F002 /* WhoopLabResults.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F002 /* WhoopLabResults.swift */; };
 			D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F003 /* WhoopLabDayViews.swift */; };
 			D1000000000000000000F004 /* SmartWake.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F004 /* SmartWake.swift */; };
+			D1000000000000000000F005 /* Sport.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F005 /* Sport.swift */; };
 			D10000000000000000000042 /* GooseAppModel+PacketPublishing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */; };
 			D10000000000000000000043 /* GooseAppModel+ActivityTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */; };
 			D10000000000000000000017 /* NotificationFrameParsing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000017 /* NotificationFrameParsing.swift */; };
@@ -181,6 +182,7 @@
 			D2000000000000000000F002 /* WhoopLabResults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhoopLabResults.swift; sourceTree = "<group>"; };
 			D2000000000000000000F003 /* WhoopLabDayViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhoopLabDayViews.swift; sourceTree = "<group>"; };
 			D2000000000000000000F004 /* SmartWake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartWake.swift; sourceTree = "<group>"; };
+			D2000000000000000000F005 /* Sport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sport.swift; sourceTree = "<group>"; };
 			D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+PacketPublishing.swift"; sourceTree = "<group>"; };
 			D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+ActivityTimeline.swift"; sourceTree = "<group>"; };
 			D20000000000000000000017 /* NotificationFrameParsing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationFrameParsing.swift; sourceTree = "<group>"; };
@@ -358,6 +360,7 @@
 				D2000000000000000000F002 /* WhoopLabResults.swift */,
 				D2000000000000000000F003 /* WhoopLabDayViews.swift */,
 				D2000000000000000000F004 /* SmartWake.swift */,
+				D2000000000000000000F005 /* Sport.swift */,
 				D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */,
 				D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */,
 				D20000000000000000000017 /* NotificationFrameParsing.swift */,
@@ -658,6 +661,7 @@
 				D1000000000000000000F002 /* WhoopLabResults.swift in Sources */,
 				D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */,
 				D1000000000000000000F004 /* SmartWake.swift in Sources */,
+				D1000000000000000000F005 /* Sport.swift in Sources */,
 				D10000000000000000000042 /* GooseAppModel+PacketPublishing.swift in Sources */,
 				D10000000000000000000043 /* GooseAppModel+ActivityTimeline.swift in Sources */,
 				D10000000000000000000017 /* NotificationFrameParsing.swift in Sources */,

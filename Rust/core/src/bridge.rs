@@ -2475,6 +2475,34 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(timeline_from_decoded_frames_bridge)
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.update" => request_args::<crate::sport::UpdateArgs>(&request)
+            .and_then(|args| crate::sport::update(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.manual" => request_args::<crate::sport::ManualArgs>(&request)
+            .and_then(|args| crate::sport::manual(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.annotate" => request_args::<crate::sport::AnnotateArgs>(&request)
+            .and_then(|args| crate::sport::annotate(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.list" => request_args::<crate::sport::ListArgs>(&request)
+            .and_then(|args| crate::sport::list(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.analyze" => request_args::<crate::sport::AnalyzeArgs>(&request)
+            .and_then(|args| crate::sport::analyze(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.export_dataset" => request_args::<crate::sport::DatasetArgs>(&request)
+            .and_then(|args| crate::sport::export_dataset(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "sport.install_model" => request_args::<crate::sport::InstallModelArgs>(&request)
+            .and_then(|args| crate::sport::install_model(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "smart_wake.update" => request_args::<crate::smart_wake::UpdateArgs>(&request)
             .and_then(|args| crate::smart_wake::update(&args))
             .map(|value| bridge_ok(&request.request_id, value))

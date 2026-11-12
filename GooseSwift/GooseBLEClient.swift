@@ -12,6 +12,9 @@ final class GooseBLEClient: NSObject, ObservableObject {
   var rawFrameSink: ((String, Date) -> Void)?
   /// Live IMU frames (packet 43, R21 layout, TOGGLE_IMU_MODE) for the smart-wake engine.
   var liveIMUSink: ((String, Date) -> Void)?
+  /// Same taps for the sport engine (Sport.swift), independent of the smart-wake ones.
+  var sportLiveSampleSink: ((Date, Int?, [Double], String) -> Void)?
+  var sportIMUSink: ((String, Date) -> Void)?
   @Published var bluetoothState = "not requested"
   @Published var connectionState = "disconnected"
   @Published var isScanning = false

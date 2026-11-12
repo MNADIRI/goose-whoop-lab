@@ -386,6 +386,7 @@ extension GooseAppModel {
       context.ble.rawFrameSink?(frame.hex, event.capturedAt)
       if frame.hex.count == 2 * 1244, frame.hex.dropFirst(16).prefix(4) == "2b15" {
         context.ble.liveIMUSink?(frame.hex, event.capturedAt)
+        context.ble.sportIMUSink?(frame.hex, event.capturedAt)
       }
     }
     let parser = notificationFrameParser

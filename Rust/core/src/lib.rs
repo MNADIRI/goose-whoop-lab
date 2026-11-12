@@ -49,6 +49,7 @@ pub mod hrv_qc;
 pub mod imu;
 pub mod optical;
 pub mod smart_wake;
+pub mod sport;
 pub mod training;
 pub mod whoop5_records;
 pub mod whoop5_store;

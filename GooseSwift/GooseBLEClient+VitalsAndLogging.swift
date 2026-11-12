@@ -10,6 +10,7 @@ extension GooseBLEClient {
       return
     }
     liveSampleSink?(date, bpm, [], source)
+    sportLiveSampleSink?(date, bpm, [], source)
 
     realtimeVitalsQueue.async { [weak self] in
       self?.processLiveHeartRate(bpm, source: source, at: date)
@@ -92,6 +93,7 @@ extension GooseBLEClient {
       return
     }
     liveSampleSink?(date, nil, validIntervals, source)
+    sportLiveSampleSink?(date, nil, validIntervals, source)
 
     realtimeVitalsQueue.async { [weak self] in
       self?.processRRIntervals(validIntervals, source: source, at: date)

@@ -1,0 +1,1419 @@
+//! Sport Intelligence Engine: activity detection, adaptive acquisition, classification, sets and
+//! repetitions, personal dataset with human labels.
+//!
+//! Sensing is tiered (see docs/SPORT.md):
+//!   tier 1  R18, 1 Hz, always recorded on the strap, reaches the phone at each history sync
+//!           (HR, steps, firmware still/walk/run, dynamic acceleration, gravity vector);
+//!   tier 2  live packet 40 (HR + R-R) and live R21 IMU (100 Hz accel + gyro), switched on by the
+//!           phone from the moment a session becomes plausible ("watch") until the post-buffer ends.
+//! The online state machine (`update`) runs on per-minute features: idle -> watch -> active ->
+//! ending -> idle. Start/end are dated on the strap's own timestamps, so a session is backdated
+//! to its first active minute (pre-buffer from R18, always available). `analyze` classifies a
+//! session (rules v1, or an installed personal model) and, from the IMU, finds strokes (tennis),
+//! sets / rests / repetitions / movement phases (strength) and exercises (nearest labelled set).
+//! Every prediction carries ENGINE_VERSION + model version; every human answer is appended to
+//! sport_annotations, never overwritten.
+
+use std::collections::BTreeMap;
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::dsp::{mean, median, percentile, round};
+use crate::GooseResult;
+
+pub const ENGINE_VERSION: &str = "sport-1";
+pub const RULES_MODEL: &str = "rules-v1";
+pub const CLASSES: [&str; 4] = ["course", "tennis", "musculation", "autre"];
+/// Session feature vector (order is the contract with lab/sport/train.py and installed models).
+pub const FEATURES: [&str; 16] = [
+    "dur_min", "hrr_mean", "hrr_p90", "steps_pm", "cad_spm", "run_frac", "walk_frac", "dyn_mean", "dyn_cv", "grav_var",
+    "active_alt", "imu_cov", "strokes_pm", "sets_per_10min", "periodic_frac", "gyro_p95",
+];
+const PRE_BUFFER_S: i64 = 120;
+const POST_BUFFER_S: i64 = 180;
+const IMU_FS: f64 = 100.0;
+
+pub fn ensure_tables(conn: &Connection) -> GooseResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sport_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sport_live (ts INTEGER PRIMARY KEY, hr REAL, rr TEXT NOT NULL, arrival REAL);
+        CREATE TABLE IF NOT EXISTS sport_imu (ts REAL PRIMARY KEY, arrival REAL, frame BLOB NOT NULL);
+        CREATE TABLE IF NOT EXISTS sport_sessions (
+            id TEXT PRIMARY KEY, start_ts INTEGER NOT NULL, end_ts INTEGER, status TEXT NOT NULL,
+            source TEXT NOT NULL, predicted_type TEXT, probs_json TEXT, confidence REAL,
+            features_json TEXT, summary_json TEXT, engine_version TEXT NOT NULL, model_version TEXT,
+            label_type TEXT, label_status TEXT NOT NULL DEFAULT 'pending', analyzed_at INTEGER,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sport_segments (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, start_ts REAL NOT NULL, end_ts REAL NOT NULL,
+            reps_pred INTEGER, reps_label INTEGER, exercise_pred TEXT, exercise_conf REAL, exercise_label TEXT,
+            confidence REAL, detail_json TEXT, label_status TEXT NOT NULL DEFAULT 'pending', engine_version TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS sport_segments_session ON sport_segments (session_id, start_ts);
+        CREATE TABLE IF NOT EXISTS sport_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, target TEXT NOT NULL, target_id TEXT NOT NULL,
+            field TEXT NOT NULL, old_value TEXT, new_value TEXT, predicted_value TEXT, confidence REAL,
+            model_version TEXT, engine_version TEXT NOT NULL, source TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sport_models (
+            version TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,
+            params_json TEXT NOT NULL, metrics_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sport_acquisition (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, stream TEXT NOT NULL, start_ts INTEGER NOT NULL,
+            end_ts INTEGER, reason TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn now_s() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn state_get(conn: &Connection, key: &str) -> GooseResult<Option<Value>> {
+    let v: Option<String> = conn.query_row("SELECT value FROM sport_state WHERE key = ?1", [key], |r| r.get(0)).optional()?;
+    Ok(v.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+fn state_set(conn: &Connection, key: &str, v: &Value) -> GooseResult<()> {
+    conn.execute("INSERT OR REPLACE INTO sport_state (key, value) VALUES (?1, ?2)", params![key, v.to_string()])?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ per-second / per-minute data
+
+#[derive(Debug, Clone, Default)]
+pub struct Sec {
+    pub ts: i64,
+    pub hr: Option<f64>,
+    pub steps: Option<i64>,
+    pub cadence_raw: Option<f64>,
+    pub dyn_g: Option<f64>,
+    pub grav: Option<[f64; 3]>,
+    pub activity: Option<String>,
+    pub sleep: bool,
+}
+
+fn load_secs(conn: &Connection, from: i64, to: i64) -> GooseResult<BTreeMap<i64, Sec>> {
+    let mut out: BTreeMap<i64, Sec> = BTreeMap::new();
+    let has_r18: bool = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whoop5_r18'", [], |_| Ok(true)).optional()?.unwrap_or(false);
+    if has_r18 {
+        let mut st = conn.prepare_cached(
+            "SELECT ts, hr, steps, cadence_raw, dyn_accel_g, grav_x_g, grav_y_g, grav_z_g, activity, band_state FROM whoop5_r18 WHERE ts >= ?1 AND ts < ?2",
+        )?;
+        let rows = st.query_map(params![from, to], |r| {
+            let gx: Option<f64> = r.get(5)?;
+            let gy: Option<f64> = r.get(6)?;
+            let gz: Option<f64> = r.get(7)?;
+            let hr: i64 = r.get(1)?;
+            Ok(Sec {
+                ts: r.get(0)?,
+                hr: (hr > 25).then_some(hr as f64),
+                steps: r.get(2)?,
+                cadence_raw: r.get::<_, Option<i64>>(3)?.map(|v| v as f64).filter(|v| *v > 20.0),
+                dyn_g: r.get::<_, Option<f64>>(4)?.filter(|v| v.is_finite() && *v >= 0.0 && *v < 16.0),
+                grav: match (gx, gy, gz) {
+                    (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                    _ => None,
+                },
+                activity: r.get(8)?,
+                sleep: r.get::<_, Option<String>>(9)?.as_deref() == Some("sleep"),
+            })
+        })?;
+        for s in rows {
+            let s = s?;
+            out.insert(s.ts, s);
+        }
+    }
+    // live HR fills seconds the history has not delivered yet
+    let mut st = conn.prepare_cached("SELECT ts, hr FROM sport_live WHERE ts >= ?1 AND ts < ?2")?;
+    for row in st.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)))? {
+        let (ts, hr) = row?;
+        let e = out.entry(ts).or_insert_with(|| Sec { ts, ..Default::default() });
+        if e.hr.is_none() {
+            e.hr = hr.filter(|v| *v > 25.0);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Minute {
+    pub t: i64,
+    pub n: usize,
+    pub hr: Option<f64>,
+    pub steps: f64,
+    pub cad_spm: Option<f64>,
+    pub dyn_mean: Option<f64>,
+    pub dyn_p90: Option<f64>,
+    pub grav_var: f64,
+    pub run_frac: f64,
+    pub walk_frac: f64,
+    pub sleep_frac: f64,
+    pub imu_dyn: Option<f64>,
+}
+
+fn minutes(secs: &BTreeMap<i64, Sec>, imu_dyn: &BTreeMap<i64, f64>) -> Vec<Minute> {
+    let mut by: BTreeMap<i64, Vec<&Sec>> = BTreeMap::new();
+    for s in secs.values() {
+        by.entry(s.ts.div_euclid(60)).or_default().push(s);
+    }
+    by.into_iter()
+        .map(|(m, v)| {
+            let hr: Vec<f64> = v.iter().filter_map(|s| s.hr).collect();
+            let dyn_: Vec<f64> = v.iter().filter_map(|s| s.dyn_g).collect();
+            let steps: i64 = v.windows(2).filter_map(|p| Some((p[1].steps? - p[0].steps?).rem_euclid(65536))).filter(|d| *d < 300).sum();
+            let cad: Vec<f64> = v.iter().filter(|s| matches!(s.activity.as_deref(), Some("walk") | Some("run"))).filter_map(|s| s.cadence_raw).map(|r| 60.0 * 196.6 / r).filter(|c| (40.0..260.0).contains(c)).collect();
+            let gv: f64 = v.windows(2).filter_map(|p| Some(((p[1].grav?[0] - p[0].grav?[0]).powi(2) + (p[1].grav?[1] - p[0].grav?[1]).powi(2) + (p[1].grav?[2] - p[0].grav?[2]).powi(2)).sqrt())).sum();
+            let n = v.len().max(1) as f64;
+            Minute {
+                t: m * 60,
+                n: v.len(),
+                hr: mean(&hr),
+                steps: steps as f64,
+                cad_spm: median(&cad),
+                dyn_mean: mean(&dyn_),
+                dyn_p90: percentile(&dyn_, 90.0),
+                grav_var: gv,
+                run_frac: v.iter().filter(|s| s.activity.as_deref() == Some("run")).count() as f64 / n,
+                walk_frac: v.iter().filter(|s| s.activity.as_deref() == Some("walk")).count() as f64 / n,
+                sleep_frac: v.iter().filter(|s| s.sleep).count() as f64 / n,
+                imu_dyn: imu_dyn.get(&m).copied(),
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Profile {
+    pub rest: f64,
+    pub hrmax: f64,
+}
+
+impl Profile {
+    fn hrr(&self, hr: f64) -> f64 {
+        ((hr - self.rest) / (self.hrmax - self.rest).max(20.0)).clamp(-0.5, 1.5)
+    }
+}
+
+fn profile(conn: &Connection, now: i64, age: Option<f64>) -> GooseResult<Profile> {
+    if let Some(p) = state_get(conn, "profile")? {
+        if p["computed_at"].as_i64().unwrap_or(0) > now - 86_400 && p["age"].as_f64() == age {
+            return Ok(Profile { rest: p["rest"].as_f64().unwrap_or(55.0), hrmax: p["hrmax"].as_f64().unwrap_or(190.0) });
+        }
+    }
+    let mut rest = 55.0;
+    let mut observed_max = 0.0;
+    let has_r18: bool = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whoop5_r18'", [], |_| Ok(true)).optional()?.unwrap_or(false);
+    if has_r18 {
+        let sleep_hr: Vec<f64> = conn
+            .prepare("SELECT hr FROM whoop5_r18 WHERE ts > ?1 AND band_state = 'sleep' AND hr > 30")?
+            .query_map([now - 7 * 86_400], |r| r.get::<_, i64>(0).map(|v| v as f64))?
+            .collect::<Result<_, _>>()?;
+        if sleep_hr.len() > 3600 {
+            rest = percentile(&sleep_hr, 5.0).unwrap_or(rest);
+        }
+        let all_hr: Vec<f64> = conn
+            .prepare("SELECT hr FROM whoop5_r18 WHERE ts > ?1 AND hr > 30")?
+            .query_map([now - 30 * 86_400], |r| r.get::<_, i64>(0).map(|v| v as f64))?
+            .collect::<Result<_, _>>()?;
+        observed_max = percentile(&all_hr, 99.98).unwrap_or(0.0);
+    }
+    let tanaka = 208.0 - 0.7 * age.unwrap_or(30.0);
+    let p = Profile { rest, hrmax: tanaka.max(observed_max) };
+    state_set(conn, "profile", &json!({"rest": p.rest, "hrmax": p.hrmax, "age": age, "computed_at": now}))?;
+    Ok(p)
+}
+
+/// Activity evidence of one minute in [0, 1]; > 0.5 = active minute.
+pub fn minute_score(m: &Minute, p: &Profile) -> f64 {
+    if m.n < 10 || m.sleep_frac > 0.5 {
+        return 0.0;
+    }
+    let hrr = m.hr.map(|h| p.hrr(h)).unwrap_or(0.0);
+    let motion = ((m.steps - 30.0) / 70.0)
+        .max((m.dyn_mean.unwrap_or(0.0) - 0.04) / 0.12)
+        .max((m.imu_dyn.unwrap_or(0.0) - 0.05) / 0.15)
+        .max((m.grav_var - 3.0) / 10.0)
+        .clamp(0.0, 1.0);
+    if m.steps >= 120.0 || m.run_frac > 0.5 {
+        return 0.95;
+    }
+    // heart-rate reserve is the main evidence (walking to the bus has motion but low HRR)
+    let x = 10.0 * (hrr - 0.33) + 1.0 * (motion - 0.3);
+    1.0 / (1.0 + (-x).exp())
+}
+
+// ------------------------------------------------------------------ IMU
+
+#[derive(Debug, Default, Clone)]
+pub struct Imu {
+    pub t: Vec<f64>,
+    pub a: [Vec<f64>; 3],
+    pub g: [Vec<f64>; 3],
+}
+
+impl Imu {
+    pub fn len(&self) -> usize {
+        self.t.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.t.is_empty()
+    }
+    fn push_record(&mut self, r: &crate::whoop5_records::R21Record) {
+        let n = r.accel_raw[0].len().min(r.gyro_raw[0].len());
+        for i in 0..n {
+            self.t.push(r.ts + i as f64 / IMU_FS);
+            for k in 0..3 {
+                self.a[k].push(f64::from(r.accel_raw[k][i]) / crate::whoop5_records::ACCEL_LSB_PER_G);
+                self.g[k].push(f64::from(r.gyro_raw[k][i]) * crate::whoop5_records::GYRO_DPS_PER_LSB);
+            }
+        }
+    }
+}
+
+pub fn load_imu(conn: &Connection, from: f64, to: f64) -> GooseResult<Imu> {
+    let mut recs: BTreeMap<i64, crate::whoop5_records::R21Record> = BTreeMap::new();
+    let mut st = conn.prepare_cached("SELECT frame FROM sport_imu WHERE ts >= ?1 AND ts < ?2 ORDER BY ts")?;
+    for f in st.query_map(params![from, to], |r| r.get::<_, Vec<u8>>(0))? {
+        let f = f?;
+        if f.len() < crate::whoop5_records::HEADER_LEN + 4 {
+            continue;
+        }
+        if let Some(r) = crate::whoop5_records::decode_r21(&f[crate::whoop5_records::HEADER_LEN..f.len() - 4]) {
+            recs.insert((r.ts * 1000.0) as i64, r);
+        }
+    }
+    // the same records may also sit in Layer B (history R21, or live frames ingested there)
+    if let Ok(more) = crate::whoop5_store::load_r21(conn, from, to) {
+        for r in more {
+            recs.entry((r.ts * 1000.0) as i64).or_insert(r);
+        }
+    }
+    let mut imu = Imu::default();
+    for r in recs.values() {
+        imu.push_record(r);
+    }
+    Ok(imu)
+}
+
+/// Mean dynamic acceleration (| |a| - 1 g |) per minute, for the online detector.
+fn imu_dyn_per_minute(imu: &Imu) -> BTreeMap<i64, f64> {
+    let mut acc: BTreeMap<i64, (f64, usize)> = BTreeMap::new();
+    for i in 0..imu.len() {
+        let m = (imu.a[0][i].powi(2) + imu.a[1][i].powi(2) + imu.a[2][i].powi(2)).sqrt();
+        let e = acc.entry((imu.t[i] as i64).div_euclid(60)).or_insert((0.0, 0));
+        e.0 += (m - 1.0).abs();
+        e.1 += 1;
+    }
+    acc.into_iter().filter(|(_, v)| v.1 >= 1000).map(|(k, v)| (k, v.0 / v.1 as f64)).collect()
+}
+
+fn moving_avg(x: &[f64], w: usize) -> Vec<f64> {
+    if x.is_empty() || w <= 1 {
+        return x.to_vec();
+    }
+    let mut c = vec![0.0; x.len() + 1];
+    for i in 0..x.len() {
+        c[i + 1] = c[i] + x[i];
+    }
+    (0..x.len())
+        .map(|i| {
+            let lo = i.saturating_sub(w / 2);
+            let hi = (i + w / 2 + 1).min(x.len());
+            (c[hi] - c[lo]) / (hi - lo) as f64
+        })
+        .collect()
+}
+
+/// 25 Hz working copy: accel (g), gyro (dps), gravity (1 s low-pass), dynamic accel.
+#[derive(Debug, Default)]
+struct Work {
+    t: Vec<f64>,
+    a: [Vec<f64>; 3],
+    g: [Vec<f64>; 3],
+    grav: [Vec<f64>; 3],
+}
+
+fn work25(imu: &Imu) -> Work {
+    let mut w = Work::default();
+    let mut i = 0;
+    while i + 4 <= imu.len() {
+        if imu.t[i + 3] - imu.t[i] > 0.1 {
+            i += 1;
+            continue;
+        }
+        w.t.push(imu.t[i]);
+        for k in 0..3 {
+            w.a[k].push(imu.a[k][i..i + 4].iter().sum::<f64>() / 4.0);
+            w.g[k].push(imu.g[k][i..i + 4].iter().sum::<f64>() / 4.0);
+        }
+        i += 4;
+    }
+    for k in 0..3 {
+        w.grav[k] = moving_avg(&w.a[k], 25);
+    }
+    w
+}
+
+fn gyro_mag(imu: &Imu, i: usize) -> f64 {
+    (imu.g[0][i].powi(2) + imu.g[1][i].powi(2) + imu.g[2][i].powi(2)).sqrt()
+}
+
+/// Tennis strokes: an isolated swing. Gyro magnitude peak > 600 deg/s with an acceleration > 3 g
+/// within 150 ms, at least 0.8 s from the previous stroke, and no other swing peak (> half its
+/// amplitude) within +-0.5 s: shaking the hand (4-6 Hz oscillation) and double/triple taps on the
+/// strap (sensor session 12 Nov: 11 and 3 false strokes with a plain threshold) are rejected.
+pub fn strokes(imu: &Imu) -> Vec<(f64, f64, f64)> {
+    let n = imu.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let gm: Vec<f64> = moving_avg(&(0..n).map(|i| gyro_mag(imu, i)).collect::<Vec<_>>(), 3);
+    let am: Vec<f64> = (0..n).map(|i| (imu.a[0][i].powi(2) + imu.a[1][i].powi(2) + imu.a[2][i].powi(2)).sqrt()).collect();
+    let peaks: Vec<usize> = (1..n - 1).filter(|&i| gm[i] > 200.0 && gm[i] >= gm[i - 1] && gm[i] > gm[i + 1]).collect();
+    let mut out: Vec<(f64, f64, f64)> = Vec::new();
+    for (k, &i) in peaks.iter().enumerate() {
+        if gm[i] <= 600.0 {
+            continue;
+        }
+        let lo = i.saturating_sub(15);
+        let hi = (i + 15).min(n - 1);
+        let amax = am[lo..=hi].iter().copied().fold(0.0, f64::max);
+        if amax <= 3.0 {
+            continue;
+        }
+        let rivals = peaks[k.saturating_sub(20)..(k + 20).min(peaks.len())]
+            .iter()
+            .filter(|&&j| j != i && (imu.t[j] - imu.t[i]).abs() <= 0.5 && (imu.t[j] - imu.t[i]).abs() >= 0.08 && gm[j] > 0.5 * gm[i])
+            .count();
+        if rivals > 0 {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if imu.t[i] - last.0 < 0.8 => {
+                if gm[i] > last.1 {
+                    *last = (imu.t[i], gm[i], amax);
+                }
+            }
+            _ => out.push((imu.t[i], gm[i], amax)),
+        }
+    }
+    out
+}
+
+fn pca1(x: &[[f64; 3]]) -> [f64; 3] {
+    let n = x.len().max(1) as f64;
+    let m: [f64; 3] = [0, 1, 2].map(|k| x.iter().map(|v| v[k]).sum::<f64>() / n);
+    let mut c = [[0.0; 3]; 3];
+    for v in x {
+        for i in 0..3 {
+            for j in 0..3 {
+                c[i][j] += (v[i] - m[i]) * (v[j] - m[j]) / n;
+            }
+        }
+    }
+    let mut e = [0.577, 0.577, 0.577];
+    for _ in 0..50 {
+        let y = [0, 1, 2].map(|i| c[i][0] * e[0] + c[i][1] * e[1] + c[i][2] * e[2]);
+        let norm = (y[0] * y[0] + y[1] * y[1] + y[2] * y[2]).sqrt();
+        if norm < 1e-12 {
+            break;
+        }
+        e = y.map(|v| v / norm);
+    }
+    e
+}
+
+fn autocorr_peak(x: &[f64], fs: f64, min_s: f64, max_s: f64) -> Option<(f64, f64)> {
+    let n = x.len();
+    let m = mean(x)?;
+    let y: Vec<f64> = x.iter().map(|v| v - m).collect();
+    let var: f64 = y.iter().map(|v| v * v).sum();
+    if var <= 1e-12 {
+        return None;
+    }
+    let lo = (min_s * fs) as usize;
+    let hi = ((max_s * fs) as usize).min(n / 2);
+    if hi <= lo + 2 {
+        return None;
+    }
+    let r: Vec<(usize, f64)> = (lo..=hi).map(|l| (l, (0..n - l).map(|i| y[i] * y[i + l]).sum::<f64>() / var)).collect();
+    let best = r.iter().map(|v| v.1).fold(f64::MIN, f64::max);
+    // first local maximum reaching 85 % of the best: avoids locking on 2x the true period
+    let pick = r.windows(3).find(|w| w[1].1 >= w[0].1 && w[1].1 >= w[2].1 && w[1].1 >= 0.85 * best).map(|w| w[1]).or_else(|| r.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)))?;
+    Some((pick.0 as f64 / fs, pick.1))
+}
+
+#[derive(Debug, Clone)]
+pub struct SetResult {
+    pub start: f64,
+    pub end: f64,
+    pub periodic: bool,
+    pub reps: usize,
+    pub period_s: Option<f64>,
+    pub confidence: f64,
+    pub up_s: Option<f64>,
+    pub down_s: Option<f64>,
+    pub hold_s: Option<f64>,
+    pub features: Vec<f64>,
+}
+
+/// Strength sets: bouts of movement energy separated by rests >= 15 s, then repetitions from the
+/// autocorrelation of the most periodic axis, and up / down / hold phases from vertical velocity.
+pub fn sets_and_reps(imu: &Imu) -> Vec<SetResult> {
+    let w = work25(imu);
+    let n = w.t.len();
+    if n < 25 * 20 {
+        return Vec::new();
+    }
+    let fs = 25.0;
+    let dynv: Vec<[f64; 3]> = (0..n).map(|i| [0, 1, 2].map(|k| w.a[k][i] - w.grav[k][i])).collect();
+    let e_raw: Vec<f64> = (0..n).map(|i| (w.g[0][i].powi(2) + w.g[1][i].powi(2) + w.g[2][i].powi(2)).sqrt() + 150.0 * (dynv[i][0].powi(2) + dynv[i][1].powi(2) + dynv[i][2].powi(2)).sqrt()).collect();
+    let e = moving_avg(&e_raw, 25);
+    let thr = (2.5 * percentile(&e, 20.0).unwrap_or(10.0)).max(30.0);
+    let mut bouts: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if e[i] < thr {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < n && (e[i] >= thr || (i + 75 < n && e[i..i + 75].iter().any(|v| *v >= thr))) {
+            i += 1;
+        }
+        // a time gap in the data also closes the bout
+        bouts.push((s, i.min(n) - 1));
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for b in bouts {
+        match merged.last_mut() {
+            Some(last) if w.t[b.0] - w.t[last.1] < 4.0 => last.1 = b.1,
+            _ => merged.push(b),
+        }
+    }
+    let mut out = Vec::new();
+    for (s, e_idx) in merged {
+        let dur = w.t[e_idx] - w.t[s];
+        if !(8.0..=180.0).contains(&dur) {
+            continue;
+        }
+        let seg_dyn = &dynv[s..=e_idx];
+        let gmean = [0, 1, 2].map(|k| w.grav[k][s..=e_idx].iter().sum::<f64>() / (e_idx - s + 1) as f64);
+        let gn = (gmean[0].powi(2) + gmean[1].powi(2) + gmean[2].powi(2)).sqrt().max(1e-6);
+        let gu = gmean.map(|v| v / gn);
+        let vert: Vec<f64> = seg_dyn.iter().map(|v| v[0] * gu[0] + v[1] * gu[1] + v[2] * gu[2]).collect();
+        let ax = pca1(seg_dyn);
+        let pa: Vec<f64> = seg_dyn.iter().map(|v| v[0] * ax[0] + v[1] * ax[1] + v[2] * ax[2]).collect();
+        let gyr: Vec<[f64; 3]> = (s..=e_idx).map(|i| [w.g[0][i], w.g[1][i], w.g[2][i]]).collect();
+        let gx = pca1(&gyr);
+        let pg: Vec<f64> = gyr.iter().map(|v| v[0] * gx[0] + v[1] * gx[1] + v[2] * gx[2]).collect();
+        let mut best: Option<(f64, f64, Vec<f64>)> = None;
+        for sig in [moving_avg(&vert, 5), moving_avg(&pa, 5), moving_avg(&pg, 5)] {
+            if let Some((p, r)) = autocorr_peak(&sig, fs, 0.8, 8.0f64.min(dur / 2.0)) {
+                if best.as_ref().is_none_or(|b| r > b.1) {
+                    best = Some((p, r, sig));
+                }
+            }
+        }
+        let Some((period, r, sig)) = best else { continue };
+        let periodic = r >= 0.4 && dur / period >= 2.5;
+        let reps = if periodic {
+            let m = mean(&sig).unwrap_or(0.0);
+            let sd = (sig.iter().map(|v| (v - m).powi(2)).sum::<f64>() / sig.len() as f64).sqrt();
+            let dist = (0.6 * period * fs) as usize;
+            let mut peaks: Vec<usize> = Vec::new();
+            for i in 1..sig.len() - 1 {
+                if sig[i] > m + 0.3 * sd && sig[i] >= sig[i - 1] && sig[i] >= sig[i + 1] {
+                    match peaks.last() {
+                        Some(&l) if i - l < dist => {
+                            if sig[i] > sig[l] {
+                                *peaks.last_mut().unwrap() = i;
+                            }
+                        }
+                        _ => peaks.push(i),
+                    }
+                }
+            }
+            let by_period = (dur / period).round() as usize;
+            if (peaks.len() as f64 - by_period as f64).abs() <= 0.3 * by_period as f64 { peaks.len() } else { by_period }
+        } else {
+            0
+        };
+        // vertical velocity (high-passed over one period) -> up / down / hold time per repetition
+        let (mut up_s, mut down_s, mut hold_s) = (None, None, None);
+        if periodic {
+            let mut v = vec![0.0; vert.len()];
+            for i in 1..vert.len() {
+                v[i] = v[i - 1] + 9.81 * vert[i] / fs;
+            }
+            let trend = moving_avg(&v, (period * fs) as usize);
+            let vh: Vec<f64> = v.iter().zip(&trend).map(|(a, b)| a - b).collect();
+            let sd = (vh.iter().map(|x| x * x).sum::<f64>() / vh.len() as f64).sqrt();
+            let eps = 0.25 * sd;
+            let nn = vh.len() as f64;
+            let fu = vh.iter().filter(|x| **x > eps).count() as f64 / nn;
+            let fd = vh.iter().filter(|x| **x < -eps).count() as f64 / nn;
+            up_s = Some(round(fu * period, 2));
+            down_s = Some(round(fd * period, 2));
+            hold_s = Some(round((1.0 - fu - fd).max(0.0) * period, 2));
+        }
+        let gyro_rms = (gyr.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / gyr.len() as f64).sqrt();
+        let acc_rms = (seg_dyn.iter().map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sum::<f64>() / seg_dyn.len() as f64).sqrt();
+        let axis_vert = (ax[0] * gu[0] + ax[1] * gu[1] + ax[2] * gu[2]).abs();
+        out.push(SetResult {
+            start: w.t[s],
+            end: w.t[e_idx],
+            periodic,
+            reps,
+            period_s: periodic.then_some(round(period, 2)),
+            confidence: round(r.clamp(0.0, 1.0), 3),
+            up_s,
+            down_s,
+            hold_s,
+            // exercise signature: wrist orientation, movement axis vs gravity, tempo, rotation share
+            features: vec![gu[0], gu[1], gu[2], axis_vert, period / 4.0, (gyro_rms / (acc_rms * 300.0).max(1e-3)).min(5.0) / 2.0],
+        });
+    }
+    out
+}
+
+// ------------------------------------------------------------------ session analysis
+
+fn softmax(s: &[f64]) -> Vec<f64> {
+    let m = s.iter().copied().fold(f64::MIN, f64::max);
+    let e: Vec<f64> = s.iter().map(|v| (v - m).exp()).collect();
+    let z: f64 = e.iter().sum();
+    e.iter().map(|v| v / z).collect()
+}
+
+fn clamp01(x: f64) -> f64 {
+    x.clamp(0.0, 1.0)
+}
+
+/// Rules v1 (no labels yet). Scores are log-odds-like; the softmax gives the probabilities.
+pub fn rules_v1(f: &BTreeMap<&str, f64>) -> Vec<f64> {
+    let g = |k: &str| f.get(k).copied().unwrap_or(0.0);
+    let imu = g("imu_cov") >= 0.3;
+    let run = 3.0 * clamp01((g("steps_pm") - 100.0) / 50.0) + 2.0 * g("run_frac") + 1.0 * clamp01((g("cad_spm") - 140.0) / 30.0) - if imu { 1.5 * clamp01(g("strokes_pm") / 3.0) } else { 0.0 };
+    let tennis = if imu {
+        3.0 * clamp01(g("strokes_pm") / 3.0) + 1.0 * clamp01((g("steps_pm") - 15.0) / 30.0) * clamp01((110.0 - g("steps_pm")) / 30.0) - 1.0 * g("periodic_frac")
+    } else {
+        1.5 * clamp01((g("steps_pm") - 20.0) / 30.0) * clamp01((110.0 - g("steps_pm")) / 30.0) + 1.0 * clamp01((g("dyn_cv") - 0.8) / 0.8) + 0.5 * clamp01(g("hrr_mean") / 0.5)
+    };
+    let strength = if imu {
+        2.0 * clamp01(g("sets_per_10min") / 2.5) + 1.5 * g("periodic_frac") + 1.0 * clamp01((25.0 - g("steps_pm")) / 25.0) - 1.0 * clamp01(g("strokes_pm") / 3.0)
+    } else {
+        1.5 * clamp01((25.0 - g("steps_pm")) / 25.0) + 1.0 * clamp01(g("active_alt") / 0.4) + 0.7 * clamp01((g("grav_var") - 4.0) / 8.0)
+    };
+    let other = 1.2;
+    softmax(&[1.6 * run, 1.6 * tennis, 1.6 * strength, other])
+}
+
+fn model_predict(params_json: &Value, f: &BTreeMap<&str, f64>) -> Option<Vec<f64>> {
+    let names: Vec<String> = serde_json::from_value(params_json.get("features")?.clone()).ok()?;
+    let mu: Vec<f64> = serde_json::from_value(params_json.get("mean")?.clone()).ok()?;
+    let sd: Vec<f64> = serde_json::from_value(params_json.get("std")?.clone()).ok()?;
+    let w: Vec<Vec<f64>> = serde_json::from_value(params_json.get("weights")?.clone()).ok()?;
+    let b: Vec<f64> = serde_json::from_value(params_json.get("bias")?.clone()).ok()?;
+    let classes: Vec<String> = serde_json::from_value(params_json.get("classes")?.clone()).ok()?;
+    let x: Vec<f64> = names.iter().enumerate().map(|(i, n)| (f.get(n.as_str()).copied().unwrap_or(0.0) - mu[i]) / sd[i].max(1e-9)).collect();
+    let z: Vec<f64> = w.iter().zip(&b).map(|(row, bi)| row.iter().zip(&x).map(|(a, c)| a * c).sum::<f64>() + bi).collect();
+    let p = softmax(&z);
+    Some(CLASSES.iter().map(|c| classes.iter().position(|k| k == c).map(|i| p[i]).unwrap_or(0.0)).collect())
+}
+
+fn active_model(conn: &Connection) -> GooseResult<Option<(String, Value)>> {
+    let r: Option<(String, String)> = conn
+        .query_row("SELECT version, params_json FROM sport_models WHERE active = 1 ORDER BY created_at DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    Ok(r.and_then(|(v, p)| serde_json::from_str(&p).ok().map(|p| (v, p))))
+}
+
+pub fn session_features(mins: &[Minute], p: &Profile, imu: &Imu, sets: &[SetResult], strokes_n: usize, start: i64, end: i64) -> BTreeMap<&'static str, f64> {
+    let act: Vec<&Minute> = mins.iter().filter(|m| minute_score(m, p) > 0.5).collect();
+    let base: Vec<&Minute> = if act.len() >= 3 { act.clone() } else { mins.iter().collect() };
+    let dur_min = ((end - start) as f64 / 60.0).max(1.0);
+    let hrr: Vec<f64> = base.iter().filter_map(|m| m.hr.map(|h| p.hrr(h))).collect();
+    let dyn_: Vec<f64> = base.iter().filter_map(|m| m.dyn_mean).collect();
+    let dyn_mean = mean(&dyn_).unwrap_or(0.0);
+    let dyn_sd = if dyn_.len() > 1 { (dyn_.iter().map(|v| (v - dyn_mean).powi(2)).sum::<f64>() / dyn_.len() as f64).sqrt() } else { 0.0 };
+    let flags: Vec<bool> = mins.iter().map(|m| minute_score(m, p) > 0.5).collect();
+    let alt = if flags.len() > 2 { flags.windows(2).filter(|w| w[0] != w[1]).count() as f64 / (flags.len() - 1) as f64 } else { 0.0 };
+    let imu_cov = (imu.len() as f64 / IMU_FS / (end - start).max(1) as f64).min(1.0);
+    let gyro: Vec<f64> = (0..imu.len()).step_by(10).map(|i| gyro_mag(imu, i)).collect();
+    let set_time: f64 = sets.iter().map(|s| s.end - s.start).sum();
+    let per_time: f64 = sets.iter().filter(|s| s.periodic).map(|s| s.end - s.start).sum();
+    let mut f = BTreeMap::new();
+    f.insert("dur_min", round(dur_min, 1));
+    f.insert("hrr_mean", round(mean(&hrr).unwrap_or(0.0), 3));
+    f.insert("hrr_p90", round(percentile(&hrr, 90.0).unwrap_or(0.0), 3));
+    f.insert("steps_pm", round(mean(&base.iter().map(|m| m.steps).collect::<Vec<_>>()).unwrap_or(0.0), 1));
+    f.insert("cad_spm", round(median(&base.iter().filter_map(|m| m.cad_spm).collect::<Vec<_>>()).unwrap_or(0.0), 0));
+    f.insert("run_frac", round(mean(&base.iter().map(|m| m.run_frac).collect::<Vec<_>>()).unwrap_or(0.0), 3));
+    f.insert("walk_frac", round(mean(&base.iter().map(|m| m.walk_frac).collect::<Vec<_>>()).unwrap_or(0.0), 3));
+    f.insert("dyn_mean", round(dyn_mean, 4));
+    f.insert("dyn_cv", round(if dyn_mean > 0.0 { dyn_sd / dyn_mean } else { 0.0 }, 3));
+    f.insert("grav_var", round(mean(&base.iter().map(|m| m.grav_var).collect::<Vec<_>>()).unwrap_or(0.0), 2));
+    f.insert("active_alt", round(alt, 3));
+    f.insert("imu_cov", round(imu_cov, 3));
+    let imu_min = (imu.len() as f64 / IMU_FS / 60.0).max(1e-6);
+    f.insert("strokes_pm", if imu.is_empty() { 0.0 } else { round(strokes_n as f64 / imu_min, 2) });
+    f.insert("sets_per_10min", if imu.is_empty() { 0.0 } else { round(sets.iter().filter(|s| s.periodic).count() as f64 / imu_min * 10.0, 2) });
+    f.insert("periodic_frac", if set_time > 0.0 { round(per_time / set_time, 3) } else { 0.0 });
+    f.insert("gyro_p95", round(percentile(&gyro, 95.0).unwrap_or(0.0), 0));
+    f
+}
+
+fn exercise_library(conn: &Connection) -> GooseResult<Vec<(String, Vec<f64>)>> {
+    let mut st = conn.prepare("SELECT exercise_label, detail_json FROM sport_segments WHERE kind = 'set' AND exercise_label IS NOT NULL")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (label, d) = row?;
+        let f: Option<Vec<f64>> = d.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| serde_json::from_value(v["features"].clone()).ok());
+        if let Some(f) = f {
+            out.push((label, f));
+        }
+    }
+    Ok(out)
+}
+
+fn nearest_exercise(lib: &[(String, Vec<f64>)], f: &[f64]) -> Option<(String, f64)> {
+    lib.iter()
+        .filter(|(_, g)| g.len() == f.len())
+        .map(|(l, g)| (l.clone(), g.iter().zip(f).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(l, d)| (l, round((-2.0 * d).exp(), 3)))
+}
+
+/// Full analysis of one session: features, classification, segments. Human-labelled segments are
+/// never replaced; unlabelled ones are re-derived.
+pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseResult<Value> {
+    let (start, end, source): (i64, Option<i64>, String) =
+        conn.query_row("SELECT start_ts, end_ts, source FROM sport_sessions WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let now = now_s();
+    let end = end.unwrap_or(now);
+    let p = profile(conn, now, age)?;
+    let imu = load_imu(conn, (start - PRE_BUFFER_S) as f64, (end + POST_BUFFER_S) as f64)?;
+    let secs = load_secs(conn, start, end + 1)?;
+    let mins = minutes(&secs, &imu_dyn_per_minute(&imu));
+    let st = strokes(&imu);
+    let sets = sets_and_reps(&imu);
+    let f = session_features(&mins, &p, &imu, &sets, st.len(), start, end);
+    let (model_version, probs) = match active_model(conn)? {
+        Some((v, params_json)) => match model_predict(&params_json, &f) {
+            Some(pr) => (v, pr),
+            None => (RULES_MODEL.to_string(), rules_v1(&f)),
+        },
+        None => (RULES_MODEL.to_string(), rules_v1(&f)),
+    };
+    let best = probs.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(3);
+    let predicted = CLASSES[best];
+    let hr: Vec<f64> = mins.iter().filter_map(|m| m.hr).collect();
+    let summary = json!({
+        "duration_min": f["dur_min"], "hr_mean": mean(&hr).map(|v| round(v, 0)), "hr_max": hr.iter().copied().fold(None, |a: Option<f64>, b| Some(a.map_or(b, |x| x.max(b)))),
+        "imu_minutes": round(imu.len() as f64 / IMU_FS / 60.0, 1), "strokes": st.len(),
+        "sets": sets.iter().filter(|s| s.periodic).count(), "reps": sets.iter().filter(|s| s.periodic).map(|s| s.reps).sum::<usize>(),
+        "cadence_spm": f["cad_spm"], "profile": {"rest_hr": round(p.rest, 0), "hr_max": round(p.hrmax, 0)},
+        "hr_series": mins.iter().filter_map(|m| m.hr.map(|h| json!([m.t, round(h, 0)]))).collect::<Vec<_>>(),
+    });
+    let feats: Value = json!(FEATURES.iter().map(|k| (k.to_string(), json!(f.get(k).copied().unwrap_or(0.0)))).collect::<serde_json::Map<_, _>>());
+    conn.execute(
+        "UPDATE sport_sessions SET predicted_type = ?2, probs_json = ?3, confidence = ?4, features_json = ?5, summary_json = ?6, model_version = ?7, engine_version = ?8, analyzed_at = ?9, updated_at = ?9 WHERE id = ?1",
+        params![id, predicted, json!(CLASSES.iter().zip(&probs).map(|(c, p)| (c.to_string(), json!(round(*p, 3)))).collect::<serde_json::Map<_, _>>()).to_string(), round(probs[best], 3), feats.to_string(), summary.to_string(), model_version, ENGINE_VERSION, now],
+    )?;
+    let labelled: i64 = conn.query_row("SELECT COUNT(*) FROM sport_segments WHERE session_id = ?1 AND label_status != 'pending'", [id], |r| r.get(0))?;
+    if labelled == 0 {
+        conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [id])?;
+        let lib = exercise_library(conn)?;
+        let label_type: Option<String> = conn.query_row("SELECT label_type FROM sport_sessions WHERE id = ?1", [id], |r| r.get(0))?;
+        let kind_of = label_type.as_deref().unwrap_or(predicted);
+        let mut ins = conn.prepare("INSERT INTO sport_segments (id, session_id, kind, start_ts, end_ts, reps_pred, exercise_pred, exercise_conf, confidence, detail_json, engine_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
+        if kind_of == "musculation" || (kind_of == "autre" && !sets.is_empty() && source == "manual") {
+            for (k, s) in sets.iter().enumerate() {
+                let ex = if s.periodic { nearest_exercise(&lib, &s.features) } else { None };
+                let detail = json!({"periodic": s.periodic, "period_s": s.period_s, "up_s": s.up_s, "down_s": s.down_s, "hold_s": s.hold_s, "features": s.features});
+                ins.execute(params![format!("{id}-s{k}"), id, if s.periodic { "set" } else { "effort" }, s.start, s.end, s.periodic.then_some(s.reps as i64), ex.as_ref().filter(|e| e.1 >= 0.5).map(|e| e.0.clone()), ex.as_ref().map(|e| e.1), s.confidence, detail.to_string(), ENGINE_VERSION])?;
+            }
+        } else if kind_of == "tennis" && !st.is_empty() {
+            // rallies / games: strokes closer than 25 s belong to the same exchange block
+            let mut blocks: Vec<(f64, f64, usize)> = Vec::new();
+            for s in &st {
+                match blocks.last_mut() {
+                    Some(b) if s.0 - b.1 < 25.0 => {
+                        b.1 = s.0;
+                        b.2 += 1;
+                    }
+                    _ => blocks.push((s.0, s.0, 1)),
+                }
+            }
+            for (k, b) in blocks.iter().enumerate() {
+                let peak: Vec<f64> = st.iter().filter(|s| s.0 >= b.0 && s.0 <= b.1).map(|s| s.1).collect();
+                ins.execute(params![format!("{id}-r{k}"), id, "exchange", b.0, b.1, b.2 as i64, Option::<String>::None, Option::<f64>::None, 1.0, json!({"strokes": b.2, "gyro_peak_median_dps": median(&peak).map(|v| round(v, 0))}).to_string(), ENGINE_VERSION])?;
+            }
+        }
+    }
+    Ok(json!({"id": id, "predicted_type": predicted, "probs": CLASSES.iter().zip(&probs).map(|(c, p)| (c.to_string(), json!(round(*p, 3)))).collect::<serde_json::Map<_, _>>(), "model_version": model_version, "features": feats, "summary": summary}))
+}
+
+// ------------------------------------------------------------------ online engine
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateArgs {
+    pub database_path: String,
+    #[serde(default)]
+    pub now_unix: Option<i64>,
+    /// live packet-40 seconds since the last call: [ts, hr, [rr_ms...]]
+    #[serde(default)]
+    pub live: Vec<(i64, f64, Vec<f64>)>,
+    /// live R21 frames since the last call: [arrival_unix, frame_hex]
+    #[serde(default)]
+    pub imu: Vec<(f64, String)>,
+    #[serde(default)]
+    pub age: Option<f64>,
+    /// streams currently on (as Swift believes): echoed into the acquisition log
+    #[serde(default)]
+    pub capturing: bool,
+    /// detection paused (smart wake owns the streams, user disabled it)
+    #[serde(default)]
+    pub paused: bool,
+}
+
+fn store_live(conn: &Connection, args: &UpdateArgs, arrival: f64) -> GooseResult<(usize, usize)> {
+    let tx = conn.unchecked_transaction()?;
+    let (mut nl, mut ni) = (0, 0);
+    {
+        let mut ins = tx.prepare_cached("INSERT OR REPLACE INTO sport_live (ts, hr, rr, arrival) VALUES (?1, ?2, ?3, ?4)")?;
+        for (ts, hr, rr) in &args.live {
+            ins.execute(params![ts, (*hr > 0.0).then_some(*hr), rr.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join(","), arrival])?;
+            nl += 1;
+        }
+        let mut imu = tx.prepare_cached("INSERT OR REPLACE INTO sport_imu (ts, arrival, frame) VALUES (?1, ?2, ?3)")?;
+        for (arr, hex_frame) in &args.imu {
+            let Ok(frame) = hex::decode(hex_frame.trim()) else { continue };
+            let Ok(parsed) = crate::protocol::parse_frame(crate::protocol::DeviceType::Goose, &frame) else { continue };
+            if !(parsed.header_crc_valid && parsed.payload_crc_valid) || frame.len() != crate::whoop5_records::R21_FRAME_LEN {
+                continue;
+            }
+            let ts = f64::from(u32::from_le_bytes([frame[15], frame[16], frame[17], frame[18]])) + f64::from(u16::from_le_bytes([frame[19], frame[20]])) / 32768.0;
+            imu.execute(params![ts, arr, frame])?;
+            ni += 1;
+        }
+    }
+    tx.commit()?;
+    Ok((nl, ni))
+}
+
+fn new_session(conn: &Connection, start: i64, source: &str, label: Option<&str>, now: i64) -> GooseResult<String> {
+    let id = format!("sp-{start}");
+    conn.execute(
+        "INSERT OR IGNORE INTO sport_sessions (id, start_ts, status, source, engine_version, label_type, label_status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?7)",
+        params![id, start, source, ENGINE_VERSION, label, if label.is_some() { "manual" } else { "pending" }, now],
+    )?;
+    Ok(id)
+}
+
+fn log_acq(conn: &Connection, session: Option<&str>, on: bool, now: i64, reason: &str) -> GooseResult<()> {
+    if on {
+        conn.execute("INSERT INTO sport_acquisition (session_id, stream, start_ts, reason) VALUES (?1, 'imu+hr', ?2, ?3)", params![session, now, reason])?;
+    } else {
+        conn.execute("UPDATE sport_acquisition SET end_ts = ?1 WHERE end_ts IS NULL", [now])?;
+    }
+    Ok(())
+}
+
+/// One online step. Returns what the phone should do: streams on/off, sync interval, UI state.
+pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
+    let t0 = std::time::Instant::now();
+    let conn = Connection::open(&args.database_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    ensure_tables(&conn)?;
+    let now = args.now_unix.unwrap_or_else(now_s);
+    let stored = store_live(&conn, args, now as f64)?;
+    let _ = crate::whoop5_store::ingest(&conn);
+    let mut st = state_get(&conn, "engine")?.unwrap_or_else(|| json!({"state": "idle"}));
+    let state = st["state"].as_str().unwrap_or("idle").to_string();
+    let p = profile(&conn, now, args.age)?;
+    let from = now - 40 * 60;
+    let imu = load_imu(&conn, from as f64, (now + 1) as f64)?;
+    let secs = load_secs(&conn, from, now + 1)?;
+    let mins = minutes(&secs, &imu_dyn_per_minute(&imu));
+    let scores: Vec<(i64, f64)> = mins.iter().map(|m| (m.t, minute_score(m, &p))).collect();
+    let data_until = secs.keys().next_back().copied().unwrap_or(0);
+    let recent = |k: usize| -> Vec<f64> { scores.iter().rev().take(k).map(|s| s.1).collect() };
+    let active_recent = |k: usize| recent(k).iter().filter(|v| **v > 0.5).count();
+    let manual = st["manual"].as_bool().unwrap_or(false);
+    let session_id = st["session_id"].as_str().map(String::from);
+    let mut next = state.clone();
+    let mut event: Option<&str> = None;
+    if args.paused && !manual {
+        if state != "idle" && state != "active" && state != "ending" {
+            next = "idle".into();
+        }
+    } else {
+        match state.as_str() {
+            "idle" => {
+                // speculative capture on the first sign (HR reserve or sustained motion)
+                if recent(3).iter().any(|v| *v > 0.35) && data_until > now - 15 * 60 {
+                    next = "watch".into();
+                    st["watch_since"] = json!(now);
+                    event = Some("watch");
+                }
+            }
+            "watch" => {
+                if active_recent(6) >= 4 {
+                    // backdate to the first active minute of this run (gaps <= 2 min tolerated)
+                    let mut start = scores.last().map(|s| s.0).unwrap_or(now);
+                    let mut gap = 0;
+                    for s in scores.iter().rev() {
+                        if s.1 > 0.5 {
+                            start = s.0;
+                            gap = 0;
+                        } else {
+                            gap += 1;
+                            if gap > 2 {
+                                break;
+                            }
+                        }
+                    }
+                    let id = new_session(&conn, start - PRE_BUFFER_S, "auto", None, now)?;
+                    st["session_id"] = json!(id);
+                    st["active_start"] = json!(start);
+                    next = "active".into();
+                    event = Some("start");
+                } else if now - st["watch_since"].as_i64().unwrap_or(now) > 10 * 60 {
+                    next = "idle".into();
+                    event = Some("watch_dropped");
+                }
+            }
+            "active" | "ending" => {
+                let last_active = scores.iter().rev().find(|s| s.1 > 0.5).map(|s| s.0).unwrap_or(st["last_active"].as_i64().unwrap_or(now));
+                st["last_active"] = json!(last_active.max(st["last_active"].as_i64().unwrap_or(0)));
+                let quiet = now - st["last_active"].as_i64().unwrap_or(now) - 60;
+                let too_long = now - st["active_start"].as_i64().unwrap_or(now) > 4 * 3600;
+                if manual {
+                    next = "active".into();
+                    if too_long {
+                        next = "ended".into();
+                    }
+                } else if quiet >= 10 * 60 || too_long {
+                    next = "ended".into();
+                } else if quiet >= 6 * 60 {
+                    next = "ending".into();
+                } else {
+                    next = "active".into();
+                }
+                if next == "ended" {
+                    let end = st["last_active"].as_i64().unwrap_or(now) + 60 + POST_BUFFER_S;
+                    if let Some(id) = &session_id {
+                        conn.execute("UPDATE sport_sessions SET end_ts = ?2, status = 'ended', updated_at = ?3 WHERE id = ?1", params![id, end.min(now), now])?;
+                    }
+                    event = Some("end");
+                }
+            }
+            _ => next = "idle".into(),
+        }
+    }
+    let mut analysis = Value::Null;
+    if next == "ended" {
+        if let Some(id) = &session_id {
+            // discard bouts too short to be a session (stairs, a sprint to the bus)
+            let (s, e): (i64, i64) = conn.query_row("SELECT start_ts, COALESCE(end_ts, ?2) FROM sport_sessions WHERE id = ?1", params![id, now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if !manual && e - s < 8 * 60 + PRE_BUFFER_S + POST_BUFFER_S {
+                conn.execute("UPDATE sport_sessions SET status = 'discarded', label_status = 'auto_discarded', updated_at = ?2 WHERE id = ?1", params![id, now])?;
+            } else {
+                analysis = analyze_session(&conn, id, args.age)?;
+            }
+        }
+        st = json!({"state": "idle"});
+        next = "idle".into();
+    }
+    if next == "watch" && state == "idle" {
+        log_acq(&conn, None, true, now, "watch")?;
+    }
+    if next == "idle" && state != "idle" {
+        log_acq(&conn, None, false, now, "stop")?;
+    }
+    st["state"] = json!(next);
+    state_set(&conn, "engine", &st)?;
+    let want = matches!(next.as_str(), "watch" | "active" | "ending");
+    let live_session = st["session_id"].as_str().map(String::from);
+    let current = match &live_session {
+        Some(id) if next != "idle" => {
+            let (start, label): (i64, Option<String>) = conn.query_row("SELECT start_ts, label_type FROM sport_sessions WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            // a cheap live guess from the last 10 minutes
+            let recent_imu = load_imu(&conn, (now - 600) as f64, (now + 1) as f64)?;
+            let rs = sets_and_reps(&recent_imu);
+            let rk = strokes(&recent_imu);
+            let f = session_features(&mins, &p, &recent_imu, &rs, rk.len(), start.max(now - 600), now);
+            let pr = rules_v1(&f);
+            let b = pr.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(3);
+            json!({"id": id, "start_ts": start, "label_type": label, "guess": CLASSES[b], "guess_p": round(pr[b], 2), "reps_last10": rs.iter().filter(|s| s.periodic).map(|s| s.reps).sum::<usize>(), "strokes_last10": rk.len()})
+        }
+        _ => Value::Null,
+    };
+    Ok(json!({
+        "state": next, "event": event, "want_streams": want, "sync_interval_s": if want { 120 } else { 300 },
+        "data_until": data_until, "lag_s": now - data_until, "minute_scores": scores.iter().rev().take(10).map(|s| json!([s.0, round(s.1, 2)])).collect::<Vec<_>>(),
+        "current": current, "analysis": analysis, "stored": {"live": stored.0, "imu": stored.1},
+        "profile": {"rest": round(p.rest, 0), "hrmax": round(p.hrmax, 0)}, "engine_version": ENGINE_VERSION,
+        "latency_ms": round(t0.elapsed().as_secs_f64() * 1000.0, 1),
+    }))
+}
+
+// ------------------------------------------------------------------ manual sessions, labels, listing, dataset
+
+#[derive(Debug, Deserialize)]
+pub struct ManualArgs {
+    pub database_path: String,
+    /// "start" or "stop"
+    pub action: String,
+    #[serde(default)]
+    pub sport: Option<String>,
+    #[serde(default)]
+    pub now_unix: Option<i64>,
+    #[serde(default)]
+    pub age: Option<f64>,
+}
+
+pub fn manual(args: &ManualArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    let now = args.now_unix.unwrap_or_else(now_s);
+    let mut st = state_get(&conn, "engine")?.unwrap_or_else(|| json!({"state": "idle"}));
+    match args.action.as_str() {
+        "start" => {
+            let sport = args.sport.clone().unwrap_or_else(|| "autre".into());
+            let id = match st["session_id"].as_str().filter(|_| st["state"] != "idle") {
+                // an auto session already running becomes the labelled one
+                Some(id) => {
+                    conn.execute("UPDATE sport_sessions SET label_type = ?2, label_status = 'manual', source = 'auto+manual', updated_at = ?3 WHERE id = ?1", params![id, sport, now])?;
+                    annotate_row(&conn, "session", id, "type", None, Some(&sport), "manual_start")?;
+                    id.to_string()
+                }
+                None => {
+                    let id = new_session(&conn, now, "manual", Some(&sport), now)?;
+                    annotate_row(&conn, "session", &id, "type", None, Some(&sport), "manual_start")?;
+                    log_acq(&conn, Some(&id), true, now, "manual")?;
+                    id
+                }
+            };
+            st = json!({"state": "active", "session_id": id, "active_start": now, "last_active": now, "manual": true});
+            state_set(&conn, "engine", &st)?;
+            Ok(json!({"state": "active", "session_id": id, "want_streams": true}))
+        }
+        "stop" => {
+            let Some(id) = st["session_id"].as_str().map(String::from) else { return Ok(json!({"state": "idle"})) };
+            conn.execute("UPDATE sport_sessions SET end_ts = ?2, status = 'ended', updated_at = ?2 WHERE id = ?1", params![id, now])?;
+            log_acq(&conn, Some(&id), false, now, "manual_stop")?;
+            state_set(&conn, "engine", &json!({"state": "idle", "cooldown_until": now + 300}))?;
+            let a = analyze_session(&conn, &id, args.age)?;
+            Ok(json!({"state": "idle", "session_id": id, "want_streams": false, "analysis": a}))
+        }
+        other => Err(crate::GooseError::Message(format!("unknown action {other}"))),
+    }
+}
+
+fn annotate_row(conn: &Connection, target: &str, id: &str, field: &str, old: Option<&str>, new: Option<&str>, source: &str) -> GooseResult<()> {
+    let (pred, conf, mv): (Option<String>, Option<f64>, Option<String>) = if target == "session" {
+        conn.query_row("SELECT predicted_type, confidence, model_version FROM sport_sessions WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or((None, None, None))
+    } else {
+        conn.query_row("SELECT CASE WHEN ?2 = 'reps' THEN CAST(reps_pred AS TEXT) ELSE exercise_pred END, confidence, engine_version FROM sport_segments WHERE id = ?1", params![id, field], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or((None, None, None))
+    };
+    conn.execute(
+        "INSERT INTO sport_annotations (ts, target, target_id, field, old_value, new_value, predicted_value, confidence, model_version, engine_version, source) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![now_s(), target, id, field, old, new, pred, conf, mv, ENGINE_VERSION, source],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnnotateArgs {
+    pub database_path: String,
+    /// "session" or "segment"
+    pub target: String,
+    pub id: String,
+    /// session: "confirm" | "type" | "reject"; segment: "confirm" | "reps" | "exercise" | "reject" | "concentric"
+    pub field: String,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+pub fn annotate(args: &AnnotateArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    let now = now_s();
+    let v = args.value.as_deref();
+    match (args.target.as_str(), args.field.as_str()) {
+        ("session", "confirm") => {
+            let old: Option<String> = conn.query_row("SELECT label_type FROM sport_sessions WHERE id = ?1", [&args.id], |r| r.get(0))?;
+            let pred: Option<String> = conn.query_row("SELECT predicted_type FROM sport_sessions WHERE id = ?1", [&args.id], |r| r.get(0))?;
+            let label = old.clone().or(pred);
+            conn.execute("UPDATE sport_sessions SET label_type = ?2, label_status = 'confirmed', updated_at = ?3 WHERE id = ?1", params![args.id, label, now])?;
+            annotate_row(&conn, "session", &args.id, "type", old.as_deref(), label.as_deref(), "confirm")?;
+        }
+        ("session", "type") => {
+            let old: Option<String> = conn.query_row("SELECT label_type FROM sport_sessions WHERE id = ?1", [&args.id], |r| r.get(0))?;
+            conn.execute("UPDATE sport_sessions SET label_type = ?2, label_status = 'corrected', updated_at = ?3 WHERE id = ?1", params![args.id, v, now])?;
+            annotate_row(&conn, "session", &args.id, "type", old.as_deref(), v, "correct")?;
+            // segments depend on the type: re-derive them unless some were labelled already
+            analyze_session(&conn, &args.id, None)?;
+        }
+        ("session", "reject") => {
+            conn.execute("UPDATE sport_sessions SET label_type = 'aucune', label_status = 'rejected', updated_at = ?2 WHERE id = ?1", params![args.id, now])?;
+            annotate_row(&conn, "session", &args.id, "type", None, Some("aucune"), "reject")?;
+        }
+        ("segment", "confirm") => {
+            conn.execute("UPDATE sport_segments SET reps_label = COALESCE(reps_label, reps_pred), exercise_label = COALESCE(exercise_label, exercise_pred), label_status = 'confirmed' WHERE id = ?1", [&args.id])?;
+            annotate_row(&conn, "segment", &args.id, "confirm", None, Some("ok"), "confirm")?;
+        }
+        ("segment", "reps") => {
+            let n: Option<i64> = v.and_then(|s| s.parse().ok());
+            conn.execute("UPDATE sport_segments SET reps_label = ?2, label_status = 'corrected' WHERE id = ?1", params![args.id, n])?;
+            annotate_row(&conn, "segment", &args.id, "reps", None, v, "correct")?;
+        }
+        ("segment", "exercise") => {
+            conn.execute("UPDATE sport_segments SET exercise_label = ?2, label_status = 'corrected' WHERE id = ?1", params![args.id, v])?;
+            annotate_row(&conn, "segment", &args.id, "exercise", None, v, "correct")?;
+        }
+        ("segment", "concentric") => {
+            // "up" (default) or "down": which vertical direction is the concentric phase
+            let d: Option<String> = conn.query_row("SELECT detail_json FROM sport_segments WHERE id = ?1", [&args.id], |r| r.get(0))?;
+            let mut d: Value = d.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({}));
+            d["concentric"] = json!(v.unwrap_or("up"));
+            conn.execute("UPDATE sport_segments SET detail_json = ?2 WHERE id = ?1", params![args.id, d.to_string()])?;
+            annotate_row(&conn, "segment", &args.id, "concentric", None, v, "correct")?;
+        }
+        ("segment", "reject") => {
+            conn.execute("UPDATE sport_segments SET label_status = 'rejected' WHERE id = ?1", [&args.id])?;
+            annotate_row(&conn, "segment", &args.id, "reject", None, Some("rejected"), "reject")?;
+        }
+        (t, f) => return Err(crate::GooseError::Message(format!("unknown annotation {t}.{f}"))),
+    }
+    Ok(json!({"ok": true}))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListArgs {
+    pub database_path: String,
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+fn row_session(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let parse = |s: Option<String>| s.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null);
+    Ok(json!({
+        "id": r.get::<_, String>(0)?, "start_ts": r.get::<_, i64>(1)?, "end_ts": r.get::<_, Option<i64>>(2)?, "status": r.get::<_, String>(3)?,
+        "source": r.get::<_, String>(4)?, "predicted_type": r.get::<_, Option<String>>(5)?, "probs": parse(r.get(6)?), "confidence": r.get::<_, Option<f64>>(7)?,
+        "summary": parse(r.get(8)?), "model_version": r.get::<_, Option<String>>(9)?, "label_type": r.get::<_, Option<String>>(10)?, "label_status": r.get::<_, String>(11)?,
+    }))
+}
+
+pub fn list(args: &ListArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    let since = now_s() - args.days.unwrap_or(30) * 86_400;
+    let mut st = conn.prepare(
+        "SELECT id, start_ts, end_ts, status, source, predicted_type, probs_json, confidence, summary_json, model_version, label_type, label_status FROM sport_sessions WHERE start_ts >= ?1 AND status != 'discarded' ORDER BY start_ts DESC",
+    )?;
+    let mut sessions: Vec<Value> = st.query_map([since], row_session)?.collect::<Result<_, _>>()?;
+    let mut seg = conn.prepare("SELECT id, kind, start_ts, end_ts, reps_pred, reps_label, exercise_pred, exercise_conf, exercise_label, confidence, detail_json, label_status FROM sport_segments WHERE session_id = ?1 ORDER BY start_ts")?;
+    for s in sessions.iter_mut() {
+        let id = s["id"].as_str().unwrap_or("").to_string();
+        let segs: Vec<Value> = seg
+            .query_map([&id], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "start_ts": r.get::<_, f64>(2)?, "end_ts": r.get::<_, f64>(3)?,
+                    "reps_pred": r.get::<_, Option<i64>>(4)?, "reps_label": r.get::<_, Option<i64>>(5)?, "exercise_pred": r.get::<_, Option<String>>(6)?,
+                    "exercise_conf": r.get::<_, Option<f64>>(7)?, "exercise_label": r.get::<_, Option<String>>(8)?, "confidence": r.get::<_, Option<f64>>(9)?,
+                    "detail": r.get::<_, Option<String>>(10)?.and_then(|v| serde_json::from_str::<Value>(&v).ok()).unwrap_or(Value::Null), "label_status": r.get::<_, String>(11)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        s["segments"] = json!(segs);
+    }
+    // review queue: unlabelled finished sessions, least confident first
+    let mut queue: Vec<&Value> = sessions.iter().filter(|s| s["label_status"] == "pending" && s["status"] == "ended").collect();
+    queue.sort_by(|a, b| a["confidence"].as_f64().unwrap_or(0.0).total_cmp(&b["confidence"].as_f64().unwrap_or(0.0)));
+    let queue_ids: Vec<Value> = queue.iter().map(|s| s["id"].clone()).collect();
+    let exercises: Vec<String> = conn.prepare("SELECT exercise_label FROM sport_segments WHERE exercise_label IS NOT NULL GROUP BY exercise_label ORDER BY COUNT(*) DESC")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let engine = state_get(&conn, "engine")?.unwrap_or(Value::Null);
+    let counts: Value = json!({
+        "labelled_sessions": conn.query_row("SELECT COUNT(*) FROM sport_sessions WHERE label_status IN ('confirmed','corrected','manual','rejected')", [], |r| r.get::<_, i64>(0))?,
+        "labelled_sets": conn.query_row("SELECT COUNT(*) FROM sport_segments WHERE label_status IN ('confirmed','corrected')", [], |r| r.get::<_, i64>(0))?,
+        "annotations": conn.query_row("SELECT COUNT(*) FROM sport_annotations", [], |r| r.get::<_, i64>(0))?,
+    });
+    Ok(json!({"sessions": sessions, "review_queue": queue_ids, "exercises": exercises, "engine": engine, "dataset": counts, "engine_version": ENGINE_VERSION}))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DatasetArgs {
+    pub database_path: String,
+    pub output_dir: String,
+}
+
+/// Personal dataset: one folder per session (raw IMU frames + decoded samples, R18, live HR,
+/// predictions, labels) and global JSONL tables (sessions, segments, annotations, models).
+pub fn export_dataset(args: &DatasetArgs) -> GooseResult<Value> {
+    use std::io::Write;
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    let root = std::path::Path::new(&args.output_dir);
+    std::fs::create_dir_all(root)?;
+    let dump = |sql: &str, name: &str| -> GooseResult<usize> {
+        let mut st = conn.prepare(sql)?;
+        let cols: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+        let mut f = std::io::BufWriter::new(std::fs::File::create(root.join(name))?);
+        let mut n = 0;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let mut o = serde_json::Map::new();
+            for (i, c) in cols.iter().enumerate() {
+                let v: rusqlite::types::Value = r.get(i)?;
+                o.insert(c.clone(), match v {
+                    rusqlite::types::Value::Null => Value::Null,
+                    rusqlite::types::Value::Integer(x) => json!(x),
+                    rusqlite::types::Value::Real(x) => json!(x),
+                    rusqlite::types::Value::Text(s) => serde_json::from_str::<Value>(&s).ok().filter(|_| c.ends_with("_json")).unwrap_or(json!(s)),
+                    rusqlite::types::Value::Blob(b) => json!(hex::encode(b)),
+                });
+            }
+            writeln!(f, "{}", Value::Object(o))?;
+            n += 1;
+        }
+        Ok(n)
+    };
+    let mut counts = serde_json::Map::new();
+    counts.insert("sessions".into(), json!(dump("SELECT * FROM sport_sessions ORDER BY start_ts", "sessions.jsonl")?));
+    counts.insert("segments".into(), json!(dump("SELECT * FROM sport_segments ORDER BY start_ts", "segments.jsonl")?));
+    counts.insert("annotations".into(), json!(dump("SELECT * FROM sport_annotations ORDER BY id", "annotations.jsonl")?));
+    counts.insert("models".into(), json!(dump("SELECT * FROM sport_models ORDER BY created_at", "models.jsonl")?));
+    counts.insert("acquisition".into(), json!(dump("SELECT * FROM sport_acquisition ORDER BY id", "acquisition.jsonl")?));
+    let sessions: Vec<(String, i64, i64)> = conn
+        .prepare("SELECT id, start_ts, COALESCE(end_ts, start_ts) FROM sport_sessions WHERE status != 'discarded'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut exported = 0;
+    for (id, s, e) in &sessions {
+        let dir = root.join("sessions").join(id);
+        if dir.join("imu.csv").exists() {
+            continue; // immutable once written
+        }
+        std::fs::create_dir_all(&dir)?;
+        let (a, b) = (s - PRE_BUFFER_S, e + POST_BUFFER_S);
+        let imu = load_imu(&conn, a as f64, b as f64)?;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join("imu.csv"))?);
+        writeln!(f, "t,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps")?;
+        for i in 0..imu.len() {
+            writeln!(f, "{:.3},{:.5},{:.5},{:.5},{:.3},{:.3},{:.3}", imu.t[i], imu.a[0][i], imu.a[1][i], imu.a[2][i], imu.g[0][i], imu.g[1][i], imu.g[2][i])?;
+        }
+        let mut raw = std::io::BufWriter::new(std::fs::File::create(dir.join("imu_frames.jsonl"))?);
+        let mut stf = conn.prepare("SELECT ts, arrival, frame FROM sport_imu WHERE ts >= ?1 AND ts < ?2 ORDER BY ts")?;
+        for row in stf.query_map(params![a as f64, b as f64], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, Vec<u8>>(2)?)))? {
+            let (t, arr, fr) = row?;
+            writeln!(raw, "{}", json!({"ts": t, "arrival": arr, "frame_hex": hex::encode(fr)}))?;
+        }
+        let secs = load_secs(&conn, a, b)?;
+        let mut r18 = std::io::BufWriter::new(std::fs::File::create(dir.join("r18.csv"))?);
+        writeln!(r18, "ts,hr,steps,cadence_raw,dyn_g,grav_x,grav_y,grav_z,activity,sleep")?;
+        for x in secs.values() {
+            let g = x.grav.unwrap_or([f64::NAN; 3]);
+            writeln!(r18, "{},{},{},{},{},{},{},{},{},{}", x.ts, x.hr.map(|v| v.to_string()).unwrap_or_default(), x.steps.map(|v| v.to_string()).unwrap_or_default(), x.cadence_raw.map(|v| v.to_string()).unwrap_or_default(), x.dyn_g.map(|v| format!("{v:.4}")).unwrap_or_default(), g[0], g[1], g[2], x.activity.clone().unwrap_or_default(), x.sleep as u8)?;
+        }
+        let mut lh = std::io::BufWriter::new(std::fs::File::create(dir.join("live_hr.csv"))?);
+        writeln!(lh, "ts,hr,rr_ms,arrival")?;
+        let mut stl = conn.prepare("SELECT ts, hr, rr, arrival FROM sport_live WHERE ts >= ?1 AND ts < ?2 ORDER BY ts")?;
+        for row in stl.query_map(params![a, b], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<f64>>(3)?)))? {
+            let (t, h, rr, arr) = row?;
+            writeln!(lh, "{t},{},\"{rr}\",{}", h.map(|v| v.to_string()).unwrap_or_default(), arr.map(|v| v.to_string()).unwrap_or_default())?;
+        }
+        exported += 1;
+    }
+    std::fs::write(root.join("README.json"), json!({
+        "engine_version": ENGINE_VERSION, "classes": CLASSES, "features": FEATURES,
+        "time": "unix seconds (strap clock); imu t = record ts + sample/100 Hz; arrival = phone clock",
+        "units": {"imu": "accel g (4096 LSB/g, +-8 g), gyro deg/s (+-2000)", "hr": "bpm", "rr": "ms"},
+        "buffers_s": {"pre": PRE_BUFFER_S, "post": POST_BUFFER_S},
+        "labels": "sessions.label_type / label_status; segments.reps_label / exercise_label; full history in annotations.jsonl",
+    }).to_string())?;
+    counts.insert("session_folders_written".into(), json!(exported));
+    Ok(Value::Object(counts))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InstallModelArgs {
+    pub database_path: String,
+    pub version: String,
+    pub kind: String,
+    pub params: Value,
+    #[serde(default)]
+    pub metrics: Option<Value>,
+}
+
+pub fn install_model(args: &InstallModelArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    conn.execute("UPDATE sport_models SET active = 0", [])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sport_models (version, kind, created_at, active, params_json, metrics_json) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+        params![args.version, args.kind, now_s(), args.params.to_string(), args.metrics.as_ref().map(|m| m.to_string())],
+    )?;
+    Ok(json!({"ok": true, "active": args.version}))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnalyzeArgs {
+    pub database_path: String,
+    pub id: String,
+    #[serde(default)]
+    pub age: Option<f64>,
+}
+
+pub fn analyze(args: &AnalyzeArgs) -> GooseResult<Value> {
+    let conn = Connection::open(&args.database_path)?;
+    ensure_tables(&conn)?;
+    analyze_session(&conn, &args.id, args.age)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    fn imu_from(f: impl Fn(f64) -> ([f64; 3], [f64; 3]), secs: f64) -> Imu {
+        let mut imu = Imu::default();
+        let n = (secs * IMU_FS) as usize;
+        for i in 0..n {
+            let t = 1_800_000_000.0 + i as f64 / IMU_FS;
+            let (a, g) = f(i as f64 / IMU_FS);
+            imu.t.push(t);
+            for k in 0..3 {
+                imu.a[k].push(a[k]);
+                imu.g[k].push(g[k]);
+            }
+        }
+        imu
+    }
+
+    #[test]
+    fn counts_reps_in_sets_and_finds_rests() {
+        // 3 sets of 10 reps at 0.4 Hz (2.5 s / rep, vertical), 60 s rest between sets
+        let imu = imu_from(
+            |t| {
+                let in_set = (t % 85.0) < 25.0 && t < 255.0;
+                let v = if in_set { 0.25 * (2.0 * PI * 0.4 * (t % 85.0)).sin() } else { 0.0 };
+                let w = if in_set { 60.0 * (2.0 * PI * 0.4 * (t % 85.0)).cos() } else { 0.3 };
+                ([0.0, 0.0, 1.0 + v], [w, 0.0, 0.0])
+            },
+            260.0,
+        );
+        let sets = sets_and_reps(&imu);
+        let per: Vec<&SetResult> = sets.iter().filter(|s| s.periodic).collect();
+        assert_eq!(per.len(), 3, "{sets:?}");
+        for s in per {
+            assert!((9..=11).contains(&s.reps), "{s:?}");
+            assert!((s.period_s.unwrap() - 2.5).abs() < 0.3);
+            assert!(s.up_s.unwrap() > 0.5 && s.down_s.unwrap() > 0.5);
+        }
+        assert!(strokes(&imu).is_empty());
+    }
+
+    #[test]
+    fn detects_tennis_strokes() {
+        // a stroke every 4 s: 30 ms burst of 900 deg/s with a 4 g impact
+        let imu = imu_from(
+            |t| {
+                let ph = t % 4.0;
+                if (1.0..1.03).contains(&ph) { ([4.0, 0.5, 1.0], [900.0, 100.0, 0.0]) } else { ([0.0, 0.0, 1.0], [5.0, 0.0, 0.0]) }
+            },
+            60.0,
+        );
+        let s = strokes(&imu);
+        assert!((14..=16).contains(&s.len()), "{}", s.len());
+    }
+
+    #[test]
+    fn minute_score_separates_effort_from_walk_and_rest() {
+        let p = Profile { rest: 50.0, hrmax: 190.0 };
+        let m = |hr: f64, steps: f64, dyn_: f64| Minute { t: 0, n: 60, hr: Some(hr), steps, dyn_mean: Some(dyn_), ..Default::default() };
+        assert!(minute_score(&m(58.0, 0.0, 0.01), &p) < 0.1);
+        assert!(minute_score(&m(85.0, 90.0, 0.08), &p) < 0.5); // walking to the bus
+        assert!(minute_score(&m(130.0, 10.0, 0.15), &p) > 0.5); // strength set
+        assert!(minute_score(&m(150.0, 165.0, 0.3), &p) > 0.9); // running
+    }
+
+    #[test]
+    fn rules_tell_running_tennis_strength_apart() {
+        let base = |pairs: &[(&'static str, f64)]| -> BTreeMap<&'static str, f64> { pairs.iter().copied().collect() };
+        let arg = |p: Vec<f64>| p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        assert_eq!(CLASSES[arg(rules_v1(&base(&[("steps_pm", 165.0), ("run_frac", 0.9), ("cad_spm", 168.0), ("imu_cov", 0.9)])))], "course");
+        assert_eq!(CLASSES[arg(rules_v1(&base(&[("steps_pm", 45.0), ("strokes_pm", 5.0), ("imu_cov", 0.9)])))], "tennis");
+        assert_eq!(CLASSES[arg(rules_v1(&base(&[("steps_pm", 5.0), ("sets_per_10min", 2.5), ("periodic_frac", 0.8), ("imu_cov", 0.9)])))], "musculation");
+    }
+
+    #[test]
+    fn online_engine_backdates_start_and_ends_after_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        ensure_tables(&conn).unwrap();
+        crate::whoop5_store::ensure_tables(&conn).unwrap();
+        let t0: i64 = 1_800_000_000;
+        // 5 min rest, 20 min running, then rest
+        let hr_at = |t: i64| if (300..1500).contains(&(t - t0)) { 150 } else { 55 };
+        for t in t0..t0 + 3000 {
+            let run = (300..1500).contains(&(t - t0));
+            conn.execute(
+                "INSERT INTO whoop5_r18 (ts, record_index, frame_id, hr, rr_ms, steps, dyn_accel_g, activity, band_state, decoder_version) VALUES (?1, ?2, 'f', ?3, '', ?4, ?5, ?6, 'wake', 'v')",
+                params![t, t - t0, hr_at(t), ((t - t0) * if run { 3 } else { 0 } / 1) % 65536, if run { 0.3 } else { 0.01 }, if run { "run" } else { "still" }],
+            ).unwrap();
+        }
+        let mut states = Vec::new();
+        for now in (t0 + 60..t0 + 3000).step_by(60) {
+            let r = update(&UpdateArgs { database_path: db.to_string_lossy().into(), now_unix: Some(now), live: vec![], imu: vec![], age: Some(30.0), capturing: false, paused: false }).unwrap();
+            states.push((now - t0, r["state"].as_str().unwrap().to_string(), r["event"].clone()));
+        }
+        let start_evt = states.iter().find(|s| s.2 == "start").expect("start");
+        assert!(start_evt.0 <= 600, "{states:?}");
+        let end_evt = states.iter().find(|s| s.2 == "end").expect("end");
+        assert!(end_evt.0 >= 1500 + 600 && end_evt.0 <= 1500 + 800, "{end_evt:?}");
+        let (s, e, ty): (i64, i64, String) = conn.query_row("SELECT start_ts, end_ts, predicted_type FROM sport_sessions", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert!((s - (t0 + 300 - PRE_BUFFER_S)).abs() <= 60, "start {}", s - t0);
+        assert!((e - (t0 + 1500 + POST_BUFFER_S)).abs() <= 120, "end {}", e - t0);
+        assert_eq!(ty, "course");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_sensor_session() {
+        // GOOSE_SENSOR_TSV = Documents/sensor_session.tsv pulled from the phone
+        let Ok(path) = std::env::var("GOOSE_SENSOR_TSV") else { return };
+        let mut by_phase: BTreeMap<String, Imu> = BTreeMap::new();
+        for line in std::fs::read_to_string(path).unwrap().lines().skip(1) {
+            let c: Vec<&str> = line.split('\t').collect();
+            let Ok(b) = hex::decode(c[3]) else { continue };
+            if b.len() != 1244 || b[8] != 43 { continue }
+            if let Some(r) = crate::whoop5_records::decode_r21(&b[8..b.len() - 4]) {
+                by_phase.entry(format!("{}|{}", c[1], c[2])).or_default().push_record(&r);
+            }
+        }
+        for (k, imu) in &by_phase {
+            let st = strokes(imu);
+            let sets = sets_and_reps(imu);
+            println!("{k}: {:.0} s, strokes {}, sets {:?}", imu.len() as f64 / IMU_FS, st.len(), sets.iter().map(|s| (round(s.end - s.start, 1), s.periodic, s.reps, s.period_s, s.confidence)).collect::<Vec<_>>());
+        }
+        let mut all = Imu::default();
+        for imu in by_phase.values().filter(|i| !i.is_empty()) {
+            for i in 0..imu.len() { all.t.push(imu.t[i]); for k in 0..3 { all.a[k].push(imu.a[k][i]); all.g[k].push(imu.g[k][i]); } }
+        }
+        println!("ALL strokes {} sets {:?}", strokes(&all).len(), sets_and_reps(&all).iter().map(|s| (round(s.end - s.start, 1), s.periodic, s.reps, s.period_s)).collect::<Vec<_>>());
+    }
+}

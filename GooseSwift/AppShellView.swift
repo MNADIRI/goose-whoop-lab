@@ -83,6 +83,8 @@ struct AppShellView: View {
       )
     case .health:
       HealthView(store: healthStore, labResults: model.labResults)
+    case .sport:
+      SportView(controller: model.sport)
     case .alarm:
       AlarmView(controller: model.smartWake, ble: model.ble)
     case .more:
@@ -98,6 +100,7 @@ struct AppShellView: View {
 enum GooseAppTab: String, CaseIterable, Identifiable {
   case home
   case health
+  case sport
   case alarm
   case more
 
@@ -107,6 +110,7 @@ enum GooseAppTab: String, CaseIterable, Identifiable {
     switch self {
     case .home: "Home"
     case .health: "Health"
+    case .sport: "Sport"
     case .alarm: "Alarme"
     case .more: "More"
     }
@@ -116,6 +120,7 @@ enum GooseAppTab: String, CaseIterable, Identifiable {
     switch self {
     case .home: "house"
     case .health: "heart.text.square"
+    case .sport: "figure.run"
     case .alarm: "alarm"
     case .more: "ellipsis.circle"
     }
