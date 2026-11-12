@@ -19,6 +19,7 @@ struct LabResults: Decodable {
   let days: [LabDayResult]
   let load: LabLoad?
   let device: LabDevice
+  let circadian: LabCircadian?
 
   var latest: LabDayResult? { days.last }
 
@@ -33,6 +34,26 @@ struct LabDayResult: Decodable, Identifiable {
   let date: String
   let night: LabNight
   let day: LabDay
+  let indices: LabIndices?
+}
+
+/// Composite indices computed over the days up to this one (health_indices.rs).
+struct LabIndices: Decodable {
+  struct Score: Decodable { let score: Double?; let reason: String? }
+  struct Signal: Decodable { let signal: String }
+  struct Warning: Decodable { let level: String; let signals: [Signal]?; let overreachingSuspected: Bool? }
+  struct VO2: Decodable { let mlKgMin: Double? }
+  let fatigue: Score?
+  let recovery: Score?
+  let earlyWarning: Warning?
+  let vo2max: VO2?
+}
+
+struct LabCircadian: Decodable {
+  struct Cos: Decodable { let acrophaseH: Double?; let troughH: Double?; let amplitude: Double? }
+  let heartRate: Cos?
+  let skinTemp: Cos?
+  let sleepRegularityIndex: Double?
 }
 
 struct LabNight: Decodable {
@@ -57,6 +78,20 @@ struct LabNight: Decodable {
   let spo2: LabSpO2?
   let firmwareRestingHr: FirmwareRHR?
   let perfusion: Perfusion?
+  let morningHrv: MorningHRV?
+  let cpc: CPC?
+  let hrvSpectral: Spectral?
+  let breathingRegularity: Breathing?
+  let respiratoryDisturbance: RespDist?
+  let movement: Movement?
+  let skinOnsetWarmingC: Double?
+
+  struct MorningHRV: Decodable { let available: Bool; let rmssdMs: Double? }
+  struct CPC: Decodable { let stablePct: Double?; let unstablePct: Double? }
+  struct Spectral: Decodable { struct Night: Decodable { let lfHf: Double?; let hfNu: Double? }; let night: Night? }
+  struct Breathing: Decodable { let rateCvPct: Double?; let irregularWindowsPct: Double? }
+  struct RespDist: Decodable { let index0100: Double?; let hrSurgesPerH: Double?; let desatWindows: Int? }
+  struct Movement: Decodable { let postureChangesPerH: Double?; let episodesPerH: Double? }
 
   struct FirmwareRHR: Decodable { let medianBpm: Double?; let p10Bpm: Double? }
   struct Perfusion: Decodable { let opticalAmplitudeMedian: Double?; let vsPreviousNightsPct: Double? }
@@ -130,6 +165,9 @@ struct LabDay: Decodable {
   let hourly: [String: Hour]?
   let stress: LabStress?
   let cadence: Cadence?
+  let sedentary: Sedentary?
+
+  struct Sedentary: Decodable { let sedentaryInBoutsMin: Double?; let longestBoutMin: Double? }
 
   struct Cadence: Decodable {
     let available: Bool
@@ -139,7 +177,7 @@ struct LabDay: Decodable {
 
   // convertFromSnakeCase turns "strain_0_21" into "strain021".
   enum CodingKeys: String, CodingKey {
-    case coverageH, steps, walkMin, runMin, mvpaMin, hrZoneMin, edwardsTrimp, energy, hrMean, hrMin, hrMax, hourly, stress, cadence
+    case coverageH, steps, walkMin, runMin, mvpaMin, hrZoneMin, edwardsTrimp, energy, hrMean, hrMin, hrMax, hourly, stress, cadence, sedentary
     case strain021 = "strain021"
   }
 

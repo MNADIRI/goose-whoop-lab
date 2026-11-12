@@ -44,6 +44,7 @@ pub mod whoop_lab_analysis;
 pub mod whoop_lab_k18;
 pub mod baselines;
 pub mod dsp;
+pub mod health_indices;
 pub mod hrv_qc;
 pub mod imu;
 pub mod optical;

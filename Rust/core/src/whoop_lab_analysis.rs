@@ -19,11 +19,12 @@ use serde_json::{json, Value};
 
 use crate::baselines::{self, Baseline};
 use crate::hrv_qc::{self, Beat};
+use crate::health_indices::{self as hi, S1};
 use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "7"; // 5: signed R26 base, optical gain state; 6: on-strap SpO2
+const ALGORITHM_VERSION: &str = "8"; // 8: spectral HRV, CPC-refined stages, health indices // 5: signed R26 base, optical gain state; 6: on-strap SpO2
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
@@ -545,6 +546,16 @@ pub fn load_extras(conn: &Connection, from: i64, to: i64) -> GooseResult<std::co
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+fn to_s1(s: &[Sample], extras: &std::collections::HashMap<i64, Extra>) -> Vec<S1> {
+    s.iter()
+        .map(|x| S1 {
+            ts: x.ts, hr: x.hr, rr: x.rr.clone(), grav: x.grav, dyn_g: x.dyn_g, skin: x.skin,
+            sleep: x.band == "sleep", still_band: x.band == "still", steps: x.steps,
+            motion_flag: extras.get(&x.ts).is_some_and(|e| e.cardiac_flags & MOTION_FLAGS != 0),
+        })
+        .collect()
+}
+
 /// On-strap SpO2 (R18 frame byte 82, found 10 Nov): during sleep the strap runs a 30 s spot
 /// measurement on a fixed 20-minute clock (xx:16 / xx:36 / xx:56); each second of a window holds
 /// either a saturation in % or a status code (2, 8, 16, 32, 128, 144, 160, 168 ...). Outside the
@@ -585,13 +596,43 @@ pub fn spo2_summary(values: &[(i64, u8)]) -> Value {
 
 fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record], spo2_values: &[(i64, u8)], extras: &std::collections::HashMap<i64, Extra>) -> Value {
     let Some(sp) = sleep_period(s) else { return json!({ "available": false, "firmware_sleep_min": s.iter().filter(|x| x.band == "sleep").count() / 60 }) };
-    let (stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
+    let (mut stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
+    let s1_night = to_s1(&s[sp.onset..=sp.wake], extras);
+    let cpc_w = hi::cpc(&s1_night);
+    let rule_counts = ["wake", "light", "deep", "rem"].map(|k| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round());
+    // CPC refinement: stable coupling in the first 2/3 of the night supports N3, very-low-frequency
+    // coupling after the first hour supports REM, unstable / VLF coupling contradicts N3
+    let n_ep = stages.len();
+    for (k, st) in stages.iter_mut().enumerate() {
+        let t = onset_ts + k as i64 * EPOCH;
+        let Some((_, class)) = cpc_w.iter().find(|(c, _)| (t - c).abs() <= 128) else { continue };
+        let frac = k as f64 / n_ep.max(1) as f64;
+        match (*st, *class) {
+            ("light", "stable") if frac < 0.66 => *st = "deep",
+            ("deep", "unstable") | ("deep", "vlf") => *st = "light",
+            ("light", "vlf") if k > 120 => *st = "rem",
+            _ => {}
+        }
+    }
     let count = |k: &str| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round();
     let (wake_m, light, deep, rem) = (count("wake"), count("light"), count("deep"), count("rem"));
     let asleep = light + deep + rem;
     let in_bed = ((s[sp.wake].ts - s[sp.bed].ts) as f64 / 60.0).round();
     let night = &s[sp.onset..=sp.wake];
     let hr: Vec<f64> = night.iter().map(|x| x.hr).collect();
+    let spec = hi::spectral(&s1_night, 300, 150);
+    let by_stage = |stage: &str| -> Value {
+        let sel: Vec<&hi::SpecWin> = spec.iter().filter(|w| {
+            let k = ((w.t + 150 - onset_ts) / EPOCH).max(0) as usize;
+            stages.get(k) == Some(&stage)
+        }).collect();
+        let hf: Vec<f64> = sel.iter().map(|w| w.hf).collect();
+        let r: Vec<f64> = sel.iter().map(|w| w.lf_hf()).collect();
+        json!({"windows": sel.len(), "hf_ms2": median(&hf).map(|v| round(v, 0)), "lf_hf": median(&r).map(|v| round(v, 2))})
+    };
+    let (_, breathing) = hi::breathing(&s1_night);
+    let surges = hi::hr_surges(&s1_night);
+    let s1_bed = to_s1(&s[sp.bed..=sp.wake], extras);
     let resting = if hr.len() > 300 {
         hr.windows(300).map(|w| w.iter().sum::<f64>() / 300.0).fold(f64::INFINITY, f64::min)
     } else {
@@ -705,6 +746,13 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
             "stages_status": "EXPERIMENTAL (65-73 % epoch agreement ceiling without EEG)",
         },
         "optical": optical,
+        "stages_rule_v1_min": {"wake": rule_counts[0], "light": rule_counts[1], "deep": rule_counts[2], "rem": rule_counts[3]},
+        "hrv_spectral": {"night": hi::spectral_summary(&spec), "deep": by_stage("deep"), "light": by_stage("light"), "rem": by_stage("rem")},
+        "cpc": hi::cpc_summary(&cpc_w),
+        "breathing_regularity": breathing,
+        "movement": hi::movement(&s1_bed),
+        "morning_hrv": hi::morning_hrv(&s1_night, s[sp.wake].ts),
+        "skin_onset_warming_c": hi::skin_onset_warming(&to_s1(s, extras), s[sp.bed].ts, s[sp.onset].ts),
         "spo2": spo2_summary(&spo2_values.iter().copied().filter(|(t, _)| *t >= s[sp.bed].ts && *t <= s[sp.wake].ts).collect::<Vec<_>>()),
         "rr_coverage_pct": round(100.0 * rr_count as f64 / (hr.iter().sum::<f64>() / 60.0).max(1.0), 1),
         "quality_mask": {
@@ -733,6 +781,8 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
             "status": "DECODED_UNVALIDATED",
         },
     });
+    let spo2_series: Vec<(i64, f64)> = out["spo2"]["series"].as_array().map(|a| a.iter().filter_map(|x| Some((x[0].as_i64()?, x[1].as_f64()?))).collect()).unwrap_or_default();
+    out["respiratory_disturbance"] = hi::respiratory_disturbance(&spo2_series, surges.len(), asleep / 60.0, &out["breathing_regularity"]);
     out["recovery"] = baselines::recovery(&baselines::RecoveryInputs {
         rmssd: hrv["rmssd_ms"].as_f64(),
         resting_hr: Some(round(resting, 1)),
@@ -883,12 +933,13 @@ fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, restin
         "hourly": hourly,
         "stress": stress(s, rhr, hrmax),
         "age_default_used": profile.age.is_none(),
-        "training": training_block(s, rhr, age, profile),
+        "training": training_block(s, rhr, age, profile, extras),
+        "sedentary": hi::sedentary(&to_s1(s, extras)),
         "cadence": cadence(s, extras),
     })
 }
 
-fn training_block(s: &[Sample], rhr: f64, age: f64, profile: &Profile) -> Value {
+fn training_block(s: &[Sample], rhr: f64, age: f64, profile: &Profile, extras: &std::collections::HashMap<i64, Extra>) -> Value {
     let hrs: Vec<f64> = s.iter().map(|x| x.hr).filter(|h| *h > 0.0).collect();
     let (hrmax, source) = training::hrmax_used(age, &hrs);
     let female = profile.sex.as_deref() == Some("female");
@@ -900,6 +951,16 @@ fn training_block(s: &[Sample], rhr: f64, age: f64, profile: &Profile) -> Value 
             let hr: Vec<f64> = s.iter().filter(|x| x.ts >= a && x.ts <= b).map(|x| x.hr).collect();
             sess["cardiac_drift_pct"] = json!(training::cardiac_drift(&hr));
             sess["hr_recovery"] = training::hr_recovery(&triples, b);
+            let part: Vec<&Sample> = s.iter().filter(|x| x.ts >= a && x.ts <= b).collect();
+            let minutes = ((b - a) as f64 / 60.0).max(1.0);
+            let steps: i64 = part.windows(2).map(|p| p[1].steps - p[0].steps).filter(|d| *d > 0 && *d < 300).sum();
+            let cad: Vec<f64> = part.iter().filter_map(|x| extras.get(&x.ts)).map(|e| f64::from(e.cadence_raw)).filter(|v| *v > 20.0).map(|r| 60.0 * 200.0 / r).collect();
+            let dyns: Vec<f64> = part.iter().filter_map(|x| x.dyn_g).collect();
+            let dm = mean(&dyns).unwrap_or(0.0);
+            let dcv = std_sample(&dyns).unwrap_or(0.0) / dm.max(1e-6);
+            let hrr = (mean(&hr).unwrap_or(rhr) - rhr) / (hrmax - rhr).max(1.0);
+            sess["type"] = json!(hi::workout_type(steps as f64 / minutes, median(&cad), dm, dcv, hrr));
+            sess["steps_per_min"] = json!(round(steps as f64 / minutes, 0));
         }
     }
     json!({
@@ -954,6 +1015,27 @@ fn training_load(days: &[Value]) -> Value {
         "foster": training::foster(&vals),
         "daily": series.iter().rev().take(28).rev().map(|(d, v)| json!({"date": d, "trimp": round(*v, 1)})).collect::<Vec<_>>(),
     })
+}
+
+/// Last 7 days: 24-h cosinor of wrist skin temperature (peak = night) and of HR (trough = night),
+/// sleep midpoint, Sleep Regularity Index on 1-min band states.
+fn circadian_rhythm(conn: &Connection, off: i64, now: i64) -> GooseResult<Value> {
+    let from = now - 7 * DAY;
+    let mut st = conn.prepare("SELECT ts / 3600, AVG(skin_centi) / 100.0, AVG(hr), SUM(band = 'sleep') FROM whoop_lab_biometric WHERE ts >= ?1 GROUP BY 1 HAVING COUNT(*) > 1800")?;
+    let rows: Vec<(i64, Option<f64>, f64)> = st.query_map([from], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let local_h = |h: i64| ((h * 3600 + off).rem_euclid(DAY)) as f64 / 3600.0;
+    let skin: Vec<(f64, f64)> = rows.iter().filter_map(|(h, s, _)| s.map(|v| (local_h(*h), v))).collect();
+    let hr: Vec<(f64, f64)> = rows.iter().map(|(h, _, v)| (local_h(*h), *v)).collect();
+    let mut sm = conn.prepare("SELECT ts / 60, MAX(band = 'sleep') FROM whoop_lab_biometric WHERE ts >= ?1 GROUP BY 1")?;
+    let minutes: std::collections::BTreeMap<i64, bool> = sm.query_map([from], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? == 1)))?.collect::<Result<_, _>>()?;
+    let cos = |p: &[(f64, f64)]| hi::cosinor(p).map(|(m, a, phi)| json!({"mesor": round(m, 2), "amplitude": round(a, 2), "acrophase_h": round(phi, 1)}));
+    Ok(json!({
+        "hours": rows.len(),
+        "skin_temp": cos(&skin),
+        "heart_rate": cos(&hr).map(|mut v| { let a = v["acrophase_h"].as_f64().unwrap(); v["trough_h"] = json!(round((a + 12.0).rem_euclid(24.0), 1)); v }),
+        "sleep_regularity_index": hi::sleep_regularity_index(&minutes),
+        "method": "single-component 24-h cosinor on hourly means (last 7 days); SRI (Phillips 2017) on 1-min firmware sleep states",
+    }))
 }
 
 // ------------------------------------------------------------------ provenance
@@ -1075,6 +1157,35 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
         day_start += DAY;
     }
     let load = training_load(&days);
+    // composite indices, computed for every day from the days up to it
+    let series: Vec<hi::DaySeries> = days.iter().map(|d| {
+        let n = &d["night"];
+        let hrr = d["day"]["training"]["workouts"]["sessions"].as_array().and_then(|a| a.iter().filter_map(|s| s["hr_recovery"]["drop_60s"].as_f64()).reduce(f64::max));
+        hi::DaySeries {
+            ln_rmssd: n["hrv_night"]["ln_rmssd"].as_f64(), rhr: n["resting_hr_bpm"].as_f64(), resp: n["respiration"]["rpm"].as_f64(),
+            skin: n["skin_temp_c"].as_f64(), spo2: n["spo2"]["median_pct"].as_f64(), asleep_min: n["asleep_min"].as_f64(),
+            need_min: 480.0, trimp: d["day"]["edwards_trimp"].as_f64().unwrap_or(0.0), hrr60: hrr,
+            morning_ln_rmssd: n["morning_hrv"]["ln_rmssd"].as_f64(),
+        }
+    }).collect();
+    let age = options.profile.age.unwrap_or(30.0);
+    let rhrs: Vec<f64> = series.iter().filter_map(|x| x.rhr).collect();
+    let day_max: Vec<f64> = days.iter().filter_map(|d| d["day"]["hr_max"].as_f64()).collect();
+    for i in 0..days.len() {
+        let upto = &series[..=i];
+        let fat = hi::fatigue(upto);
+        let rhr7 = median(&upto.iter().rev().filter_map(|x| x.rhr).take(7).collect::<Vec<_>>());
+        let hrmax = (208.0 - 0.7 * age).max(day_max.iter().copied().take(i + 1).fold(0.0, f64::max));
+        days[i]["indices"] = json!({
+            "fatigue": fat.clone(),
+            "recovery": hi::recovery_v2(upto),
+            "early_warning": hi::early_warning(upto, fat["score"].as_f64()),
+            "vo2max": {"ml_kg_min": rhr7.and_then(|r| hi::vo2max_uth(hrmax, r)), "hrmax_used": hrmax.round(), "resting_hr_7d": rhr7,
+                       "method": "Uth 2004: 15.3 x HRmax / HRrest; HRmax = max(Tanaka, observed)"},
+        });
+    }
+    let _ = rhrs;
+    let circadian = circadian_rhythm(&conn, off, now)?;
     // sleep regularity: SD of onset / wake clock times over the last 7 nights (minutes)
     let clock = |v: &Value| v.as_i64().map(|t| (((t + off).rem_euclid(DAY) + DAY / 2) % DAY) as f64 / 60.0);
     let recent: Vec<&Value> = days.iter().rev().filter(|d| d["night"]["available"] == true).take(7).map(|d| &d["night"]).collect();
@@ -1093,6 +1204,7 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
         "days": days,
         "load": load,
         "sleep_regularity": regularity,
+        "circadian": circadian,
         "layer_b_ingest": serde_json::to_value(&layer_b).unwrap_or(Value::Null),
         "provenance": provenance(),
         "device": {"records": total, "first": first, "last": last,

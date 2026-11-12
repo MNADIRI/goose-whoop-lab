@@ -93,6 +93,34 @@ binaire brut et `schema.json` avec unités, statuts et provenance).
 | **Température de la carte** | R18 temp. auxiliaire 2 | médiane nocturne, écart peau − carte | résultats (`environment_temp`) | Décodé, non validé |
 | **Cadence de marche** | R18 période du pas | 60 × k / valeur brute, k auto-étalonné sur le compteur de pas (≥ 5 min de marche ; 196,6 mesuré, 200 par défaut) | Aujourd'hui › Activité | Expérimental |
 
+### Algorithme 8 : indicateurs avancés (`Rust/core/src/health_indices.rs`)
+
+| Indicateur | Entrées | Méthode (référence) | Résultat 9–11 nov. |
+|---|---|---|---|
+| **VFC spectrale** | R-R (tachogramme 1 Hz) | Bandes Task Force 1996 : VLF 0,0033–0,04, LF 0,04–0,15, HF 0,15–0,4 Hz ; fenêtres de 5 min ; par phase | nuit 1 : LF 979, HF 600 ms², LF/HF 1,53 ; nuit 2 : LF/HF 2,38 |
+| **Couplage cardio-respiratoire** | R-R | Version R-R seule de la CPC (Thomas 2005), fenêtres de 512 s : stable (HF/(LF+VLF) ≥ 0,6 et pic ≥ 20 %), instable (LF/HF ≥ 2), VLF (≥ 50 %) ; seuils calés sur tes nuits | stable 20,6 % / 0 % |
+| **Phases v2** | phases à règles + CPC | stable en début de nuit → profond ; instable/VLF → pas profond ; VLF après 1 h → paradoxal. Les comptes v1 restent dans `stages_rule_v1_min` | nuit 1 : profond 29 → 59 min, paradoxal 98 → 111 |
+| **Régularité respiratoire** | R-R | fréquence par fenêtre de 2 min (RSA) : CV, variation moyenne, % de fenêtres irrégulières (> 3/min de la médiane) | CV 11,4 % / 15,8 % |
+| **Perturbations respiratoires** (0–100) | SpO₂ du bracelet, FC, respiration | ODI-3 sur les fenêtres SpO₂ + accélérations de FC ≥ 8 bpm (cf. Azarbarzin 2014) + irrégularité ; indicateur de dépistage, pas un IAH | 37 / 61 |
+| **Mouvement** | gravité, accélération dynamique, indicateurs du bracelet | secondes en mouvement, épisodes/h, changements de position (≥ 30° entre minutes) | 3,2 / 4,0 changements/h |
+| **Sédentarité** | pas, accélération | minutes inactives (< 10 pas, < 0,15 g), périodes ≥ 30 min | 10 périodes, 609 min le 10 |
+| **VFC au réveil** | R-R des 10 dernières min de sommeil | RMSSD sans les secondes en mouvement | 53,5 / 62,8 ms |
+| **Peau à l'endormissement** | température de peau | moyenne 20–40 min après l'endormissement − 15 min avant le coucher (vasodilatation distale, Kräuchi 1999) | −1,2 / +0,5 °C |
+| **Rythme circadien** | 7 jours | cosinor 24 h de la FC (creux) et de la peau (pic) ; indice de régularité du sommeil (SRI, Phillips 2017) | creux de FC 5 h 00, pic de peau 8 h, SRI 70,8 |
+| **Type de séance** | pas/min, cadence, accélération, %RFC | course / marche rapide / marche / vélo-rameur / renforcement / autre effort | |
+| **VO₂max** | FC max, FC de repos sur 7 nuits | Uth 2004 : 15,3 × FCmax / FCrepos (± ~10 %) ; FCmax = max(Tanaka, observée) | ~65–66 (FC de repos basse : la formule surestime probablement) |
+| **Fatigue** (0–100) | VFC 7 j, FC de repos 7 j, charge, sommeil | ln RMSSD 7 j vs référence 30 j en unités de 0,5 SD (Plews & Buchheit) ×0,35 ; FC de repos ×0,20 ; ATL/CTL de Banister ×0,25 ; dette 7 j ×0,20 ; logistique ; CV du ln RMSSD 7 j exposé | après ≥ 5 nuits de référence |
+| **Récupération v2** (0–100) | nuit, réveil, séances, charge | z VFC nuit ×0,30 + VFC réveil ×0,10, FC repos ×0,20, respiration ×0,05, performance de sommeil ×0,15, **récupération cardiaque après effort** ×0,10, **forme de Banister (TSB/CTL)** ×0,10 ; logistique (Z = 0 → 58) | après 3 nuits |
+| **Alerte précoce** | nuit vs ≤ 30 nuits | peau ≥ +0,5 °C, FC repos ≥ +3 bpm, ln RMSSD ≤ −1,5 SD, respiration ≥ +1/min, SpO₂ ≤ −2 % ; « à surveiller » ≥ 2 signaux, « alerte » ≥ 3 ou peau + FC (cf. Mishra 2020, Smarr 2020) ; surentraînement suspecté si fatigue ≥ 65 et VFC basse 3 nuits | après 5 nuits |
+
+**Modèles externes étudiés** :
+- **HAR** : HARNet (ssl-wearables, Oxford, poids ouverts) est le meilleur modèle pré-entraîné au poignet, mais il lui faut
+  l'accéléromètre brut en continu (30 Hz). On ne l'a qu'en direct, sur commande. Il pourrait servir pendant une séance
+  avec IMU allumée, une fois converti pour l'iPhone ; sur l'historique à 1 Hz, il n'est pas applicable, d'où la
+  classification par règles.
+- **Sommeil** : WatchSleepNet (2025) est ouvert, mais ses entrées doivent être vérifiées et il faudrait le porter (PyTorch
+  vers CoreML ou Rust). Le gain est à valider contre une référence.
+
 ## 3. Cohérence et redondances traitées
 
 - **Une seule valeur par mesure.** Les cartes goose (Sleep, Recovery, Strain, Stress, Cardio Load, FC repos,

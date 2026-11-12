@@ -449,3 +449,81 @@ struct LabRouteDetailView: View {
     .navigationTitle(route.title)
   }
 }
+
+/// Composite indices and the night's advanced signals (fatigue, recovery, VO2max, health alert,
+/// morning HRV, cardiopulmonary coupling, spectral HRV, breathing, disturbances, movement, rhythm).
+struct LabIndicesCard: View {
+  let day: LabDayResult
+  let circadian: LabCircadian?
+
+  private var warningText: String {
+    switch day.indices?.earlyWarning?.level {
+    case "alert": return "Alerte"
+    case "watch": return "À surveiller"
+    case "none": return "RAS"
+    default: return "—"
+    }
+  }
+
+  var body: some View {
+    let ix = day.indices
+    let n = day.night
+    LabCard(title: "Indicateurs", systemImage: "gauge.with.dots.needle.67percent", tint: .indigo,
+            badge: warningText, badgeCaption: "santé") {
+      LazyVGrid(columns: [GridItem(.flexible(), spacing: 16, alignment: .top), GridItem(.flexible(), spacing: 16, alignment: .top)], spacing: 16) {
+        LabMetric(title: "Récupération", value: labFmt(ix?.recovery?.score), unit: ix?.recovery?.score != nil ? "/100" : "",
+                  status: score(ix?.recovery?.score, higherIsBetter: true),
+                  detail: ix?.recovery?.score == nil ? (ix?.recovery?.reason ?? "") : "VFC, FC repos, sommeil, récup. cardiaque, forme")
+        LabMetric(title: "Fatigue", value: labFmt(ix?.fatigue?.score), unit: ix?.fatigue?.score != nil ? "/100" : "",
+                  status: score(ix?.fatigue?.score, higherIsBetter: false),
+                  detail: ix?.fatigue?.score == nil ? "après quelques jours de données" : "VFC 7 j, FC repos, charge, dette")
+        LabMetric(title: "VO₂max", value: labFmt(ix?.vo2max?.mlKgMin, 1), unit: "ml/kg/min", detail: "FC max / FC repos")
+        LabMetric(title: "VFC au réveil", value: labFmt(n.morningHrv?.rmssdMs), unit: "ms", detail: "10 dernières min de sommeil")
+        if n.available {
+          LabMetric(title: "Sommeil stable", value: labFmt(n.cpc?.stablePct), unit: "%", detail: "couplage cardio-respiratoire")
+          LabMetric(title: "Équilibre LF/HF", value: labFmt(n.hrvSpectral?.night?.lfHf, 2), detail: "nuit ; HF \(labFmt(n.hrvSpectral?.night?.hfNu)) %")
+          LabMetric(title: "Respiration", value: labFmt(n.breathingRegularity?.rateCvPct), unit: "% var.",
+                    status: rangeStatus(n.breathingRegularity?.rateCvPct, good: 0...12, fair: 12...20), detail: "variabilité du rythme")
+          LabMetric(title: "Perturbations resp.", value: labFmt(n.respiratoryDisturbance?.index0100), unit: "/100",
+                    status: rangeStatus(n.respiratoryDisturbance?.index0100, good: 0...30, fair: 30...60),
+                    detail: "\(labFmt(n.respiratoryDisturbance?.hrSurgesPerH, 1)) accél. FC/h · \(n.respiratoryDisturbance?.desatWindows ?? 0) désat.")
+          LabMetric(title: "Mouvements nuit", value: labFmt(n.movement?.postureChangesPerH, 1), unit: "/h", detail: "changements de position")
+          LabMetric(title: "Peau à l'endormissement", value: n.skinOnsetWarmingC.map { String(format: "%+.1f", $0) } ?? "—", unit: "°C", detail: "réchauffement du poignet")
+        }
+        if let c = circadian, let trough = c.heartRate?.troughH {
+          LabMetric(title: "Rythme circadien", value: String(format: "%02.0fh%02.0f", floor(trough), (trough - floor(trough)) * 60),
+                    detail: "creux de FC · régularité \(labFmt(c.sleepRegularityIndex))/100")
+        }
+        if let sed = day.day.sedentary?.sedentaryInBoutsMin {
+          LabMetric(title: "Sédentarité", value: labDuration(sed), detail: "périodes ≥ 30 min · max \(labDuration(day.day.sedentary?.longestBoutMin))")
+        }
+      }
+      if let signals = ix?.earlyWarning?.signals, !signals.isEmpty {
+        Text(signals.map { Self.signalText($0.signal) }.joined(separator: " · "))
+          .font(.footnote).foregroundStyle(.orange)
+      }
+    }
+  }
+
+  private static func signalText(_ s: String) -> String {
+    switch s {
+    case "skin_temp_up": return "température de peau en hausse"
+    case "resting_hr_up": return "FC de repos en hausse"
+    case "hrv_down": return "VFC en baisse"
+    case "respiration_up": return "respiration accélérée"
+    case "spo2_down": return "SpO₂ en baisse"
+    default: return s
+    }
+  }
+
+  private func score(_ v: Double?, higherIsBetter: Bool) -> LabStatus {
+    guard let v else { return .neutral }
+    let x = higherIsBetter ? v : 100 - v
+    return x >= 67 ? .good : x >= 34 ? .fair : .low
+  }
+
+  private func rangeStatus(_ value: Double?, good: ClosedRange<Double>, fair: ClosedRange<Double>) -> LabStatus {
+    guard let value else { return .neutral }
+    return good.contains(value) ? .good : fair.contains(value) ? .fair : .low
+  }
+}

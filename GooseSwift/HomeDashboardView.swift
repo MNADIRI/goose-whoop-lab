@@ -18,6 +18,7 @@ struct HomeDashboardView: View {
           LabActivityCard(day: current.day)
           LabNightCard(night: current.night)
           LabBodyCard(night: current.night)
+          LabIndicesCard(day: current, circadian: results.circadian)
           Text("\(labResults.status) · \(results.device.records.formatted()) secondes enregistrées depuis le \(labDayLabel(results.firstDay ?? "", style: .dateTime.day().month(.wide)))")
             .font(.caption2)
             .foregroundStyle(.secondary)
