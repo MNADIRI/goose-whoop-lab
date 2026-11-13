@@ -545,6 +545,18 @@ pub fn load_imu(conn: &Connection, session_id: &str, from: i64, to: i64) -> Goos
     Ok(out)
 }
 
+/// Hypnogram code -> HMM state. 'U' marks epochs without enough data: never a sleep stage.
+fn code_state(c: char) -> Option<usize> {
+    match c { 'W' => Some(W), 'L' => Some(L), 'D' => Some(D), 'R' => Some(R), _ => None }
+}
+
+/// Sleep minutes of a night usable for need / debt: an incomplete capture is only a lower bound,
+/// so it must not read as a short night.
+fn complete_asleep_min(n: &Value) -> Option<f64> {
+    if n["sleep_duration_status"] == "INCOMPLETE_LOWER_BOUND" { return None; }
+    n["asleep_min"].as_f64()
+}
+
 /// Personal context from past nights (whoop_lab_days): baselines, habitual wake, sleep need/debt,
 /// and emission means refitted on the user's own nights (shrinkage towards the default model).
 pub fn personal_context(conn: &Connection, before_ts: i64, utc_offset: i64) -> GooseResult<(Context, Value)> {
@@ -562,7 +574,7 @@ pub fn personal_context(conn: &Connection, before_ts: i64, utc_offset: i64) -> G
         }
     }
     let wake_mins: Vec<f64> = nights.iter().filter_map(|n| n["wake_time"].as_i64()).map(|t| ((t + utc_offset).rem_euclid(86_400)) as f64 / 60.0).collect();
-    let asleep: Vec<f64> = nights.iter().filter_map(|n| n["asleep_min"].as_f64()).collect();
+    let asleep: Vec<f64> = nights.iter().filter_map(complete_asleep_min).collect();
     let need_min = if asleep.len() >= 5 { percentile(&asleep, 75.0).unwrap().clamp(390.0, 570.0) } else { 480.0 };
     let debt_h = asleep.iter().take(7).map(|a| (need_min - a).max(0.0)).sum::<f64>() / 60.0;
     let mut priors = Priors::default();
@@ -615,7 +627,8 @@ fn personalise(conn: &Connection, nights: &[Value], priors: &Priors, mut model: 
         let z = zscores(&f, priors);
         for (k, c) in code.chars().enumerate() {
             let e = ((start - t0) / EPOCH) as usize + k;
-            let s = match c { 'W' => W, 'L' => L, 'D' => D, _ => R };
+            // 'U' (insufficient data) and any other code never trains a state
+            let Some(s) = code_state(c) else { continue };
             for (dim, v) in z.get(e).map(|x| *x).unwrap_or([None; 3]).iter().enumerate() {
                 if let Some(v) = v {
                     acc[s][dim].push(*v);
@@ -903,7 +916,7 @@ pub fn plan(args: &PlanArgs) -> GooseResult<Value> {
         }
     }
     let nights: Vec<&Value> = days.iter().map(|d| &d["night"]).filter(|n| n["available"] == true).collect();
-    let asleep: Vec<f64> = nights.iter().take(14).filter_map(|n| n["asleep_min"].as_f64()).collect();
+    let asleep: Vec<f64> = nights.iter().take(14).filter_map(|n| complete_asleep_min(n)).collect();
     let (base, base_src) = if asleep.len() >= 5 { (percentile(&asleep, 75.0).unwrap().clamp(420.0, 540.0), "personnel (p75 des 14 dernières nuits)") } else { (480.0, "par défaut (8 h, moins de 5 nuits)") };
     // activity
     let loads: Vec<f64> = days.iter().filter_map(|d| d["day"]["edwards_trimp"].as_f64()).collect();
@@ -1009,7 +1022,7 @@ pub fn replay(args: &ReplayArgs) -> GooseResult<Value> {
             if ts < hstart {
                 return Some(W);
             }
-            code.chars().nth(((ts - hstart) / EPOCH) as usize).map(|c| match c { 'W' => W, 'L' => L, 'D' => D, _ => R })
+            code.chars().nth(((ts - hstart) / EPOCH) as usize).and_then(code_state)
         };
         let (ctx, info) = personal_context(&conn, bed, args.utc_offset_seconds)?;
         let cfg = SessionConfig { id: format!("replay-{bed}"), start_ts: bed - 600, window_start: wake - window, window_end: wake, utc_offset_seconds: args.utc_offset_seconds };
@@ -1453,5 +1466,16 @@ mod latency_real {
             }).unwrap();
             println!("{label}: wall {:?} engine {} ms action {} post {} window {} fresh {}", t.elapsed(), r["latency_ms"], r["action"], r["epoch"]["posterior"], r["window"], r["epoch"]["quality"]["fresh"]);
         }
+    }
+
+    #[test]
+    fn unknown_epochs_never_become_rem_and_incomplete_nights_add_no_debt() {
+        use super::*;
+        assert_eq!(code_state('U'), None);
+        assert_eq!(code_state('?'), None);
+        assert_eq!(code_state('R'), Some(R));
+        let partial = json!({"asleep_min": 180.0, "sleep_duration_status": "INCOMPLETE_LOWER_BOUND"});
+        assert_eq!(complete_asleep_min(&partial), None);
+        assert_eq!(complete_asleep_min(&json!({"asleep_min": 450.0, "sleep_duration_status": "COMPLETE"})), Some(450.0));
     }
 }

@@ -41,6 +41,8 @@ def main(root):
     if len(rows) < 8 or len({r["label_type"] for r in rows}) < 2:
         sys.exit(f"{len(rows)} labelled sessions: need >= 8 over >= 2 classes")
     X = np.array([[float(r["features_json"].get(f, 0.0)) for f in FEATURES] for r in rows])
+    if not np.isfinite(X).all():
+        sys.exit("non-finite features: repair the dataset before training")
     y = np.array([CLASSES.index(r["label_type"]) for r in rows])
     rules_ok = np.mean([r.get("predicted_type") == r["label_type"] for r in rows])
     ok = 0

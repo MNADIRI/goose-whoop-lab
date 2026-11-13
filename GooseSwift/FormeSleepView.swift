@@ -129,6 +129,13 @@ struct FormeSleepView: View {
           Text(FF.clock(day.wake))
         }
         .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
+        if let u = day.unknownMin, u >= 1 {
+          Text(day.sleepIncomplete
+               ? "\(FF.dur(u)) sans données cette nuit : durées minimales, pas de score."
+               : "\(FF.dur(u)) sans données, non comptées dans les phases.")
+            .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
       VStack(spacing: 0) {
         ForEach(Array(Self.phaseRows.enumerated()), id: \.offset) { i, p in
@@ -194,7 +201,7 @@ struct FormeSleepView: View {
       MetricTile(label: "Température cutanée", value: day.skinDelta.map { FF.signed($0, 1) } ?? FF.num(day.skin, 1), unit: "°C", note: day.skinDelta == nil ? "Au poignet" : "Écart à ta référence")
       MetricTile(label: "SpO₂ (saturation en oxygène)", value: FF.num(day.spo2), unit: "%", note: day.spo2Min.map { "Minimum \(FF.num($0)) %" })
       MetricTile(label: "Perfusion", value: day.perfusionPct.map { FF.signed($0) } ?? "—", unit: "%", note: "Amplitude du pouls vs nuits")
-      MetricTile(label: "Perturbations respiratoires", value: FF.num(day.respDisturbance), unit: "/100", note: day.hrSurgesPerH.map { "\(FF.num($0, 1)) accélérations du pouls/h" })
+      MetricTile(label: "Accélérations du pouls", value: FF.num(day.hrSurgesPerH, 1), unit: "/h", note: "Par heure de sommeil")
       MetricTile(label: "Mouvements", value: FF.num(day.postureChangesPerH, 1), unit: "/h", note: "Changements de position")
     }
     .padding(.top, 12)
@@ -203,9 +210,9 @@ struct FormeSleepView: View {
   private func tech(_ day: FormeDay) -> [(String, String, String)] {
     let n = day.night
     return [
-      ("Couplage stable (CPC)", "Respiration régulière qui module le cœur : sommeil profond", n["cpc"]["stable_pct"].d.map { "\(FF.num($0)) %" } ?? "—"),
-      ("Couplage instable", "Respiration irrégulière : sommeil léger, éveils", n["cpc"]["unstable_pct"].d.map { "\(FF.num($0)) %" } ?? "—"),
-      ("LF/HF de la nuit", "Équilibre sympathique / parasympathique", FF.num(n["hrv_spectral"]["night"]["lf_hf"].d, 2)),
+      ("Couplage stable (CPC)", "Respiration régulière qui module le cœur : sommeil stable", n["cpc"]["stable_pct"].d.map { "\(FF.num($0)) %" } ?? "—"),
+      ("Couplage instable", "Respiration irrégulière : sommeil fragmenté, éveils", n["cpc"]["unstable_pct"].d.map { "\(FF.num($0)) %" } ?? "—"),
+      ("LF/HF de la nuit", "Puissance basses / hautes fréquences de la VFC", FF.num(n["hrv_spectral"]["night"]["lf_hf"].d, 2)),
       ("Variabilité de la respiration", "Coefficient de variation du rythme", n["breathing_regularity"]["rate_cv_pct"].d.map { "\(FF.num($0, 1)) %" } ?? "—"),
       ("Température cutanée", "Au poignet pendant le sommeil", n["skin_temp_c"].d.map { "\(FF.num($0, 1)) °C" } ?? "—"),
       ("Réchauffement à l'endormissement", "Hausse de température cutanée", n["skin_onset_warming_c"].d.map { "\(FF.signed($0, 2)) °C" } ?? "—"),

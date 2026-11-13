@@ -132,15 +132,19 @@ struct FormeDay {
   var skinDelta: Double? { night["skin_temp_delta_c"].d }
   var skin: Double? { night["skin_temp_c"].d }
   var perfusionPct: Double? { night["perfusion"]["vs_previous_nights_pct"].d }
-  var respDisturbance: Double? { night["respiratory_disturbance"]["index_0_100"].d }
   var hrSurgesPerH: Double? { night["respiratory_disturbance"]["hr_surges_per_h"].d }
   var postureChangesPerH: Double? { night["movement"]["posture_changes_per_h"].d }
   var regularity: Double? { root["circadian"]["sleep_regularity_index"].d }
 
   /// Composite sleep score (Rust: duration vs need, continuity, regularity, architecture).
   var sleepScore: Double? {
-    night["sleep_score"]["score"].d ?? asleepMin.map { min(100, ($0 / sleepNeed * 100).rounded()) }
+    guard !sleepIncomplete else { return nil }
+    return night["sleep_score"]["score"].d ?? asleepMin.map { min(100, ($0 / sleepNeed * 100).rounded()) }
   }
+  /// Minutes between onset and wake without enough data (excluded from the phases).
+  var unknownMin: Double? { night["unknown_min"].d }
+  /// Capture covers < 90 % of the night: durations are a lower bound and no score is derived.
+  var sleepIncomplete: Bool { night["sleep_duration_status"].s == "INCOMPLETE_LOWER_BOUND" }
   var sleepNeed: Double { night["sleep_score"]["need_min"].d ?? 480 }
 
   struct ScorePart: Identifiable {

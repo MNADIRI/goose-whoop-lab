@@ -10,7 +10,7 @@
 //! Per burst: continuity check -> linear detrend -> 0.5-4 Hz zero-phase band-pass -> pulse rate by
 //! autocorrelation (polarity independent) -> pulse peaks on the polarity that matches it -> pulse
 //! intervals, amplitudes, rise time, amplitude variability, spectral SNR -> agreement with the R18
-//! heart rate of the same seconds (independent check of the sampling-rate estimate).
+//! heart rate of the same seconds (internal consistency only, not external validation).
 
 use serde_json::{json, Value};
 
@@ -30,7 +30,7 @@ pub fn bursts(windows: &[R26Record]) -> Vec<Burst<'_>> {
     let mut out: Vec<Burst> = Vec::new();
     for w in windows {
         match out.last_mut() {
-            Some(b) if b.windows.last().is_some_and(|l| w.ts == l.ts + 1) => b.windows.push(w),
+            Some(b) if b.windows.last().is_some_and(|l| w.ts == l.ts + 1 && w.status_raw == l.status_raw) => b.windows.push(w),
             Some(b) if b.windows.last().is_some_and(|l| w.ts == l.ts) => {} // duplicate second
             _ => out.push(Burst { windows: vec![w] }),
         }
@@ -111,9 +111,10 @@ pub fn analyze_burst(b: &Burst, hr_at: &dyn Fn(i64) -> Option<f64>) -> Value {
         (Some(p), Some(h)) => Some(p - h),
         _ => None,
     };
-    let clean = moving == 0 && snr >= 0.5;
+    let clean = moving == 0 && motion.len() == n_win && accepted == n_win
+        && continuity(b).is_some_and(|r| r <= 3.0) && snr >= 0.5;
     let status = match err {
-        Some(e) if e.abs() <= 5.0 && clean => Status::Validated,
+        Some(e) if e.abs() <= 5.0 && clean => Status::Experimental,
         _ if clean => Status::Experimental,
         _ => Status::Invalid,
     };
@@ -130,7 +131,9 @@ pub fn analyze_burst(b: &Burst, hr_at: &dyn Fn(i64) -> Option<f64>) -> Value {
         "amplitude_median": median(&amps).map(|v| round(v, 1)),
         "amplitude_cv": match (amp_mean, std_sample(&amps)) { (Some(m), Some(s)) if m > 0.0 => Some(round(s / m, 3)), _ => None },
         "rise_time_ms_median": median(&rise_ms).map(|v| v.round()),
-        "spectral_snr": round(snr, 3),
+        "spectral_peak_power_fraction": round(snr.clamp(0.0, 1.0), 3),
+        "agreement_with_firmware": err.map(|e| e.abs() <= 5.0),
+        "external_validation": false,
         "acf_peak": round(ac[lag], 3),
         "status": status,
     }))
@@ -152,17 +155,18 @@ pub fn summarize(windows: &[R26Record], hr_at: &dyn Fn(i64) -> Option<f64>) -> V
     let results: Vec<Value> = bs.iter().map(|b| analyze_burst(b, hr_at)).collect();
     let errs: Vec<f64> = results.iter().filter_map(|r| r["pulse_rate_minus_hr_bpm"].as_f64()).collect();
     let fs: Vec<f64> = results.iter().filter_map(|r| r["fs_hz_estimated"].as_f64()).collect();
-    let validated = results.iter().filter(|r| r["status"] == "VALIDATED").count();
-    let amps: Vec<f64> = results.iter().filter(|r| r["status"] == "VALIDATED").filter_map(|r| r["amplitude_median"].as_f64()).collect();
+    let usable = results.iter().filter(|r| r["status"] == "EXPERIMENTAL").count();
+    let amps: Vec<f64> = results.iter().filter(|r| r["status"] == "EXPERIMENTAL").filter_map(|r| r["amplitude_median"].as_f64()).collect();
     json!({
         "windows": windows.len(),
         "bursts": bs.len(),
         "fs_hz_estimated_median": median(&fs).map(|v| round(v, 2)),
         "accepted_window_pct": round(100.0 * windows.iter().filter(|w| w.acceptance_raw != 0).count() as f64 / windows.len() as f64, 1),
-        "validated_bursts": validated,
+        "validated_bursts": 0,
+        "usable_bursts": usable,
         "pulse_rate_vs_hr_mae_bpm": (!errs.is_empty()).then(|| round(errs.iter().map(|e| e.abs()).sum::<f64>() / errs.len() as f64, 1)),
         "pulse_amplitude_median": median(&amps).map(|v| round(v, 1)),
-        "status": if validated > 0 { Status::Experimental } else { Status::Unavailable },
+        "status": if usable > 0 { Status::Experimental } else { Status::Unavailable },
         "per_burst": results,
     })
 }
@@ -202,6 +206,17 @@ mod tests {
     }
 
     #[test]
+    fn gain_changes_split_bursts_and_missing_quality_rejects() {
+        let mut windows = synth(40, 66.0, false);
+        for w in &mut windows[20..] { w.status_raw = 1; }
+        assert_eq!(bursts(&windows).len(), 2);
+        for w in &mut windows { w.motion = None; }
+        let result = summarize(&windows, &|_| Some(66.0));
+        assert_eq!(result["usable_bursts"], 0);
+        assert_eq!(result["validated_bursts"], 0);
+    }
+
+    #[test]
     fn recovers_pulse_rate_and_validates_against_hr() {
         for inverted in [false, true] {
             let w = synth(40, 66.0, inverted);
@@ -210,7 +225,9 @@ mod tests {
             assert_eq!(b["fs_hz_estimated"], 25.0);
             let pr = b["pulse_rate_peaks_bpm"].as_f64().unwrap();
             assert!((pr - 66.0).abs() < 2.0, "pr {pr}");
-            assert_eq!(b["status"], "VALIDATED", "{b}");
+            assert_eq!(b["status"], "EXPERIMENTAL", "{b}");
+            assert_eq!(b["agreement_with_firmware"], true);
+            assert_eq!(b["external_validation"], false);
             assert!(b["continuity_ratio"].as_f64().unwrap() < 3.0);
         }
     }

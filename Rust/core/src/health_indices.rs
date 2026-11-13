@@ -41,12 +41,23 @@ pub fn tachogram(s: &[S1]) -> (i64, Vec<f64>) {
     (t0, x)
 }
 
+const MAX_GAP_S: usize = 15;
+const MAX_EDGE_S: usize = 10;
+
 /// Linear gap filling of a window when >= `min_cov` is present and no >25 % jump remains.
 fn filled(w: &[f64], min_cov: f64) -> Option<Vec<f64>> {
+    filled_max_gap(w, min_cov, MAX_GAP_S)
+}
+
+fn filled_max_gap(w: &[f64], min_cov: f64, max_gap: usize) -> Option<Vec<f64>> {
     let known: Vec<(usize, f64)> = w.iter().copied().enumerate().filter(|(_, v)| v.is_finite()).collect();
     if (known.len() as f64) < min_cov * w.len() as f64 || known.len() < 2 {
         return None;
     }
+    // Bounded fabrication: no gap longer than MAX_GAP_S is bridged and at most MAX_EDGE_S is held
+    // at either edge, even when total coverage is high (a long straight line has no HF power).
+    if known[0].0 > MAX_EDGE_S || w.len() - 1 - known.last()?.0 > MAX_EDGE_S
+        || known.windows(2).any(|p| p[1].0 - p[0].0 > max_gap) { return None; }
     let mut out = vec![0.0; w.len()];
     let mut j = 0;
     for (i, o) in out.iter_mut().enumerate() {
@@ -145,7 +156,8 @@ pub fn cpc(s: &[S1]) -> Vec<(i64, &'static str)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + n <= x.len() {
-        if let Some(mut w) = filled(&x[i..i + n], 0.7) {
+        // 512-s coupling windows target 0.01-0.4 Hz over the whole window: a 30-s bridge is tolerable
+        if let Some(mut w) = filled_max_gap(&x[i..i + n], 0.7, 30) {
             detrend_linear(&mut w);
             let p = periodogram(&w);
             let (vlf, lf, hf) = (band(&p, n, 0.0039, 0.01) + band(&p, n, 0.01, 0.04), band(&p, n, 0.04, 0.1), band(&p, n, 0.1, 0.4));
@@ -179,7 +191,8 @@ pub fn cpc_summary(c: &[(i64, &str)]) -> Value {
         "windows": c.len(),
         "stable_pct": share("stable"), "unstable_pct": share("unstable"), "vlf_pct": share("vlf"), "mixed_pct": share("mixed"),
         "series": c.iter().map(|(t, k)| json!([t, k])).collect::<Vec<_>>(),
-        "method": "RR-only proxy of cardiopulmonary coupling (Thomas 2005): spectral concentration of the 1 Hz tachogram, 512-s windows",
+        "method": "RR-only proxy of cardiopulmonary coupling (Thomas 2005): spectral concentration of the 1 Hz tachogram, 512-s windows; not validated against PSG",
+        "status": "EXPERIMENTAL",
     })
 }
 
@@ -246,9 +259,8 @@ pub fn hr_surges(s: &[S1]) -> Vec<i64> {
     out
 }
 
-/// Night respiratory-disturbance summary: on-strap SpO2 desaturation windows (>= 3 points below
-/// the night's p90, i.e. the ODI-3 criterion applied to spot windows), HR surges per hour of sleep,
-/// breathing irregularity. A screening indicator, not an AHI.
+/// Descriptive observations from sparse, unvalidated firmware SpO2 spot windows and HR changes.
+/// Never an ODI, AHI, event count or respiratory screening score.
 pub fn respiratory_disturbance(spo2_series: &[(i64, f64)], surges: usize, sleep_hours: f64, breathing: &Value) -> Value {
     let meds: Vec<f64> = spo2_series.iter().map(|x| x.1).collect();
     let base = percentile(&meds, 90.0);
@@ -256,15 +268,16 @@ pub fn respiratory_disturbance(spo2_series: &[(i64, f64)], surges: usize, sleep_
     let surge_h = surges as f64 / sleep_hours.max(0.5);
     let desat_pct = (!meds.is_empty()).then(|| 100.0 * desat.len() as f64 / meds.len() as f64);
     let irregular = breathing["irregular_windows_pct"].as_f64();
-    // composite 0-100: each component scaled to its own "clearly abnormal" level
-    let parts: Vec<f64> = [desat_pct.map(|v| (v / 30.0).min(1.0)), Some((surge_h / 15.0).min(1.0)), irregular.map(|v| (v / 40.0).min(1.0))].into_iter().flatten().collect();
     json!({
-        "index_0_100": (!parts.is_empty()).then(|| round(100.0 * parts.iter().sum::<f64>() / parts.len() as f64, 0)),
+        "index_0_100": null,
+        "status": "DESCRIPTIVE_ONLY",
+        "odi_available": false,
+        "reason": "Sparse unvalidated spot windows cannot establish ODI, AHI or screening risk",
         "desat_windows": desat.len(), "spo2_windows": meds.len(), "desat_windows_pct": desat_pct.map(|v| round(v, 1)),
         "spo2_baseline_p90": base, "spo2_nadir_window": meds.iter().copied().reduce(f64::min),
         "hr_surges": surges, "hr_surges_per_h": round(surge_h, 1),
         "breathing_irregular_pct": irregular,
-        "method": "ODI-3 on on-strap SpO2 windows + HR surges (>= 8 bpm) + breathing irregularity",
+        "method": "Observed spot windows >=3 percentage points below observed p90; not desaturation events or ODI",
     })
 }
 
@@ -532,13 +545,14 @@ pub fn fatigue(days: &[DaySeries]) -> Value {
     let load_z = (n >= 14 && ctl > 1.0).then(|| (atl / ctl - 1.0) / 0.3);
     let debt_h: f64 = last7.iter().filter_map(|d| d.asleep_min.map(|a| (d.need_min - a).max(0.0))).sum::<f64>() / 60.0;
     let debt_z = last7.iter().any(|d| d.asleep_min.is_some()).then(|| debt_h / 3.0 - 0.5);
+    // CV of RMSSD in ms (Plews 2012), not of its logarithm (which would shrink it ~4x)
     let cv = {
-        let v: Vec<f64> = last7.iter().filter_map(|d| d.ln_rmssd).collect();
+        let v: Vec<f64> = last7.iter().filter_map(|d| d.ln_rmssd.map(f64::exp)).collect();
         (v.len() >= 5).then(|| round(100.0 * std_sample(&v).unwrap() / mean(&v).unwrap(), 1))
     };
     let mut out = composite(&[("hrv_7d_vs_swc", 0.35, hrv_z), ("rhr_7d", 0.20, rhr_z), ("acute_chronic_load", 0.25, load_z), ("sleep_debt", 0.20, debt_z)], 1.2, 0.0);
     out["ln_rmssd_7d"] = json!(hrv7.map(|v| round(v, 3)));
-    out["ln_rmssd_cv_7d_pct"] = json!(cv);
+    out["rmssd_cv_7d_pct"] = json!(cv);
     out["sleep_debt_7d_h"] = json!(round(debt_h, 1));
     out["banister"] = json!({"ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(tsb, 1), "days": n,
         "calibration_days": BANISTER_CALIBRATION_DAYS, "calibrating": n < BANISTER_CALIBRATION_DAYS});
@@ -563,8 +577,9 @@ pub fn recovery_v2(days: &[DaySeries]) -> Value {
     let rhr = z(today.rhr, &col(|d| d.rhr), 1.5).map(|v| -v);
     let resp = z(today.resp, &col(|d| d.resp), 0.4).map(|v| -v);
     let perf = today.asleep_min.map(|a| ((a / today.need_min).min(1.1) - 0.85) / 0.12);
-    let last_hrr = days.iter().rev().find_map(|d| d.hrr60);
-    let hrr = z(last_hrr, &days.iter().filter_map(|d| d.hrr60).collect::<Vec<_>>(), 3.0);
+    // latest heart-rate recovery of the last 7 days vs the sessions strictly before it
+    let last = days.iter().enumerate().rev().take(7).find_map(|(i, d)| d.hrr60.map(|v| (i, v)));
+    let hrr = last.and_then(|(i, v)| z(Some(v), &days[..i].iter().filter_map(|d| d.hrr60).collect::<Vec<_>>(), 3.0));
     let b = banister(&days.iter().map(|d| d.trimp).collect::<Vec<_>>());
     let (ctl, _, tsb) = *b.last().unwrap();
     let form = (n >= BANISTER_CALIBRATION_DAYS && ctl > 1.0).then(|| (tsb / ctl / 0.3).clamp(-3.0, 3.0));
@@ -643,6 +658,28 @@ mod tests {
             let rr = 1000.0 + amp * (2.0 * PI * f_resp * t as f64).sin();
             S1 { ts: 1_000_000 + t as i64, hr: 60_000.0 / rr, rr: vec![rr], sleep: true, grav: Some([0.0, 0.6, -0.8]), dyn_g: Some(0.005), ..Default::default() }
         }).collect()
+    }
+
+    #[test]
+    fn spectral_gap_policy_rejects_long_gaps_and_edge_extrapolation() {
+        let mut w = vec![1000.0; 300];
+        for v in &mut w[100..130] { *v = f64::NAN; }
+        assert!(filled(&w, 0.8).is_none());
+        let mut w = vec![1000.0; 300];
+        for v in &mut w[..20] { *v = f64::NAN; }
+        assert!(filled(&w, 0.8).is_none());
+        let mut w = vec![1000.0; 300];
+        for v in &mut w[..5] { *v = f64::NAN; }
+        for v in &mut w[50..60] { *v = f64::NAN; }
+        assert!(filled(&w, 0.8).is_some());
+    }
+
+    #[test]
+    fn spot_oximetry_never_produces_screening_score() {
+        let result = respiratory_disturbance(&[(0, 99.0), (1200, 90.0)], 20, 1.0, &Value::Null);
+        assert!(result["index_0_100"].is_null());
+        assert_eq!(result["odi_available"], false);
+        assert_eq!(result["desat_windows"], 1);
     }
 
     #[test]
