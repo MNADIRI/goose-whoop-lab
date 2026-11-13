@@ -166,26 +166,25 @@ struct FormeTodayView: View {
     return NavigationLink(value: FormeRoute.effort(day.isToday ? nil : day.key)) {
       AuraCard(family: .effort, radius: 32, padding: 20, height: 240) {
         Text("Effort").font(Forme.sans(17, .regular, relativeTo: .headline))
-        DotNumber(value: day.strain.map { FF.num($0, 1) }, size: 52).padding(.top, 18)
-        Text("sur 21 · " + (count == 0 ? "aucune séance" : "\(count) séance\(count > 1 ? "s" : "")")).font(Forme.sans(12, .semibold, relativeTo: .caption)).foregroundStyle(Forme.onBright2).padding(.top, 6)
-        Track(fraction: (day.strain ?? 0) / 21, fill: Forme.hex(0xa51d29), track: .white.opacity(0.66)).padding(.top, 14)
+        DotNumber(value: day.strain.map { FF.num($0) }, size: 52, unit: day.strain == nil ? nil : "%", unitSize: 18).padding(.top, 18)
+        Text(count == 0 ? "Aucune séance" : "\(count) séance\(count > 1 ? "s" : "")").font(Forme.sans(12, .semibold, relativeTo: .caption)).foregroundStyle(Forme.onBright2).padding(.top, 6)
+        Track(fraction: (day.strain ?? 0) / 100, fill: Forme.hex(0xa51d29), track: .white.opacity(0.66)).padding(.top, 14)
         Spacer(minLength: 8)
         VeilPill(text: day.strainWord, ink: Forme.Family.effort.pillInk)
       }
     }
     .buttonStyle(FormePressStyle())
-    .accessibilityLabel("Effort \(day.strain.map { FF.num($0, 1) } ?? "—") sur 21, \(day.strainWord). Voir le détail")
+    .accessibilityLabel("Effort \(day.strain.map { "\(FF.num($0)) %" } ?? "en attente"), \(day.strainWord). Voir le détail")
   }
 
   private func sleepCard(_ day: FormeDay) -> some View {
-    let need = (model.smartWake.plan["recommended_sleep_min"] as? Double) ?? 480
-    let score = day.sleepScore(needMin: need)
+    let score = day.sleepScore
     let st = day.stages
     return NavigationLink(value: FormeRoute.sleep(day.isToday ? nil : day.key)) {
       AuraCard(family: .sleep, radius: 32, padding: 20, height: 240) {
         Text("Sommeil").font(Forme.sans(17, .regular, relativeTo: .headline))
         DotNumber(value: score.map { FF.num($0) }, size: 52, unit: "%", unitSize: 18).padding(.top, 18)
-        Text(day.hasNight ? "\(FF.dur(day.asleepMin)) · \(FF.num(day.efficiency)) % d'efficacité" : "Pas de nuit mesurée")
+        Text(day.hasNight ? "\(FF.dur(day.asleepMin)) dormies" : "Pas de nuit mesurée")
           .font(Forme.sans(12, .semibold, relativeTo: .caption)).foregroundStyle(Forme.onBright2).lineLimit(1).minimumScaleFactor(0.75).padding(.top, 6)
         Group {
           if day.hasNight {
@@ -226,17 +225,36 @@ struct FormeTodayView: View {
 
   // MARK: sections
 
+  /// Awake resting vitals of the day. The night values (VFC, pouls, température, respiration, SpO₂,
+  /// perfusion) live in Sommeil: measured lying still, they are the comparable reference.
   @ViewBuilder private func bodySection(_ day: FormeDay) -> some View {
-    SectionTitle(title: "Ton corps cette nuit", subtitle: "Comparé à ta référence personnelle")
-    LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
-      MetricTile(label: "Variabilité cardiaque (VFC)", value: FF.num(day.hrv), unit: "ms", note: day.hrvDelta.map { "\(FF.signed($0)) vs référence" } ?? "Référence en cours", noteColor: (day.hrvDelta ?? 0) >= 0 ? Forme.posInk : Forme.calmInk)
-      MetricTile(label: "Pouls au repos", value: FF.num(day.rhr), unit: "bpm", note: day.rhrDelta.map { "\(FF.signed($0)) vs référence" } ?? "Référence en cours", noteColor: (day.rhrDelta ?? 0) <= 0 ? Forme.posInk : Forme.calmInk)
-      MetricTile(label: "Respiration", value: FF.num(day.resp, 1), unit: "/min", note: day.respDelta.map { abs($0) < 1 ? "Dans ta plage" : "\(FF.signed($0, 1)) vs référence" } ?? "Pendant le sommeil")
-      MetricTile(label: "Température cutanée", value: day.skinDelta.map { FF.signed($0, 1) } ?? FF.num(day.skin, 1), unit: "°C", note: day.skinDelta == nil ? "Au poignet, cette nuit" : "Écart à ta référence")
-      MetricTile(label: "SpO₂ (saturation en oxygène)", value: FF.num(day.spo2), unit: "%", note: day.spo2Min.map { "Minimum \(FF.num($0)) %" })
-      MetricTile(label: "Perfusion", value: day.perfusionPct.map { FF.signed($0) } ?? "—", unit: "%", note: "Amplitude du pouls")
+    SectionTitle(title: "Ton corps aujourd'hui", subtitle: "Au repos, éveillé et immobile · comparé à tes autres journées")
+    if day.restAvailable {
+      LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+        restTile("Pouls au repos", day.restHR, "bpm", 0, day.restReference { $0.restHR }, higherIsBetter: false)
+        restTile("Variabilité cardiaque (VFC)", day.restHRV, "ms", 0, day.restReference { $0.restHRV }, higherIsBetter: true)
+        restTile("Respiration", day.restResp, "/min", 1, day.restReference { $0.restResp }, higherIsBetter: nil)
+        restTile("Température cutanée", day.daySkin, "°C", 1, day.restReference { $0.daySkin }, higherIsBetter: nil)
+      }
+      .padding(.top, 12)
+      Text("Mesuré sur \(FF.num(day.restMinutes)) min de calme. SpO₂ et perfusion sont mesurées la nuit : voir Sommeil.")
+        .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted).padding(.top, 10).padding(.horizontal, 4)
+    } else {
+      FrostCard(radius: 32, padding: 18, spacing: 6) {
+        Text("En attente de moments calmes").font(Forme.sans(15, .semibold, relativeTo: .subheadline)).foregroundStyle(Forme.ink)
+        Text("Pouls, VFC et respiration du jour se mesurent dès que tu restes immobile quelques minutes (assis, au bureau). Les valeurs de la nuit sont dans Sommeil.")
+          .font(Forme.sans(13, .medium, relativeTo: .footnote)).foregroundStyle(Forme.muted).fixedSize(horizontal: false, vertical: true)
+      }
+      .padding(.top, 12)
     }
-    .padding(.top, 12)
+  }
+
+  private func restTile(_ label: String, _ v: Double?, _ unit: String, _ dec: Int, _ ref: Double?, higherIsBetter: Bool?) -> MetricTile {
+    let delta = v.flatMap { x in ref.map { x - $0 } }
+    let good = delta.map { d in higherIsBetter.map { $0 ? d >= 0 : d <= 0 } ?? true } ?? true
+    return MetricTile(label: label, value: FF.num(v, dec), unit: unit,
+                      note: v == nil ? "Pas encore mesurée" : (delta.map { "\(FF.signed($0, dec)) vs tes jours" } ?? "Référence en cours"),
+                      noteColor: delta == nil ? Forme.muted : (good ? Forme.posInk : Forme.calmInk))
   }
 
   @ViewBuilder private func daySection(_ day: FormeDay) -> some View {
@@ -356,7 +374,9 @@ struct FormeTodayHeader: View {
   }
 
   private var syncText: String {
-    if !connected { return "Déconnecté" }
+    if !connected {
+      return ["connecting", "discovering"].contains(ble.connectionState) || ble.reconnectState.hasPrefix("retrying") ? "Connexion…" : "Déconnecté"
+    }
     if ble.isHistoricalSyncing { return "Synchro…" }
     return ble.lastHistoricalSyncCompletedAt.map { FF.clock($0) } ?? "Connecté"
   }

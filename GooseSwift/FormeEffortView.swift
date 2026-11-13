@@ -46,10 +46,10 @@ struct FormeEffortView: View {
         Spacer()
         VeilPill(text: day.strainWord, ink: Forme.Family.effort.pillInk)
       }
-      DotNumber(value: day.strain.map { FF.num($0, 1) }, size: 88, unit: day.strain == nil ? nil : "/ 21", unitSize: 22).padding(.top, 22)
+      DotNumber(value: day.strain.map { FF.num($0) }, size: 88, unit: day.strain == nil ? nil : "%", unitSize: 26).padding(.top, 22)
       Text(n == 0 ? "Aucune séance, effort du quotidien surtout en zone \(main)." : "\(n == 1 ? "Une séance" : "\(n) séances"), surtout en zone\(main <= 2 ? "s 1 et 2" : " \(main)").")
         .font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426)).padding(.top, 14)
-      Track(fraction: (day.strain ?? 0) / 21, fill: Forme.hex(0xa51d29), track: .white.opacity(0.66)).padding(.top, 14)
+      Track(fraction: (day.strain ?? 0) / 100, fill: Forme.hex(0xa51d29), track: .white.opacity(0.66)).padding(.top, 14)
       Spacer(minLength: 12)
       VeilPanel {
         HStack(spacing: 8) {
@@ -244,8 +244,8 @@ struct FormeEffortView: View {
       } else {
         Text("Le ratio arrive après 21 jours de données.").font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
       }
-      DotWeekChart(cols: week.map { .init(label: FF.day($0.date, "EEEEE").uppercased(), value: $0.strain, today: $0.key == day.key) }, maxValue: 21, lit: Forme.ink, todayLit: Forme.strain)
-        .accessibilityLabel("Effort : " + week.map { "\(FF.day($0.date, "EEEE")) \(FF.num($0.strain, 1))" }.joined(separator: ", "))
+      DotWeekChart(cols: week.map { .init(label: FF.day($0.date, "EEEEE").uppercased(), value: $0.strain, today: $0.key == day.key) }, maxValue: 100, lit: Forme.ink, todayLit: Forme.strain)
+        .accessibilityLabel("Effort : " + week.map { "\(FF.day($0.date, "EEEE")) \(FF.num($0.strain)) %" }.joined(separator: ", "))
     }
     .padding(.top, 12)
   }

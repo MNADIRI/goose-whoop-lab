@@ -255,6 +255,10 @@ final class GooseBLEClient: NSObject, ObservableObject {
   var autoReconnectTargetID: UUID?
   var autoReconnectInFlight = false
   var startupReconnectAttempted = false
+  /// Silent retry after a failed/stalled connect (backoff 3 s → 3 min), reset on success.
+  var reconnectRetryCount = 0
+  var reconnectRetryWorkItem: DispatchWorkItem?
+  var connectWatchdogWorkItem: DispatchWorkItem?
   var pendingConnectionReason: String?
   var pendingAutomaticHistoricalSyncReason: String?
   var clientHelloSentForCurrentConnection = false

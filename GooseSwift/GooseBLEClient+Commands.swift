@@ -662,6 +662,7 @@ extension GooseBLEClient {
     updateReconnectState(reason.hasPrefix("auto") || reason == "restore" ? "connecting" : reconnectState)
     record(source: "ble", title: "connect.started", body: "reason=\(reason) evidence=\(evidence) \(peripheral.name ?? fallbackName ?? rememberedDeviceName ?? "WHOOP") \(peripheral.identifier.uuidString)")
     pendingConnectionReason = reason
+    armConnectWatchdog(for: peripheral)
     central.connect(
       peripheral,
       options: [
@@ -671,14 +672,66 @@ extension GooseBLEClient {
     )
   }
 
+  /// A connect that is still pending after 25 s (strap busy, encryption stalled, stale restore)
+  /// is cancelled and retried, so the app never sits on a dead "connecting".
+  func armConnectWatchdog(for peripheral: CBPeripheral) {
+    connectWatchdogWorkItem?.cancel()
+    let id = peripheral.identifier
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, let active = self.activePeripheral, active.identifier == id,
+            active.state != .connected, self.connectionState == "connecting" else { return }
+      self.record(level: .warn, source: "ble", title: "connect.watchdog", body: "pending connect stalled; retrying")
+      self.central?.cancelPeripheralConnection(active)
+      self.activePeripheral = nil
+      self.autoReconnectInFlight = false
+      self.pendingConnectionReason = nil
+      self.updateConnectionState("disconnected")
+      self.scheduleReconnectRetry(reason: "watchdog")
+    }
+    connectWatchdogWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: work)
+  }
+
+  func scheduleReconnectRetry(reason: String) {
+    guard rememberedDeviceID != nil else { return }
+    reconnectRetryWorkItem?.cancel()
+    let delays: [Double] = [3, 8, 20, 45, 90, 180]
+    let delay = delays[min(reconnectRetryCount, delays.count - 1)]
+    reconnectRetryCount += 1
+    updateReconnectState("retrying in \(Int(delay)) s")
+    record(source: "ble", title: "reconnect.retry_scheduled", body: "reason=\(reason) attempt=\(reconnectRetryCount) delay=\(Int(delay))s")
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      if let active = self.activePeripheral, active.state == .connected { return }
+      self.attemptAutomaticReconnect(reason: "retry.\(reason)")
+    }
+    reconnectRetryWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  /// Back in the foreground and not connected: try now instead of waiting for the backoff.
+  func reconnectOnForegroundIfNeeded() {
+    guard rememberedDeviceID != nil else { return }
+    if let active = activePeripheral, active.state == .connected { return }
+    if connectionState == "connecting", activePeripheral != nil { return } // watchdog owns it
+    reconnectRetryWorkItem?.cancel()
+    reconnectRetryCount = 0
+    activePeripheral = nil
+    autoReconnectInFlight = false
+    attemptAutomaticReconnect(reason: "foreground")
+  }
+
   func attemptAutomaticReconnect(reason: String) {
     guard let central, central.state == .poweredOn else {
       updateReconnectState("waiting for bluetooth")
       return
     }
-    guard activePeripheral == nil else {
-      updateReconnectState("already connected")
-      return
+    if let active = activePeripheral {
+      if active.state == .connected || connectionState == "connecting" {
+        updateReconnectState(active.state == .connected ? "already connected" : "connecting")
+        return
+      }
+      activePeripheral = nil  // stale handle from a failed/cancelled attempt
     }
     guard !autoReconnectInFlight else {
       record(level: .debug, source: "ble", title: "reconnect.skipped", body: "already in flight")

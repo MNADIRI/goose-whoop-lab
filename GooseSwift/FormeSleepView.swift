@@ -7,7 +7,8 @@ struct FormeSleepView: View {
   let dayKey: String?
   let isRoot: Bool
 
-  private var need: Double { (smartWake.plan["recommended_sleep_min"] as? Double) ?? 480 }
+  /// Tonight's recommendation (need + debt payback) from the smart-wake plan.
+  private var tonightNeed: Double { (smartWake.plan["recommended_sleep_min"] as? Double) ?? 480 }
 
   var body: some View {
     FormeScroll {
@@ -15,11 +16,12 @@ struct FormeSleepView: View {
       DetailHeader(title: "Sommeil", chip: day.map(nightChip), showsBack: !isRoot)
       if let day {
         hero(day).padding(.top, 24)
+        if day.hasNight { scoreParts(day) }
         smartWakeCard.padding(.top, 12)
         if day.hasNight {
           phases(day)
           quality(day)
-          breathing(day)
+          bodyTonight(day)
           TechDetails(subtitle: "Couplage cardio-respiratoire, spectre, horaires", rows: tech(day)).padding(.top, 32)
         }
       } else {
@@ -33,7 +35,7 @@ struct FormeSleepView: View {
   }
 
   private func hero(_ day: FormeDay) -> some View {
-    let score = day.sleepScore(needMin: need)
+    let score = day.sleepScore
     return AuraCard(family: .sleep, radius: 44, padding: 24, height: 330) {
       HStack {
         Text("Performance").font(Forme.sans(20, .regular, relativeTo: .title3)).tracking(-0.2)
@@ -41,7 +43,7 @@ struct FormeSleepView: View {
         VeilPill(text: day.sleepWord(score), ink: Forme.Family.sleep.pillInk)
       }
       DotNumber(value: score.map { FF.num($0) }, size: 88, unit: "%").padding(.top, 22)
-      Text(day.hasNight ? "\(FF.dur(day.asleepMin)) dormies sur un objectif de \(FF.dur(need))." : "Aucune nuit mesurée pour ce jour.")
+      Text(day.hasNight ? "\(FF.dur(day.asleepMin)) dormies pour un besoin de \(FF.dur(day.sleepNeed))." : "Aucune nuit mesurée pour ce jour.")
         .font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426)).padding(.top, 14)
       Spacer(minLength: 12)
       VeilPanel {
@@ -95,7 +97,7 @@ struct FormeSleepView: View {
     return VStack(alignment: .leading, spacing: 4) {
       Text("Ce soir").font(Forme.sans(13, .semibold, relativeTo: .footnote)).foregroundStyle(Forme.ink2)
       Text(lights.map { "Lumière éteinte vers \(FF.clock($0))" } ?? "Règle ton heure de réveil pour un conseil").font(Forme.sans(17, .semibold, relativeTo: .headline)).foregroundStyle(Forme.ink)
-      Text("Besoin de \(FF.dur(need))" + (debt.map { $0 >= 10 ? " · dette de \(FF.dur($0)) à rattraper" : " · pas de dette" } ?? ""))
+      Text("Besoin de \(FF.dur(tonightNeed))" + (debt.map { $0 >= 10 ? " · dette de \(FF.dur($0)) à rattraper" : " · pas de dette" } ?? ""))
         .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
     }
     .padding(.horizontal, 16)
@@ -157,11 +159,41 @@ struct FormeSleepView: View {
     .padding(.top, 12)
   }
 
-  @ViewBuilder private func breathing(_ day: FormeDay) -> some View {
-    SectionTitle(title: "Respiration et oxygène", subtitle: "Mesurés pendant le sommeil")
+  // MARK: score breakdown
+
+  @ViewBuilder private func scoreParts(_ day: FormeDay) -> some View {
+    SectionTitle(title: "Ce qui fait ton score", subtitle: "Durée, continuité, régularité et phases, pondérées")
+    FrostCard(radius: 36, padding: 20, spacing: 0) {
+      ForEach(Array(day.sleepScoreParts.enumerated()), id: \.offset) { i, p in
+        if i > 0 { FormeDivider() }
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(alignment: .firstTextBaseline) {
+            Text(p.label).font(Forme.sans(15, .semibold, relativeTo: .subheadline)).foregroundStyle(Forme.ink)
+            Text("\(Int((p.weight * 100).rounded())) %").font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
+            Spacer()
+            Text(p.score.map { FF.num($0) } ?? "—").font(Forme.sans(17, .semibold, relativeTo: .headline)).monospacedDigit().foregroundStyle(Forme.ink)
+          }
+          Track(fraction: (p.score ?? 0) / 100, fill: p.score == nil ? Forme.dotOff : Forme.blue, track: Forme.sunken)
+          Text(p.explain).font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 12)
+        .accessibilityElement(children: .combine)
+      }
+    }
+    .padding(.top, 12)
+  }
+
+  // MARK: body tonight
+
+  @ViewBuilder private func bodyTonight(_ day: FormeDay) -> some View {
+    SectionTitle(title: "Ton corps cette nuit", subtitle: "Mesuré au calme du sommeil, comparé à ta référence")
     LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+      MetricTile(label: "Variabilité cardiaque (VFC)", value: FF.num(day.hrv), unit: "ms", note: day.hrvDelta.map { "\(FF.signed($0)) vs référence" } ?? "Référence en cours", noteColor: (day.hrvDelta ?? 0) >= 0 ? Forme.posInk : Forme.calmInk)
+      MetricTile(label: "Pouls au repos", value: FF.num(day.rhr), unit: "bpm", note: day.rhrDelta.map { "\(FF.signed($0)) vs référence" } ?? "Référence en cours", noteColor: (day.rhrDelta ?? 0) <= 0 ? Forme.posInk : Forme.calmInk)
       MetricTile(label: "Respiration", value: FF.num(day.resp, 1), unit: "/min", note: day.respDelta.map { abs($0) < 1 ? "Dans ta plage" : "\(FF.signed($0, 1)) vs référence" } ?? "Fréquence médiane")
+      MetricTile(label: "Température cutanée", value: day.skinDelta.map { FF.signed($0, 1) } ?? FF.num(day.skin, 1), unit: "°C", note: day.skinDelta == nil ? "Au poignet" : "Écart à ta référence")
       MetricTile(label: "SpO₂ (saturation en oxygène)", value: FF.num(day.spo2), unit: "%", note: day.spo2Min.map { "Minimum \(FF.num($0)) %" })
+      MetricTile(label: "Perfusion", value: day.perfusionPct.map { FF.signed($0) } ?? "—", unit: "%", note: "Amplitude du pouls vs nuits")
       MetricTile(label: "Perturbations respiratoires", value: FF.num(day.respDisturbance), unit: "/100", note: day.hrSurgesPerH.map { "\(FF.num($0, 1)) accélérations du pouls/h" })
       MetricTile(label: "Mouvements", value: FF.num(day.postureChangesPerH, 1), unit: "/h", note: "Changements de position")
     }

@@ -629,7 +629,9 @@ enum FF {
   static func signed(_ v: Double?, _ d: Int = 0) -> String {
     guard let v, v.isFinite else { return "—" }
     let s = num(abs(v), d)
-    return v > 0 ? "+\(s)" : (v < 0 ? "−\(s)" : s)
+    let p = pow(10, Double(d))
+    let r = (v * p).rounded() / p  // sign of the displayed value, so −0,04 never shows as "−0"
+    return r > 0 ? "+\(s)" : (r < 0 ? "−\(s)" : s)
   }
   static func dur(_ minutes: Double?) -> String {
     guard let m = minutes, m.isFinite else { return "—" }

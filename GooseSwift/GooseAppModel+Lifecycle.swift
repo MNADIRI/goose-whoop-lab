@@ -6,6 +6,7 @@ extension GooseAppModel {
   func handleAppLifecycleChange(_ phase: String) {
     let power = Self.currentOvernightPowerState()
     ble.record(source: "app.lifecycle", title: "scene_phase", body: "\(phase) | \(power.summary)")
+    if phase == "active" { ble.reconnectOnForegroundIfNeeded() }
     guard overnightGuardActive else {
       return
     }

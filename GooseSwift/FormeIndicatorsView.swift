@@ -224,7 +224,7 @@ struct FormeTrendsView: View {
     Metric(id: "resp", title: "Respiration", unit: "/min", decimals: 1, color: Forme.calmInk) { $0["night"]["respiration"]["rpm"].d },
     Metric(id: "skin", title: "Température cutanée", unit: "°C", decimals: 1, color: Forme.strainInk) { $0["night"]["skin_temp_c"].d },
     Metric(id: "recovery", title: "Récupération", unit: "%", decimals: 0, color: Forme.green) { $0["indices"]["recovery"]["score"].d },
-    Metric(id: "strain", title: "Effort", unit: "/21", decimals: 1, color: Forme.strain) { $0["day"]["strain_0_21"].d },
+    Metric(id: "strain", title: "Effort", unit: "%", decimals: 0, color: Forme.strain) { $0["day"]["strain_pct"].d ?? $0["day"]["strain_0_21"].d.map { $0 / 21 * 100 } },
     Metric(id: "steps", title: "Pas", unit: "", decimals: 0, color: Forme.ink) { $0["day"]["steps"].d },
     Metric(id: "kcal", title: "Calories actives", unit: "kcal", decimals: 0, color: Forme.strainDeep) { $0["day"]["energy"]["active_kcal"].d },
     Metric(id: "stress", title: "Stress moyen", unit: "/100", decimals: 0, color: Forme.muted) { $0["day"]["stress"]["mean"].d },
@@ -285,6 +285,7 @@ struct FormeMethodsView: View {
     ("Nuit", [
       ("Sommeil", "État du bracelet + actigraphie Cole-Kripke (te Lindert) au-dessus du bruit du capteur."),
       ("Phases", "Pouls, VFC locale et mouvement, sans EEG : environ 65 à 73 % d'accord au mieux."),
+      ("Score de sommeil", "Dimensions RU-SATED (Buysse 2014) : durée vs besoin 40 % (NSF, Hirshkowitz 2015), continuité 30 % (efficacité ≥ 85 %, endormissement ≤ 30 min, éveil ≤ 20 min ; Ohayon 2017), régularité 15 % (milieu de nuit vs 7 nuits ; Phillips 2017, Windred 2024), phases 15 % (profond ≥ 15 %, paradoxal ≥ 20 %)."),
       ("Pouls au repos", "Plus basse moyenne sur 5 min pendant le sommeil."),
       ("VFC", "RMSSD sur battements réellement successifs, battements fendus fusionnés, seuil d'artefact adaptatif."),
       ("Respiration", "Arythmie sinusale respiratoire, pic 0,13–0,45 Hz sur fenêtres de 2 min."),
@@ -297,10 +298,11 @@ struct FormeMethodsView: View {
       ("Fatigue et forme", "Modèle de Banister : charge 7 j (fatigue) contre 42 j (forme de fond)."),
     ]),
     ("Journée", [
-      ("Effort", "TRIMP d'Edwards sur zones de FC max (Tanaka), ramené sur 0–21. Charge : 7 j contre 28 j."),
+      ("Effort", "TRIMP d'Edwards sur zones de FC max (Tanaka), en % de la capacité du jour : 100 × (1 − e^(−TRIMP/250)). 50 % ≈ 1 h soutenue. Charge : 7 j contre 28 j."),
       ("Calories", "Actives : Keytel 2005 au-dessus du repos ; totales : + métabolisme de base (Mifflin-St Jeor)."),
       ("Stress", "Pouls au-dessus du repos, éveillé et immobile, rapporté à la réserve cardiaque."),
       ("Pas", "Compteur du bracelet : il compte au poignet, le téléphone compte dans la poche."),
+      ("Mesures du jour", "Pouls, VFC et respiration sur des fenêtres de 5 min éveillé et immobile ; comparées à tes autres journées, pas à la nuit."),
       ("Séances", "Détection sur le pouls et la signature du mouvement, puis type et exercices reconnus par l'IMU."),
     ]),
   ]

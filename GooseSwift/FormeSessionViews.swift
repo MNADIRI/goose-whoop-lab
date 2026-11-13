@@ -67,7 +67,7 @@ struct FormeSessionView: View {
       let w: Double = pct >= 0.9 ? 5 : (pct >= 0.8 ? 4 : (pct >= 0.7 ? 3 : (pct >= 0.6 ? 2 : (pct >= 0.5 ? 1 : 0))))
       trimp += w
     }
-    return 21 * (1 - exp(-trimp / 250))
+    return 100 * (1 - exp(-trimp / 250))
   }
 
   private func statusWord(_ s: SportSession) -> String {
@@ -83,7 +83,7 @@ struct FormeSessionView: View {
         Spacer()
         VeilPill(text: statusWord(s), ink: Forme.Family.effort.pillInk)
       }
-      DotNumber(value: st.map { FF.num($0, 1) }, size: 80, unit: st == nil ? nil : "/ 21", unitSize: 22).padding(.top, 20)
+      DotNumber(value: st.map { FF.num($0) }, size: 80, unit: st == nil ? nil : "%", unitSize: 26).padding(.top, 20)
       Text("\(FF.clock(s.start)) – \(FF.clock(s.end)) · \(FF.dur(s.durationMin))").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426)).padding(.top, 12)
       Spacer(minLength: 12)
       VeilPanel {

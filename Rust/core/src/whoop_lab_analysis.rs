@@ -24,7 +24,7 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "9"; // 9: split-beat merge + adaptive R-R artefact threshold, IMU start-up sentinel; 8: spectral HRV, CPC-refined stages, health indices // 5: signed R26 base, optical gain state; 6: on-strap SpO2
+const ALGORITHM_VERSION: &str = "10"; // 10: composite sleep score (duration/continuity/regularity/architecture), awake resting vitals, strain %; 9: 9: split-beat merge + adaptive R-R artefact threshold, IMU start-up sentinel; 8: spectral HRV, CPC-refined stages, health indices // 5: signed R26 base, optical gain state; 6: on-strap SpO2
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
@@ -783,6 +783,7 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
     });
     let spo2_series: Vec<(i64, f64)> = out["spo2"]["series"].as_array().map(|a| a.iter().filter_map(|x| Some((x[0].as_i64()?, x[1].as_f64()?))).collect()).unwrap_or_default();
     out["respiratory_disturbance"] = hi::respiratory_disturbance(&spo2_series, surges.len(), asleep / 60.0, &out["breathing_regularity"]);
+    out["sleep_score"] = sleep_score(&out, &prev, SLEEP_NEED_MIN);
     out["recovery"] = baselines::recovery(&baselines::RecoveryInputs {
         rmssd: hrv["rmssd_ms"].as_f64(),
         resting_hr: Some(round(resting, 1)),
@@ -793,6 +794,110 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
         resp_base: b_resp,
     });
     out
+}
+
+/// Default adult sleep need (NSF: 7-9 h for 18-64 y, Hirshkowitz 2015; AASM/SRS >= 7 h).
+pub const SLEEP_NEED_MIN: f64 = 480.0;
+
+/// Linear 0-100 between a "poor" and a "good" threshold (either direction).
+fn ramp(v: f64, poor: f64, good: f64) -> f64 {
+    (100.0 * (v - poor) / (good - poor)).clamp(0.0, 100.0)
+}
+
+/// Composite sleep score, 0-100, built on the RU-SATED dimensions (Buysse 2014) we can measure:
+/// - duration vs need (40 %): Hirshkowitz 2015 (NSF), Watson 2015 (AASM/SRS) — 100 at >= need,
+///   0 at <= half of it;
+/// - continuity (30 %): NSF sleep-quality indicators (Ohayon 2017): efficiency >= 85 % good (65 %
+///   poor), latency <= 30 min good (>= 60 min poor), WASO <= 20 min good (>= 60 min poor);
+/// - regularity (15 %): mid-sleep shift vs the median of the previous 7 nights, <= 30 min good,
+///   >= 2 h poor (Phillips 2017 SRI, Windred 2024: regularity predicts outcomes beyond duration;
+///   social jet lag, Wittmann 2006);
+/// - architecture (15 %, low weight: staging without EEG is ~65-73 % accurate): deep >= 15 % and
+///   REM >= 20 % good, deep <= 5 % and REM <= 10 % poor (Ohayon 2004 norms, Ohayon 2017).
+/// Missing components are dropped and the remaining weights renormalised.
+fn sleep_score(n: &Value, prev: &[&Value], need_min: f64) -> Value {
+    let asleep = n["asleep_min"].as_f64();
+    let mut comps: Vec<(&str, f64, Option<f64>, Value)> = Vec::new();
+    comps.push(("duration", 0.40, asleep.map(|a| ramp(a / need_min, 0.5, 1.0)), json!({"asleep_min": asleep, "need_min": need_min})));
+    let eff = n["efficiency_pct"].as_f64();
+    let lat = n["latency_min"].as_f64();
+    let waso = n["sleep_detail"]["waso_min"].as_f64();
+    let cont: Vec<f64> = [eff.map(|e| ramp(e, 65.0, 85.0)), lat.map(|l| ramp(l, 60.0, 30.0)), waso.map(|w| ramp(w, 60.0, 20.0))].into_iter().flatten().collect();
+    comps.push(("continuity", 0.30, mean(&cont), json!({"efficiency_pct": eff, "latency_min": lat, "waso_min": waso})));
+    let mid = |v: &Value| Some((v["sleep_onset"].as_i64()? + v["wake_time"].as_i64()?) / 2);
+    let wrap = |d: i64| ((d % DAY) + DAY + DAY / 2) % DAY - DAY / 2;
+    let shift = mid(n).and_then(|m| {
+        let devs: Vec<f64> = prev.iter().rev().take(7).filter_map(|p| mid(p)).map(|pm| wrap(m - pm) as f64 / 60.0).collect();
+        (devs.len() >= 3).then(|| median(&devs).unwrap().abs())
+    });
+    comps.push(("regularity", 0.15, shift.map(|m| ramp(m, 120.0, 30.0)), json!({"midpoint_shift_min": shift.map(|v| v.round())})));
+    let st = &n["stages_min"];
+    let arch = asleep.filter(|a| *a > 60.0).and_then(|a| {
+        let deep = 100.0 * st["deep"].as_f64()? / a;
+        let rem = 100.0 * st["rem"].as_f64()? / a;
+        Some((deep, rem, (ramp(deep, 5.0, 15.0) + ramp(rem, 10.0, 20.0)) / 2.0))
+    });
+    comps.push(("architecture", 0.15, arch.map(|x| x.2), json!({"deep_pct": arch.map(|x| round(x.0, 1)), "rem_pct": arch.map(|x| round(x.1, 1))})));
+    let wsum: f64 = comps.iter().filter(|c| c.2.is_some()).map(|c| c.1).sum();
+    let score = (wsum > 0.0 && comps[0].2.is_some()).then(|| comps.iter().filter_map(|c| c.2.map(|v| v * c.1)).sum::<f64>() / wsum);
+    let mut components = serde_json::Map::new();
+    for (name, w, v, detail) in comps {
+        components.insert(name.into(), json!({"weight": w, "score": v.map(|x| x.round()), "detail": detail}));
+    }
+    json!({
+        "score": score.map(|v| v.round()),
+        "need_min": need_min,
+        "components": components,
+        "method": "RU-SATED dimensions: duration vs need 40 %, continuity (efficiency, latency, WASO; NSF/Ohayon 2017) 30 %, regularity (mid-sleep shift) 15 %, architecture (deep/REM share) 15 %",
+        "status": "EXPERIMENTAL",
+    })
+}
+
+/// Awake resting vitals: 5-min windows after the morning wake, awake (band != sleep), still for
+/// >= 90 % of seconds (dynamic acceleration < 0.03 g), R-R dropped on strap motion flags.
+/// Comparable from day to day; not comparable to the night (posture, digestion, caffeine...).
+/// SpO2 is only computed by the strap during sleep, so it has no daytime value.
+fn day_rest_vitals(s: &[Sample], after: i64, extras: &std::collections::HashMap<i64, Extra>) -> Value {
+    let awake: Vec<&Sample> = s.iter().filter(|x| x.ts > after && x.band != "sleep" && x.hr > 0.0).collect();
+    let mut wins: BTreeMap<i64, Vec<&Sample>> = BTreeMap::new();
+    for x in &awake {
+        wins.entry(x.ts / 300).or_default().push(x);
+    }
+    let still: Vec<Vec<&Sample>> = wins
+        .into_values()
+        .filter(|w| w.len() >= 270 && w.iter().filter(|x| x.dyn_g.is_some_and(|d| d < 0.03)).count() as f64 >= 0.9 * w.len() as f64)
+        .collect();
+    let skin: Vec<f64> = awake.iter().filter_map(|x| x.skin).collect();
+    let skin_med = median(&skin).map(|v| round(v, 2));
+    if still.len() < 3 {
+        return json!({"available": false, "still_windows": still.len(), "skin_temp_c": skin_med});
+    }
+    let hr_means: Vec<f64> = still.iter().map(|w| w.iter().map(|x| x.hr).sum::<f64>() / w.len() as f64).collect();
+    let samples: Vec<Sample> = still
+        .iter()
+        .flatten()
+        .map(|x| {
+            let mut y = (*x).clone();
+            if extras.get(&x.ts).is_some_and(|e| e.cardiac_flags & MOTION_FLAGS != 0) {
+                y.rr.clear();
+            }
+            y
+        })
+        .collect();
+    let (hrv, _, _) = hrv_with_qc(&samples);
+    let resp = respiratory_rate(&samples);
+    json!({
+        "available": true,
+        "still_windows": still.len(),
+        "still_min": still.len() * 5,
+        "resting_hr_bpm": percentile(&hr_means, 10.0).map(|v| round(v, 1)),
+        "hr_still_median_bpm": median(&hr_means).map(|v| round(v, 1)),
+        "rmssd_ms": hrv["rmssd_ms"].clone(),
+        "respiration_rpm": resp["rpm"].clone(),
+        "skin_temp_c": skin_med,
+        "method": "awake 5-min windows, >= 90 % still (< 0.03 g), after wake; HRV/respiration on R-R without strap motion flags",
+        "status": "EXPERIMENTAL",
+    })
 }
 
 #[allow(dead_code)]
@@ -924,6 +1029,8 @@ fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, restin
         "hr_zone_min": {"z1": zone_min[0], "z2": zone_min[1], "z3": zone_min[2], "z4": zone_min[3], "z5": zone_min[4]},
         "edwards_trimp": round(trimp, 1),
         "strain_0_21": round(21.0 * (1.0 - (-trimp / 250.0).exp()), 1),
+        // same saturating curve as a share of the day's capacity: 100 % is unreachable, 50 % ~ 1 h hard
+        "strain_pct": round(100.0 * (1.0 - (-trimp / 250.0).exp()), 0),
         "hrmax_used": hrmax.round(),
         "energy": {"resting_kcal": resting_kcal.round(), "active_kcal": active_kcal.round(), "total_kcal": (resting_kcal + active_kcal).round(),
                    "profile_defaults_used": profile.weight_kg.is_none() || profile.age.is_none()},
@@ -1137,7 +1244,11 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
             let night = analyze_night(&night_samples, &nights_hist, &optical_windows, &spo2_values, &extras);
             let day_samples = load_samples(&conn, d0, d1)?;
             let rhr = night["resting_hr_bpm"].as_f64();
-            let day = analyze_day(&day_samples, d0, now, &options.profile, rhr, &extras);
+            let mut day = analyze_day(&day_samples, d0, now, &options.profile, rhr, &extras);
+            if day.is_object() {
+                let after = night["wake_time"].as_i64().unwrap_or(d0);
+                day["rest_vitals"] = day_rest_vitals(&day_samples, after, &extras);
+            }
             let value = json!({ "date": key, "night": night, "day": day });
             conn.execute(
                 "INSERT OR REPLACE INTO whoop_lab_days (date_key, input_count, input_last_ts, algorithm_version, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",

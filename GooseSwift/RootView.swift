@@ -18,7 +18,7 @@ struct RootView: View {
           }
         }
       }
-      SyncToastHost(ble: model.ble)
+      // the sync state lives in the Forme header pill; the legacy toast is not shown any more
     }
     .gooseScreenBackground()
     .onAppear {

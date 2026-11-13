@@ -51,6 +51,7 @@ extension GooseBLEClient: CBCentralManagerDelegate {
       processCachedServicesIfAvailable(peripheral, reason: "restore.connected")
     case .connecting:
       updateConnectionState("connecting")
+      armConnectWatchdog(for: peripheral)
     case .disconnected, .disconnecting:
       if central.state == .poweredOn {
         connect(peripheral, reason: "restore")
@@ -74,6 +75,8 @@ extension GooseBLEClient: CBCentralManagerDelegate {
       if !startupReconnectAttempted {
         startupReconnectAttempted = true
         attemptAutomaticReconnect(reason: "startup")
+      } else if activePeripheral == nil {
+        attemptAutomaticReconnect(reason: "bluetooth_on")
       }
     } else {
       isScanning = false
@@ -83,6 +86,8 @@ extension GooseBLEClient: CBCentralManagerDelegate {
       updateConnectionState("disconnected")
       updateReconnectState("waiting for bluetooth")
       connectedAt = nil
+      connectWatchdogWorkItem?.cancel()
+      reconnectRetryWorkItem?.cancel()
     }
   }
 
@@ -158,6 +163,9 @@ extension GooseBLEClient: CBCentralManagerDelegate {
       return
     }
 
+    connectWatchdogWorkItem?.cancel()
+    reconnectRetryWorkItem?.cancel()
+    reconnectRetryCount = 0
     let fallbackName = discoveredDevices.first { $0.id == peripheral.identifier }?.name
     guard let evidence = whoopIdentityEvidence(for: peripheral, fallbackName: fallbackName) else {
       pendingConnectionReason = nil
@@ -217,9 +225,13 @@ extension GooseBLEClient: CBCentralManagerDelegate {
     autoReconnectInFlight = false
     autoConnectForPhysiologyCapture = false
     pendingConnectionReason = nil
+    connectWatchdogWorkItem?.cancel()
+    if activePeripheral?.identifier == peripheral.identifier { activePeripheral = nil }
     updateConnectionState("connect failed")
     updateReconnectState("connect failed")
     record(level: .error, source: "ble", title: "connect.failed", body: error?.localizedDescription ?? "unknown")
+    // transient (encryption timeout, strap busy): retry silently with backoff
+    if rememberedDeviceID == peripheral.identifier { scheduleReconnectRetry(reason: "connect_failed") }
   }
 
   func centralManager(

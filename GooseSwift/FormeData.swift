@@ -131,10 +131,33 @@ struct FormeDay {
   var postureChangesPerH: Double? { night["movement"]["posture_changes_per_h"].d }
   var regularity: Double? { root["circadian"]["sleep_regularity_index"].d }
 
-  /// Sleep performance vs need (8 h unless the smart-wake plan knows better).
-  func sleepScore(needMin: Double) -> Double? {
-    guard let a = asleepMin, needMin > 0 else { return nil }
-    return min(100, (a / needMin * 100).rounded())
+  /// Composite sleep score (Rust: duration vs need, continuity, regularity, architecture).
+  var sleepScore: Double? {
+    night["sleep_score"]["score"].d ?? asleepMin.map { min(100, ($0 / sleepNeed * 100).rounded()) }
+  }
+  var sleepNeed: Double { night["sleep_score"]["need_min"].d ?? 480 }
+
+  struct ScorePart: Identifiable {
+    let id: String
+    let label: String
+    let explain: String
+    let weight: Double
+    let score: Double?
+  }
+  var sleepScoreParts: [ScorePart] {
+    let c = night["sleep_score"]["components"]
+    let d = { (k: String) in c[k]["detail"] }
+    let dur = d("duration")
+    let cont = d("continuity")
+    let reg = d("regularity")
+    let arch = d("architecture")
+    let shift = reg["midpoint_shift_min"].d
+    return [
+      ScorePart(id: "duration", label: "Durée", explain: "\(FF.dur(dur["asleep_min"].d)) sur un besoin de \(FF.dur(dur["need_min"].d))", weight: c["duration"]["weight"].d ?? 0.4, score: c["duration"]["score"].d),
+      ScorePart(id: "continuity", label: "Continuité", explain: "Efficacité \(FF.num(cont["efficiency_pct"].d)) % · endormi en \(FF.num(cont["latency_min"].d)) min · \(FF.num(cont["waso_min"].d)) min éveillé", weight: c["continuity"]["weight"].d ?? 0.3, score: c["continuity"]["score"].d),
+      ScorePart(id: "regularity", label: "Régularité", explain: shift.map { "Milieu de nuit décalé de \(FF.dur($0)) vs tes 7 dernières nuits" } ?? "Après 3 nuits mesurées", weight: c["regularity"]["weight"].d ?? 0.15, score: c["regularity"]["score"].d),
+      ScorePart(id: "architecture", label: "Phases", explain: "Profond \(FF.num(arch["deep_pct"].d)) % · paradoxal \(FF.num(arch["rem_pct"].d)) %", weight: c["architecture"]["weight"].d ?? 0.15, score: c["architecture"]["score"].d),
+    ]
   }
   func sleepWord(_ score: Double?) -> String {
     guard let s = score else { return "En attente" }
@@ -143,7 +166,8 @@ struct FormeDay {
 
   // MARK: effort / day
 
-  var strain: Double? { day["strain_0_21"].d }
+  /// Day effort as a share of the day's capacity, 0-100 % (saturating TRIMP curve).
+  var strain: Double? { day["strain_pct"].d ?? day["strain_0_21"].d.map { ($0 / 21 * 100).rounded() } }
   var steps: Int? { day["steps"].i }
   var activeKcal: Double? { day["energy"]["active_kcal"].d }
   var totalKcal: Double? { day["energy"]["total_kcal"].d }
@@ -157,6 +181,20 @@ struct FormeDay {
   var longestSedentary: Double? { day["sedentary"]["longest_bout_min"].d }
   var stressMean: Double? { day["stress"]["mean"].d }
   var stressMax: Double? { day["stress"]["max"].d }
+
+  // awake resting vitals (5-min still windows after waking)
+  var rest: J { day["rest_vitals"] }
+  var restAvailable: Bool { rest["available"].b == true }
+  var restHR: Double? { rest["resting_hr_bpm"].d }
+  var restHRV: Double? { rest["rmssd_ms"].d }
+  var restResp: Double? { rest["respiration_rpm"].d }
+  var daySkin: Double? { rest["skin_temp_c"].d }
+  var restMinutes: Double? { rest["still_min"].d }
+  /// Mean of the same value over the previous days (up to 7) — the day's own reference.
+  func restReference(_ pick: (FormeDay) -> Double?) -> Double? {
+    let vals = past(8).dropLast().compactMap(pick)
+    return vals.count >= 2 ? vals.reduce(0, +) / Double(vals.count) : nil
+  }
   var stressMinutes: [String: Double] { day["stress"]["minutes"].dict.compactMapValues { $0.d } }
   var coverageH: Double? { day["coverage_h"].d }
   var zones: [Double] { (1...5).map { day["hr_zone_min"]["z\($0)"].d ?? 0 } }
@@ -165,7 +203,7 @@ struct FormeDay {
   }
   var strainWord: String {
     guard let s = strain else { return "En attente" }
-    return s >= 18 ? "Très élevé" : (s >= 14 ? "Élevé" : (s >= 10 ? "Modéré" : "Léger"))
+    return s >= 86 ? "Très élevé" : (s >= 67 ? "Élevé" : (s >= 48 ? "Modéré" : "Léger"))
   }
 
   // MARK: load
