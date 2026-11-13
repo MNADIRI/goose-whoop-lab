@@ -399,18 +399,21 @@ final class SportController: ObservableObject {
       scoped = folder
       dir = folder.appendingPathComponent("sport", isDirectory: true)
     }
-    // a personal model trained offline (lab/sport/train.py) is picked up from <dataset>/models
+    // Only explicitly reviewed models placed in <dataset>/models are eligible for activation.
     let models = dir.appendingPathComponent("models", isDirectory: true)
     let newest = (try? FileManager.default.contentsOfDirectory(at: models, includingPropertiesForKeys: nil))?
       .filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }.last
     var install: [String: Any]?
     if let newest, let data = try? Data(contentsOf: newest), let m = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let metrics = m["metrics"] as? [String: Any], metrics["review_status"] as? String == "approved",
        let version = m["version"] as? String, version != UserDefaults.standard.string(forKey: "sport.installedModel") {
-      install = ["version": version, "kind": m["kind"] as? String ?? "logreg", "params": m["params"] ?? [:], "metrics": m["metrics"] ?? [:]]
+      install = ["version": version, "kind": m["kind"] as? String ?? "logreg", "params": m["params"] ?? [:], "metrics": metrics, "activate": true]
     }
     call("sport.export_dataset", ["output_dir": dir.path]) { _ in scoped?.stopAccessingSecurityScopedResource() }
     if let install {
-      call("sport.install_model", install) { _ in UserDefaults.standard.set(install["version"], forKey: "sport.installedModel") }
+      call("sport.install_model", install) { result in
+        if result["ok"] as? Bool == true { UserDefaults.standard.set(install["version"], forKey: "sport.installedModel") }
+      }
     }
   }
 

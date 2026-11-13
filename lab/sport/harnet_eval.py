@@ -20,6 +20,7 @@ import sys
 import time
 
 import numpy as np
+from scipy.signal import resample_poly
 
 FS_IN, FS_OUT, WIN_S, HOP_S = 100.0, 30.0, 10.0, 5.0
 
@@ -90,12 +91,20 @@ def windows(t, a, g):
         if len(idx) < FS_IN * WIN_S:
             continue
         tt = t[idx]
-        grid = np.arange(tt[0], tt[-1] - WIN_S, HOP_S)
-        for t0 in grid:
-            tw = t0 + np.arange(int(WIN_S * FS_OUT)) / FS_OUT
-            aw = np.vstack([np.interp(tw, tt, a[k, idx]) for k in range(3)])
-            gw = np.vstack([np.interp(tw, tt, g[k, idx]) for k in range(3)])
-            res.append((aw, gw))
+        if not np.isfinite(tt).all() or np.any(np.diff(tt) <= 0):
+            continue
+        source_grid = tt[0] + np.arange(int(np.floor((tt[-1] - tt[0]) * FS_IN)) + 1) / FS_IN
+        raw = np.vstack([np.interp(source_grid, tt, v[idx]) for v in np.vstack([a, g])])
+        if not np.isfinite(raw).all():
+            continue
+        # Polyphase low-pass filtering is required before reducing the sampling rate.
+        reduced = resample_poly(raw, 3, 10, axis=1, padtype="line")
+        length, hop = int(WIN_S * FS_OUT), int(HOP_S * FS_OUT)
+        # Exclude filter transients at both segment boundaries.
+        trim = int(FS_OUT)
+        for start in range(trim, reduced.shape[1] - trim - length + 1, hop):
+            segment = reduced[:, start:start + length]
+            res.append((segment[:3], segment[3:]))
     return res
 
 

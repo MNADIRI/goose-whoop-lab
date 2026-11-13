@@ -2,9 +2,8 @@
 
 Reads whoop-lab/sport/sessions.jsonl, trains a multinomial logistic regression on the engine's
 session features (Rust/core/src/sport.rs FEATURES), evaluates it leave-one-session-out against the
-rules-v1 predictions stored with each session, and writes models/<version>.json. The app installs
-the newest file of that folder at its next dataset export (sport.install_model) and every later
-prediction records the model version.
+rules-v1 predictions stored with each session, and writes candidates/<version>.json. Candidates are never installed automatically. Promotion requires an independent held-out
+evaluation and a named review; LOSO here is exploratory only.
 
   python -I train.py ~/Library/Mobile\\ Documents/com~apple~CloudDocs/whoop-lab/sport
 """
@@ -41,6 +40,8 @@ def main(root):
     if len(rows) < 8 or len({r["label_type"] for r in rows}) < 2:
         sys.exit(f"{len(rows)} labelled sessions: need >= 8 over >= 2 classes")
     X = np.array([[float(r["features_json"].get(f, 0.0)) for f in FEATURES] for r in rows])
+    if not np.isfinite(X).all():
+        sys.exit("non-finite features: repair the dataset before training")
     y = np.array([CLASSES.index(r["label_type"]) for r in rows])
     rules_ok = np.mean([r.get("predicted_type") == r["label_type"] for r in rows])
     ok = 0
@@ -54,13 +55,13 @@ def main(root):
     W, b = fit((X - mu) / sd, y)
     version = time.strftime("personal-logreg-%Y%m%d-%H%M")
     model = {"version": version, "kind": "logreg", "params": {"features": FEATURES, "classes": CLASSES, "mean": mu.tolist(), "std": sd.tolist(), "weights": W.tolist(), "bias": b.tolist()},
-             "metrics": {"n_sessions": len(rows), "loso_accuracy": round(loso, 3), "rules_v1_accuracy": round(float(rules_ok), 3)}}
-    os.makedirs(os.path.join(root, "models"), exist_ok=True)
-    out = os.path.join(root, "models", version + ".json")
+             "metrics": {"review_status": "pending", "n_sessions": len(rows), "loso_accuracy": round(loso, 3), "rules_v1_accuracy": round(float(rules_ok), 3)}}
+    os.makedirs(os.path.join(root, "candidates"), exist_ok=True)
+    out = os.path.join(root, "candidates", version + ".json")
     json.dump(model, open(out, "w"), indent=1)
     print(f"{len(rows)} sessions | leave-one-session-out {loso:.0%} vs rules-v1 {rules_ok:.0%} -> {out}")
     if loso < rules_ok:
-        print("personal model is not better than the rules yet: delete the file to keep rules-v1")
+        print("personal model is not better than the rules yet: candidate remains inactive")
 
 
 if __name__ == "__main__":

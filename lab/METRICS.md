@@ -1,3 +1,7 @@
+> **Review v10:** certaines descriptions ci-dessous documentent v9. Les changements de statut,
+> les époques inconnues et le retrait du faux CPC/ODI sont détaillés dans
+> [OPUS_REVIEW.md](../docs/review/OPUS_REVIEW.md). Le Python historique n'est pas encore un oracle de parité v10.
+
 # WHOOP 5.0 : des capteurs à l'écran
 
 Source unique : toutes les valeurs physiologiques de l'app sont calculées **sur l'iPhone** par le cœur

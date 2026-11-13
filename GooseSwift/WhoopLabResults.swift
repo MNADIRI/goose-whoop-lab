@@ -63,6 +63,8 @@ struct LabNight: Decodable {
   let wakeTime: Double?
   let timeInBedMin: Double?
   let asleepMin: Double?
+  let unknownMin: Double?
+  let sleepDurationStatus: String?
   let latencyMin: Double?
   let efficiencyPct: Double?
   let awakenings: Int?
@@ -99,7 +101,7 @@ struct LabNight: Decodable {
   let hypnogramStart: Double?
 
   /// Sleep performance: hours slept vs an 8 h need.
-  var sleepScore: Int? { asleepMin.map { min(100, Int(($0 / 480 * 100).rounded())) } }
+  var sleepScore: Int? { guard sleepDurationStatus != "INCOMPLETE_LOWER_BOUND" else { return nil }; return asleepMin.map { min(100, Int(($0 / 480 * 100).rounded())) } }
 }
 
 struct LabHRV: Decodable {

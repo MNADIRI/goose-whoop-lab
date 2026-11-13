@@ -47,6 +47,9 @@ fn filled(w: &[f64], min_cov: f64) -> Option<Vec<f64>> {
     if (known.len() as f64) < min_cov * w.len() as f64 || known.len() < 2 {
         return None;
     }
+    // No edge extrapolation or long-gap fabrication, even when total coverage is high.
+    if known[0].0 != 0 || known.last()?.0 != w.len() - 1
+        || known.windows(2).any(|p| p[1].0 - p[0].0 > 6) { return None; }
     let mut out = vec![0.0; w.len()];
     let mut j = 0;
     for (i, o) in out.iter_mut().enumerate() {
@@ -179,7 +182,8 @@ pub fn cpc_summary(c: &[(i64, &str)]) -> Value {
         "windows": c.len(),
         "stable_pct": share("stable"), "unstable_pct": share("unstable"), "vlf_pct": share("vlf"), "mixed_pct": share("mixed"),
         "series": c.iter().map(|(t, k)| json!([t, k])).collect::<Vec<_>>(),
-        "method": "RR-only proxy of cardiopulmonary coupling (Thomas 2005): spectral concentration of the 1 Hz tachogram, 512-s windows",
+        "method": "Exploratory RR-only spectral pattern; not cardiopulmonary coupling or a sleep stage",
+        "status": "EXPERIMENTAL",
     })
 }
 
@@ -246,9 +250,8 @@ pub fn hr_surges(s: &[S1]) -> Vec<i64> {
     out
 }
 
-/// Night respiratory-disturbance summary: on-strap SpO2 desaturation windows (>= 3 points below
-/// the night's p90, i.e. the ODI-3 criterion applied to spot windows), HR surges per hour of sleep,
-/// breathing irregularity. A screening indicator, not an AHI.
+/// Descriptive observations from sparse, unvalidated firmware SpO2 spot windows and HR changes.
+/// Never an ODI, AHI, event count or respiratory screening score.
 pub fn respiratory_disturbance(spo2_series: &[(i64, f64)], surges: usize, sleep_hours: f64, breathing: &Value) -> Value {
     let meds: Vec<f64> = spo2_series.iter().map(|x| x.1).collect();
     let base = percentile(&meds, 90.0);
@@ -256,15 +259,16 @@ pub fn respiratory_disturbance(spo2_series: &[(i64, f64)], surges: usize, sleep_
     let surge_h = surges as f64 / sleep_hours.max(0.5);
     let desat_pct = (!meds.is_empty()).then(|| 100.0 * desat.len() as f64 / meds.len() as f64);
     let irregular = breathing["irregular_windows_pct"].as_f64();
-    // composite 0-100: each component scaled to its own "clearly abnormal" level
-    let parts: Vec<f64> = [desat_pct.map(|v| (v / 30.0).min(1.0)), Some((surge_h / 15.0).min(1.0)), irregular.map(|v| (v / 40.0).min(1.0))].into_iter().flatten().collect();
     json!({
-        "index_0_100": (!parts.is_empty()).then(|| round(100.0 * parts.iter().sum::<f64>() / parts.len() as f64, 0)),
+        "index_0_100": null,
+        "status": "DESCRIPTIVE_ONLY",
+        "odi_available": false,
+        "reason": "Sparse unvalidated spot windows cannot establish ODI, AHI or screening risk",
         "desat_windows": desat.len(), "spo2_windows": meds.len(), "desat_windows_pct": desat_pct.map(|v| round(v, 1)),
         "spo2_baseline_p90": base, "spo2_nadir_window": meds.iter().copied().reduce(f64::min),
         "hr_surges": surges, "hr_surges_per_h": round(surge_h, 1),
         "breathing_irregular_pct": irregular,
-        "method": "ODI-3 on on-strap SpO2 windows + HR surges (>= 8 bpm) + breathing irregularity",
+        "method": "Observed spot windows >=3 percentage points below observed p90; not desaturation events or ODI",
     })
 }
 
@@ -634,6 +638,27 @@ mod tests {
             let rr = 1000.0 + amp * (2.0 * PI * f_resp * t as f64).sin();
             S1 { ts: 1_000_000 + t as i64, hr: 60_000.0 / rr, rr: vec![rr], sleep: true, grav: Some([0.0, 0.6, -0.8]), dyn_g: Some(0.005), ..Default::default() }
         }).collect()
+    }
+
+    #[test]
+    fn spectral_gap_policy_rejects_long_gaps_and_edge_extrapolation() {
+        let mut w = vec![1000.0; 300];
+        for v in &mut w[100..130] { *v = f64::NAN; }
+        assert!(filled(&w, 0.8).is_none());
+        let mut w = vec![1000.0; 300];
+        w[0] = f64::NAN;
+        assert!(filled(&w, 0.8).is_none());
+        w[0] = 1000.0;
+        w[50] = f64::NAN;
+        assert!(filled(&w, 0.8).is_some());
+    }
+
+    #[test]
+    fn spot_oximetry_never_produces_screening_score() {
+        let result = respiratory_disturbance(&[(0, 99.0), (1200, 90.0)], 20, 1.0, &Value::Null);
+        assert!(result["index_0_100"].is_null());
+        assert_eq!(result["odi_available"], false);
+        assert_eq!(result["desat_windows"], 1);
     }
 
     #[test]
