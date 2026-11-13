@@ -450,9 +450,17 @@ pub fn vo2max_uth(hrmax: f64, hrrest: f64) -> Option<f64> {
 
 /// Banister fitness-fatigue: CTL (42 d) and ATL (7 d) exponentially weighted daily loads,
 /// TSB = CTL - ATL ("form"). Series oldest first.
+/// Days of history before the Banister fitness/fatigue balance is trusted (~4 chronic time constants
+/// would be ideal; 28 days is the usual practical minimum).
+pub const BANISTER_CALIBRATION_DAYS: usize = 28;
+
+/// Banister impulse-response (EWMA 7 d fatigue / 42 d fitness). Both averages are seeded with the
+/// mean load of the first week instead of zero, so a short history does not read as a sudden
+/// overload (from zero, ATL rises ~6x faster than CTL and TSB is always strongly negative).
 pub fn banister(daily: &[f64]) -> Vec<(f64, f64, f64)> {
     let (ka, kc) = (1.0 - (-1.0f64 / 7.0).exp(), 1.0 - (-1.0f64 / 42.0).exp());
-    let (mut atl, mut ctl) = (0.0, 0.0);
+    let seed = mean(&daily[..daily.len().min(7)]).unwrap_or(0.0);
+    let (mut atl, mut ctl) = (seed, seed);
     daily.iter().map(|l| { atl += ka * (l - atl); ctl += kc * (l - ctl); (ctl, atl, ctl - atl) }).collect()
 }
 
@@ -532,7 +540,8 @@ pub fn fatigue(days: &[DaySeries]) -> Value {
     out["ln_rmssd_7d"] = json!(hrv7.map(|v| round(v, 3)));
     out["ln_rmssd_cv_7d_pct"] = json!(cv);
     out["sleep_debt_7d_h"] = json!(round(debt_h, 1));
-    out["banister"] = json!({"ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(tsb, 1)});
+    out["banister"] = json!({"ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(tsb, 1), "days": n,
+        "calibration_days": BANISTER_CALIBRATION_DAYS, "calibrating": n < BANISTER_CALIBRATION_DAYS});
     out["method"] = json!("HRV 7-d mean vs SWC (Plews/Buchheit), RHR 7-d, Banister ATL/CTL, 7-d sleep debt; logistic");
     out
 }
@@ -558,7 +567,7 @@ pub fn recovery_v2(days: &[DaySeries]) -> Value {
     let hrr = z(last_hrr, &days.iter().filter_map(|d| d.hrr60).collect::<Vec<_>>(), 3.0);
     let b = banister(&days.iter().map(|d| d.trimp).collect::<Vec<_>>());
     let (ctl, _, tsb) = *b.last().unwrap();
-    let form = (n >= 14 && ctl > 1.0).then(|| (tsb / ctl / 0.3).clamp(-3.0, 3.0));
+    let form = (n >= BANISTER_CALIBRATION_DAYS && ctl > 1.0).then(|| (tsb / ctl / 0.3).clamp(-3.0, 3.0));
     let mut out = composite(&[("hrv_night", 0.30, hrv), ("hrv_morning", 0.10, morning), ("resting_hr", 0.20, rhr), ("respiration", 0.05, resp),
         ("sleep_performance", 0.15, perf), ("hr_recovery_after_effort", 0.10, hrr), ("training_form", 0.10, form)], 1.6, 0.2);
     if hrv.is_none() {
@@ -680,5 +689,16 @@ mod tests {
         assert_eq!(workout_type(160.0, Some(165.0), 0.6, 0.4, 0.7), "course");
         assert_eq!(workout_type(5.0, None, 0.12, 0.5, 0.6), "vélo / rameur");
         assert_eq!(workout_type(100.0, Some(105.0), 0.2, 0.5, 0.3), "marche");
+    }
+
+    #[test]
+    fn banister_seeded_short_history_is_not_overloaded() {
+        // Steady training from day one: balance stays near zero instead of a deep negative TSB.
+        let b = banister(&[40.0, 0.0, 80.0, 30.0, 0.0]);
+        let (ctl, atl, tsb) = *b.last().unwrap();
+        assert!(ctl > 25.0 && atl > 20.0, "seeded: ctl {ctl} atl {atl}");
+        assert!(tsb.abs() < 10.0, "tsb {tsb}");
+        // Constant load: perfectly balanced.
+        assert!(banister(&[50.0; 10]).iter().all(|&(_, _, t)| t.abs() < 1e-9));
     }
 }

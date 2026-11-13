@@ -56,7 +56,7 @@ struct FormeRecoveryView: View {
       ("sleep_performance", "Performance du sommeil", day.asleepMin.map { "\(FF.dur($0)) dormies" } ?? "—"),
       ("hrv_morning", "VFC au réveil", day.morningHRV.map { "\(FF.num($0)) ms" } ?? "—"),
       ("hr_recovery_after_effort", "Récupération cardiaque après effort", "—"),
-      ("training_form", "Forme d'entraînement (Banister)", day.banister.tsb.map { "TSB \(FF.signed($0, 0))" } ?? "—"),
+      ("training_form", "Forme d'entraînement (Banister)", day.formCalibration.map { "Calibration \($0.days)/\($0.needed) j" } ?? day.banister.tsb.map { "TSB \(FF.signed($0, 0))" } ?? "—"),
       ("respiration", "Respiration", day.resp.map { "\(FF.num($0, 1)) /min" } ?? "—"),
     ]
     SectionTitle(title: "Ce qui fait ton score", subtitle: "Écart à ta référence et poids de chaque signal")

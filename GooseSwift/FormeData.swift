@@ -82,6 +82,12 @@ struct FormeDay {
     let b = indices["fatigue"]["banister"]
     return (b["atl"].d, b["ctl"].d, b["tsb"].d)
   }
+  /// Banister balance needs ~4 weeks of history: (days of history, days required).
+  var formCalibration: (days: Int, needed: Int)? {
+    let b = indices["fatigue"]["banister"]
+    let days = Int(b["days"].d ?? 0), needed = Int(b["calibration_days"].d ?? 28)
+    return days < needed ? (days, needed) : nil
+  }
 
   enum Zone { case optimal, moderate, low, calibrating }
   var recoveryZone: Zone {

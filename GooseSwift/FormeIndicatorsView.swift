@@ -125,9 +125,29 @@ struct FormeIndicatorsView: View {
         MiniStat(label: "Forme de fond", value: FF.num(b.ctl))
         MiniStat(label: "Fraîcheur", value: FF.signed(b.tsb))
       }
+      if let c = day.formCalibration {
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(spacing: 8) {
+            FormePill(text: "En calibration · \(c.days)/\(c.needed) jours", ink: Forme.ink2, bg: Forme.sunken)
+            Spacer(minLength: 0)
+          }
+          Track(fraction: Double(c.days) / Double(c.needed), fill: Forme.ink2)
+          Text("L'équilibre fatigue/forme se lit après 4 semaines de port. D'ici là, les chiffres ci-dessus suivent ta charge sans verdict.")
+            .font(Forme.sans(13, .regular, relativeTo: .footnote)).foregroundStyle(Forme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      } else {
+        formCursor(b.tsb)
+      }
+    }
+    .padding(.top, 12)
+  }
+
+  @ViewBuilder private func formCursor(_ tsb: Double?) -> some View {
+    VStack(spacing: 14) {
       GeometryReader { g in
         let w = g.size.width
-        let t = min(max(((b.tsb ?? 0) + 30) / 60, 0), 1)
+        let t = min(max(((tsb ?? 0) + 30) / 60, 0), 1)
         ZStack(alignment: .leading) {
           HStack(spacing: 3) {
             Capsule().fill(Forme.strainBg)
@@ -138,11 +158,10 @@ struct FormeIndicatorsView: View {
         }
       }
       .frame(height: 8)
-      .accessibilityLabel("Fraîcheur \(FF.signed(b.tsb))")
+      .accessibilityLabel("Fraîcheur \(FF.signed(tsb))")
       HStack { Text("En charge"); Spacer(); Text("Équilibré"); Spacer(); Text("Reposé") }
         .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
     }
-    .padding(.top, 12)
   }
 
   @ViewBuilder private func device(_ day: FormeDay?) -> some View {
@@ -295,7 +314,7 @@ struct FormeMethodsView: View {
     ("Scores", [
       ("Récupération", "Écarts (z) de tes mesures de la nuit (VFC, pouls au repos…) à ta référence personnelle, pondérés."),
       ("Signaux de santé", "Chaque signal comparé à tes 30 dernières nuits ; deux signaux décalés déclenchent une alerte."),
-      ("Fatigue et forme", "Modèle de Banister : charge 7 j (fatigue) contre 42 j (forme de fond)."),
+      ("Fatigue et forme", "Modèle de Banister : charge 7 j (fatigue) contre 42 j (forme de fond), amorcées sur ta première semaine. L'équilibre n'est lu qu'après 28 jours."),
     ]),
     ("Journée", [
       ("Effort", "TRIMP d'Edwards sur zones de FC max (Tanaka), en % de la capacité du jour : 100 × (1 − e^(−TRIMP/250)). 50 % ≈ 1 h soutenue. Charge : 7 j contre 28 j."),
