@@ -23,6 +23,8 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>mn health</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -34,17 +36,17 @@
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Goose uses Bluetooth to connect to your owned WHOOP strap and read a local hello response.</string>
+	<string>mn health uses Bluetooth to connect to your owned WHOOP strap and read a local hello response.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>Goose uses Bluetooth to connect to your owned WHOOP strap and read a local hello response.</string>
+	<string>mn health uses Bluetooth to connect to your owned WHOOP strap and read a local hello response.</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>Goose reads Apple Health body mass only to prefill your local profile weight.</string>
+	<string>mn health reads Apple Health body mass only to prefill your local profile weight.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Goose uses background location to keep tracking outdoor workout routes, pace, and distance when you minimize the app.</string>
+	<string>mn health uses background location to keep tracking outdoor workout routes, pace, and distance when you minimize the app.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
-	<string>Goose uses background location to keep tracking outdoor workout routes, pace, and distance when you minimize the app.</string>
+	<string>mn health uses background location to keep tracking outdoor workout routes, pace, and distance when you minimize the app.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Goose uses location to record outdoor workout routes, pace, distance, and elevation.</string>
+	<string>mn health uses location to record outdoor workout routes, pace, distance, and elevation.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>NSSupportsLiveActivitiesFrequentUpdates</key>

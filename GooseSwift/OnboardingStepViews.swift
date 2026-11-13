@@ -41,7 +41,7 @@ struct OnboardingProfileStep: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 18) {
-      Text("These basics help Goose calculate your local metrics.")
+      Text("These basics help mn health calculate your local metrics.")
         .font(.body)
         .foregroundStyle(.secondary)
 
