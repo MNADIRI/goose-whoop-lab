@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use crate::dsp::{mean, median, percentile, round};
 use crate::GooseResult;
 
-pub const ENGINE_VERSION: &str = "sport-2"; // 2: repetition-based set segmentation (12 Nov gym session)
+pub const ENGINE_VERSION: &str = "sport-3"; // 3: neutral-palm walking excluded, strength signature = 3 named sets + cardiac load; 2: repetition-based sets
 pub const RULES_MODEL: &str = "rules-v1";
 pub const CLASSES: [&str; 4] = ["course", "tennis", "musculation", "autre"];
 /// Session feature vector (order is the contract with lab/sport/train.py and installed models).
@@ -602,7 +602,7 @@ pub fn sets_and_reps_with(imu: &Imu, steps: &BTreeMap<i64, f64>, period_hint: &d
         let tc = w.t[s0 + win / 2] as i64;
         let spm = (-4..4).map(|q| steps.get(&(tc + q)).copied().unwrap_or(0.0)).sum::<f64>() / 8.0;
         // walking: steps, arm hanging (x) with the palm side out (z > 0; a curl has z < 0), arm swing
-        let walking = spm >= 1.0 && gm[0] >= 0.6 && gm[2] > 0.1 && best.0 < 1.8;
+        let walking = spm >= 1.0 && gm[0] >= 0.6 && gm[2] > -0.1 && best.0 < 1.8;
         wins.push(Win { s: s0, g: gm, per: best.0, k: best.2, rep: best.1 >= 0.45 && energy >= 15.0 && !walking });
         s0 += hop;
     }
@@ -665,7 +665,7 @@ pub fn sets_and_reps_with(imu: &Imu, steps: &BTreeMap<i64, f64>, period_hint: &d
     }
     // a set is a stable repetition: a net change of wrist orientation is a transition
     out.retain(|x| x.reps >= 5 && x.net_turn < 0.5);
-    out.retain(|x| !(x.spm >= 1.0 && x.features[0] >= 0.6 && x.features[2] > 0.1 && x.period_s.unwrap_or(9.0) < 1.8));
+    out.retain(|x| !(x.spm >= 1.0 && x.features[0] >= 0.6 && x.features[2] > -0.1 && x.period_s.unwrap_or(9.0) < 1.8));
     // a set lasts and repeats cleanly; an unnamed movement must be even cleaner (12 Nov: most of the
     // remaining false sets were 8 s, r < 0.6 bursts between exercises)
     out.retain(|x| x.end - x.start >= 9.0 && x.confidence >= 0.5 && (movement_family(x).is_some() || (x.confidence >= 0.6 && x.reps >= 8)));
@@ -1188,7 +1188,7 @@ fn imu_window(imu: &Imu, from: f64) -> Imu {
 ///   strength    >= 2 periodic sets in the last 10 minutes (IMU);
 ///   sustained   >= 8 of the last 10 minutes at >= 50 % heart-rate reserve (other sports, and
 ///               days without IMU): daily-life bursts do not last that long.
-pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, now: i64) -> Value {
+pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, steps: &BTreeMap<i64, f64>, now: i64) -> Value {
     let last = |k: usize| -> Vec<&Minute> { mins.iter().rev().take(k).collect() };
     let run_min = last(5).iter().filter(|m| m.steps >= 140.0 || m.run_frac > 0.5).count();
     let sustained = last(10).iter().filter(|m| m.n >= 30 && m.hr.map(|h| p.hrr(h)).unwrap_or(0.0) >= 0.5).count();
@@ -1196,19 +1196,23 @@ pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, now: i64) -> Value {
     let w10 = imu_window(imu, (now - 600) as f64);
     let imu_s = w10.len() as f64 / IMU_FS;
     let strokes5 = strokes(&w5).len();
-    let sets10 = sets_and_reps(&w10).iter().filter(|s| s.periodic && s.reps >= 4).count();
+    // strength: named movements only (an unnamed periodic burst is usually walking or fidgeting),
+    // and the heart has to work (13 Nov: 3 "sets" of walking at HR 88 opened a session)
+    let sets10 = sets_and_reps_with(&w10, steps, &|_| None).iter().filter(|s| s.periodic && s.reps >= 6 && movement_family(s).is_some()).count();
+    let hrr10: Vec<f64> = last(10).iter().filter_map(|m| m.hr.map(|h| p.hrr(h))).collect();
+    let load = percentile(&hrr10, 75.0).unwrap_or(0.0);
     let kind = if run_min >= 3 {
         Some("course")
     } else if strokes5 >= 3 {
         Some("tennis")
-    } else if sets10 >= 2 {
+    } else if sets10 >= 3 && load >= 0.35 {
         Some("musculation")
     } else if sustained >= 8 {
         Some("effort soutenu")
     } else {
         None
     };
-    json!({"confirmed": kind.is_some(), "by": kind, "run_minutes": run_min, "strokes_5min": strokes5, "sets_10min": sets10, "sustained_minutes": sustained, "imu_s_10min": round(imu_s, 0)})
+    json!({"confirmed": kind.is_some(), "by": kind, "run_minutes": run_min, "strokes_5min": strokes5, "sets_10min": sets10, "hrr_p75_10min": round(load, 2), "sustained_minutes": sustained, "imu_s_10min": round(imu_s, 0)})
 }
 
 // ------------------------------------------------------------------ online engine
@@ -1337,7 +1341,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                 }
             }
             "watch" => {
-                let sig = signature(&mins, &p, &imu, now);
+                let sig = signature(&mins, &p, &imu, &steps_per_second(&secs), now);
                 st["signature"] = sig.clone();
                 let quiet_watch = recent(8).iter().all(|v| *v <= 0.35);
                 if active_recent(6) >= 3 && sig["confirmed"].as_bool() == Some(true) {
@@ -1429,7 +1433,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
             let (start, label): (i64, Option<String>) = conn.query_row("SELECT start_ts, label_type FROM sport_sessions WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
             // a cheap live guess from the last 10 minutes
             let recent_imu = load_imu(&conn, (now - 600) as f64, (now + 1) as f64)?;
-            let rs = sets_and_reps(&recent_imu);
+            let rs = sets_and_reps_with(&recent_imu, &steps_per_second(&secs), &|_| None);
             let rk = strokes(&recent_imu);
             let f = session_features(&mins, &p, &recent_imu, &rs, rk.len(), start.max(now - 600), now);
             let pr = rules_v1(&f);
@@ -2249,5 +2253,44 @@ mod tests {
         }
         let c = cluster_sets(&sets.iter().collect::<Vec<_>>());
         println!("groups {}", c.iter().max().map(|m| m + 1).unwrap_or(0));
+    }
+
+    #[test]
+    #[ignore]
+    fn real_signature_timeline() {
+        // GOOSE_SESSION_DIR: replays the strength signature minute by minute on an exported session
+        let Ok(dir) = std::env::var("GOOSE_SESSION_DIR") else { return };
+        let mut imu = Imu::default();
+        for line in std::fs::read_to_string(format!("{dir}/imu.csv")).unwrap().lines().skip(1) {
+            let v: Vec<f64> = line.split(',').map(|x| x.parse().unwrap()).collect();
+            imu.t.push(v[0]);
+            for k in 0..3 { imu.a[k].push(v[1 + k]); imu.g[k].push(v[4 + k]); }
+        }
+        let mut secs: BTreeMap<i64, Sec> = BTreeMap::new();
+        for line in std::fs::read_to_string(format!("{dir}/r18.csv")).unwrap().lines().skip(1) {
+            let c: Vec<&str> = line.split(',').collect();
+            let ts: i64 = c[0].parse().unwrap();
+            secs.insert(ts, Sec { ts, hr: c[1].parse().ok(), steps: c[2].parse().ok(), dyn_g: c[4].parse().ok(), activity: Some(c[8].to_string()).filter(|a| !a.is_empty()), ..Default::default() });
+        }
+        for line in std::fs::read_to_string(format!("{dir}/live_hr.csv")).unwrap().lines().skip(1) {
+            let c: Vec<&str> = line.split(',').collect();
+            let ts: i64 = c[0].parse().unwrap();
+            if let Ok(h) = c[1].parse::<f64>() { secs.entry(ts).or_insert(Sec { ts, ..Default::default() }).hr.get_or_insert(h); }
+        }
+        let p = Profile { rest: 52.0, hrmax: 187.0 };
+        let (t0, t1) = (imu.t[0] as i64, *imu.t.last().unwrap() as i64);
+        let steps = steps_per_second(&secs);
+        for now in (t0 + 300..=t1).step_by(60) {
+            let w: BTreeMap<i64, Sec> = secs.range(now - 2400..=now).map(|(k, v)| (*k, v.clone())).collect();
+            let mins = minutes(&w, &BTreeMap::new());
+            let mut win = imu_window(&imu, (now - 900) as f64);
+            let k = win.t.partition_point(|t| *t <= now as f64);
+            win.t.truncate(k);
+            for i in 0..3 { win.a[i].truncate(k); win.g[i].truncate(k); }
+            let sig = signature(&mins, &p, &win, &steps, now);
+            let k = imu_window(&imu, 0.0);
+            let _ = k;
+            println!("{} {}", (now + 3600).rem_euclid(86400) / 60, sig);
+        }
     }
 }
