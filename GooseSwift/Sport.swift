@@ -71,6 +71,11 @@ struct SportSession: Identifiable, Hashable {
   let reps: Int?
   let cadence: Double?
   let imuMinutes: Double?
+  let gpsDistanceM: Double?
+  let gpsPaceSPerKm: Double?
+  let gpsGainM: Double?
+  let restHR: Double?
+  let maxHR: Double?
   let hrSeries: [(Date, Double)]
   let segments: [SportSegment]
 
@@ -95,6 +100,13 @@ struct SportSession: Identifiable, Hashable {
     reps = s["reps"] as? Int
     cadence = s["cadence_spm"] as? Double
     imuMinutes = s["imu_minutes"] as? Double
+    let gps = s["gps"] as? [String: Any] ?? [:]
+    gpsDistanceM = gps["distance_m"] as? Double
+    gpsPaceSPerKm = gps["pace_s_per_km"] as? Double
+    gpsGainM = gps["elevation_gain_m"] as? Double
+    let prof = s["profile"] as? [String: Any] ?? [:]
+    restHR = prof["rest_hr"] as? Double
+    maxHR = prof["hr_max"] as? Double
     hrSeries = (s["hr_series"] as? [[Any]] ?? []).compactMap { p in
       guard p.count == 2, let t = (p[0] as? Int).map(Double.init) ?? (p[0] as? Double), let v = p[1] as? Double else { return nil }
       return (Date(timeIntervalSince1970: t), v)
@@ -316,8 +328,13 @@ final class SportController: ObservableObject {
     }
   }
 
-  func stopManual() {
-    call("sport.manual", ["action": "stop"]) { [weak self] _ in
+  /// Ends the running session; an outdoor GPS summary (distance, pace, elevation) is attached to it.
+  func stopManual(gps: [String: Double]? = nil) {
+    call("sport.manual", ["action": "stop"]) { [weak self] r in
+      if let gps, let id = r["session_id"] as? String,
+         let data = try? JSONSerialization.data(withJSONObject: gps), let text = String(data: data, encoding: .utf8) {
+        self?.annotate("session", id, "gps", text)
+      }
       self?.state = "idle"
       self?.current = [:]
       // keep the post-activity buffer: streams off 3 minutes later

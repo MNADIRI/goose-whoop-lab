@@ -214,6 +214,8 @@ struct LabDevice: Decodable {
 @MainActor
 final class WhoopLabResultsStore: ObservableObject {
   @Published private(set) var results: LabResults?
+  /// The same analysis as plain JSON: every field the typed model does not decode (Forme screens).
+  @Published private(set) var raw: [String: Any] = [:]
   @Published private(set) var status = "Analyse en attente"
   @Published private(set) var isRunning = false
   private var lastRunAt: Date?
@@ -221,6 +223,19 @@ final class WhoopLabResultsStore: ObservableObject {
 
   /// `force` bypasses the 20 s spacing (pull-to-refresh, end of a history sync).
   func refresh(force: Bool = false) {
+    #if targetEnvironment(simulator)
+    // simulator only: Documents/forme_preview.json (a real analysis copied in) drives the screens
+    if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+       let data = try? Data(contentsOf: dir.appendingPathComponent("forme_preview.json")),
+       let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      self.raw = raw
+      let decoder = JSONDecoder()
+      decoder.keyDecodingStrategy = .convertFromSnakeCase
+      self.results = try? decoder.decode(LabResults.self, from: data)
+      status = "Aperçu simulateur"
+      return
+    }
+    #endif
     guard !isRunning else { return }
     if !force, let lastRunAt, Date().timeIntervalSince(lastRunAt) < 20 { return }
     isRunning = true
@@ -232,8 +247,9 @@ final class WhoopLabResultsStore: ObservableObject {
         self.isRunning = false
         self.lastRunAt = Date()
         switch outcome {
-        case .success(let results):
+        case .success(let (results, raw)):
           self.results = results
+          self.raw = raw
           self.status = "Analysé \(Date().formatted(date: .omitted, time: .shortened))"
         case .failure(let error):
           self.status = "Analyse impossible : \(error.localizedDescription)"
@@ -256,13 +272,13 @@ final class WhoopLabResultsStore: ObservableObject {
     ]
   }
 
-  nonisolated private static func run(args: [String: Any]) -> Result<LabResults, Error> {
+  nonisolated private static func run(args: [String: Any]) -> Result<(LabResults, [String: Any]), Error> {
     do {
       let value = try GooseRustBridge().request(method: "whoop_lab.analyze", args: args)
       let data = try JSONSerialization.data(withJSONObject: value)
       let decoder = JSONDecoder()
       decoder.keyDecodingStrategy = .convertFromSnakeCase
-      return .success(try decoder.decode(LabResults.self, from: data))
+      return .success((try decoder.decode(LabResults.self, from: data), value))
     } catch {
       return .failure(error)
     }

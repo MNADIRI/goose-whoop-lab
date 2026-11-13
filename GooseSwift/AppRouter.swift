@@ -1,31 +1,43 @@
 import Foundation
+import SwiftUI
 
 @MainActor
 final class AppRouter: ObservableObject {
-  @Published var selectedTab: GooseAppTab = .home
-  @Published var healthPath: [HealthRoute] = []
+  @Published var selectedTab: GooseAppTab = .today
+  @Published var todayPath = NavigationPath()
+  @Published var sleepPath = NavigationPath()
+  @Published var effortPath = NavigationPath()
+  /// Indicators tab: Forme routes and the technical HealthRoute pages.
+  @Published var healthPath = NavigationPath()
   @Published var morePath: [MoreRoute] = []
+  /// Profile, device and settings (the former "More" tab) live in a sheet.
+  @Published var showProfile = false
 
   func openHealth(_ route: HealthRoute?) {
-    selectedTab = .health
-    if let route {
-      healthPath = [route]
-    } else {
-      healthPath = []
-    }
+    showProfile = false
+    selectedTab = .indicators
+    var p = NavigationPath()
+    if let route { p.append(route) }
+    healthPath = p
   }
 
   func openMore(_ route: MoreRoute?) {
-    selectedTab = .more
-    if let route {
-      morePath = [route]
-    } else {
-      morePath = []
+    morePath = route.map { [$0] } ?? []
+    showProfile = true
+  }
+
+  /// Tapping the selected tab again pops it to its root.
+  func popToRoot(_ tab: GooseAppTab) {
+    switch tab {
+    case .today: todayPath = NavigationPath()
+    case .sleep: sleepPath = NavigationPath()
+    case .effort: effortPath = NavigationPath()
+    case .indicators: healthPath = NavigationPath()
     }
   }
 
   func reselect(_ tab: GooseAppTab) {
-    _ = tab
+    popToRoot(tab)
   }
 
   @discardableResult

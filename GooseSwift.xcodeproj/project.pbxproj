@@ -45,6 +45,15 @@
 			D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F003 /* WhoopLabDayViews.swift */; };
 			D1000000000000000000F004 /* SmartWake.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F004 /* SmartWake.swift */; };
 			D1000000000000000000F005 /* Sport.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000F005 /* Sport.swift */; };
+			D10000000000000000F11000 /* FormeTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11000 /* FormeTheme.swift */; };
+			D10000000000000000F11100 /* FormeData.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11100 /* FormeData.swift */; };
+			D10000000000000000F11200 /* FormeTodayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11200 /* FormeTodayView.swift */; };
+			D10000000000000000F11300 /* FormeRecoveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11300 /* FormeRecoveryView.swift */; };
+			D10000000000000000F11400 /* FormeSleepView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11400 /* FormeSleepView.swift */; };
+			D10000000000000000F11500 /* FormeEffortView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11500 /* FormeEffortView.swift */; };
+			D10000000000000000F11600 /* FormeIndicatorsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11600 /* FormeIndicatorsView.swift */; };
+			D10000000000000000F11700 /* FormeSessionViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11700 /* FormeSessionViews.swift */; };
+			D10000000000000000F1FF00 /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F1FF00 /* Fonts */; };
 			D10000000000000000000042 /* GooseAppModel+PacketPublishing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */; };
 			D10000000000000000000043 /* GooseAppModel+ActivityTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */; };
 			D10000000000000000000017 /* NotificationFrameParsing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000017 /* NotificationFrameParsing.swift */; };
@@ -183,6 +192,15 @@
 			D2000000000000000000F003 /* WhoopLabDayViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhoopLabDayViews.swift; sourceTree = "<group>"; };
 			D2000000000000000000F004 /* SmartWake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartWake.swift; sourceTree = "<group>"; };
 			D2000000000000000000F005 /* Sport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sport.swift; sourceTree = "<group>"; };
+			D20000000000000000F11000 /* FormeTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeTheme.swift; sourceTree = "<group>"; };
+			D20000000000000000F11100 /* FormeData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeData.swift; sourceTree = "<group>"; };
+			D20000000000000000F11200 /* FormeTodayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeTodayView.swift; sourceTree = "<group>"; };
+			D20000000000000000F11300 /* FormeRecoveryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeRecoveryView.swift; sourceTree = "<group>"; };
+			D20000000000000000F11400 /* FormeSleepView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeSleepView.swift; sourceTree = "<group>"; };
+			D20000000000000000F11500 /* FormeEffortView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeEffortView.swift; sourceTree = "<group>"; };
+			D20000000000000000F11600 /* FormeIndicatorsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeIndicatorsView.swift; sourceTree = "<group>"; };
+			D20000000000000000F11700 /* FormeSessionViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeSessionViews.swift; sourceTree = "<group>"; };
+			D20000000000000000F1FF00 /* Fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Fonts; sourceTree = "<group>"; };
 			D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+PacketPublishing.swift"; sourceTree = "<group>"; };
 			D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseAppModel+ActivityTimeline.swift"; sourceTree = "<group>"; };
 			D20000000000000000000017 /* NotificationFrameParsing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationFrameParsing.swift; sourceTree = "<group>"; };
@@ -361,6 +379,15 @@
 				D2000000000000000000F003 /* WhoopLabDayViews.swift */,
 				D2000000000000000000F004 /* SmartWake.swift */,
 				D2000000000000000000F005 /* Sport.swift */,
+				D20000000000000000F11000 /* FormeTheme.swift */,
+				D20000000000000000F11100 /* FormeData.swift */,
+				D20000000000000000F11200 /* FormeTodayView.swift */,
+				D20000000000000000F11300 /* FormeRecoveryView.swift */,
+				D20000000000000000F11400 /* FormeSleepView.swift */,
+				D20000000000000000F11500 /* FormeEffortView.swift */,
+				D20000000000000000F11600 /* FormeIndicatorsView.swift */,
+				D20000000000000000F11700 /* FormeSessionViews.swift */,
+				D20000000000000000F1FF00 /* Fonts */,
 				D20000000000000000000042 /* GooseAppModel+PacketPublishing.swift */,
 				D20000000000000000000043 /* GooseAppModel+ActivityTimeline.swift */,
 				D20000000000000000000017 /* NotificationFrameParsing.swift */,
@@ -607,6 +634,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1000000000000000000000B /* Assets.xcassets in Resources */,
+				D10000000000000000F1FF00 /* Fonts in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -662,6 +690,14 @@
 				D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */,
 				D1000000000000000000F004 /* SmartWake.swift in Sources */,
 				D1000000000000000000F005 /* Sport.swift in Sources */,
+				D10000000000000000F11000 /* FormeTheme.swift in Sources */,
+				D10000000000000000F11100 /* FormeData.swift in Sources */,
+				D10000000000000000F11200 /* FormeTodayView.swift in Sources */,
+				D10000000000000000F11300 /* FormeRecoveryView.swift in Sources */,
+				D10000000000000000F11400 /* FormeSleepView.swift in Sources */,
+				D10000000000000000F11500 /* FormeEffortView.swift in Sources */,
+				D10000000000000000F11600 /* FormeIndicatorsView.swift in Sources */,
+				D10000000000000000F11700 /* FormeSessionViews.swift in Sources */,
 				D10000000000000000000042 /* GooseAppModel+PacketPublishing.swift in Sources */,
 				D10000000000000000000043 /* GooseAppModel+ActivityTimeline.swift in Sources */,
 				D10000000000000000000017 /* NotificationFrameParsing.swift in Sources */,

@@ -8,6 +8,7 @@ struct GooseSwiftApp: App {
 
   init() {
     GooseTheme.configureAppearance()
+    Forme.registerFonts()
   }
 
   var body: some Scene {
@@ -19,7 +20,7 @@ struct GooseSwiftApp: App {
         .environmentObject(router)
         .onOpenURL { url in
           if model.handleDebugCommandDeepLink(url) {
-            router.selectedTab = .more
+            router.openMore(nil)
           } else {
             _ = router.handleDeepLink(url)
           }

@@ -1103,6 +1103,10 @@ pub fn analyze_session(conn: &Connection, id: &str, age: Option<f64>) -> GooseRe
         "cadence_spm": f["cad_spm"], "profile": {"rest_hr": round(p.rest, 0), "hr_max": round(p.hrmax, 0)},
         "hr_series": mins.iter().filter_map(|m| m.hr.map(|h| json!([m.t, round(h, 0)]))).collect::<Vec<_>>(),
     });
+    let mut summary = summary;
+    if let Some(g) = state_get(conn, &format!("gps:{id}"))? {
+        summary["gps"] = g;
+    }
     let feats: Value = json!(FEATURES.iter().map(|k| (k.to_string(), json!(f.get(k).copied().unwrap_or(0.0)))).collect::<serde_json::Map<_, _>>());
     conn.execute(
         "UPDATE sport_sessions SET predicted_type = ?2, probs_json = ?3, confidence = ?4, features_json = ?5, summary_json = ?6, model_version = ?7, engine_version = ?8, analyzed_at = ?9, updated_at = ?9 WHERE id = ?1",
@@ -1548,6 +1552,15 @@ pub fn annotate(args: &AnnotateArgs) -> GooseResult<Value> {
             annotate_row(&conn, "session", &args.id, "type", old.as_deref(), v, "correct")?;
             // segments depend on the type: re-derive them unless some were labelled already
             analyze_session(&conn, &args.id, None)?;
+        }
+        ("session", "gps") => {
+            // GPS summary of a manual outdoor session (distance, pace, elevation), kept in the summary
+            let g: Value = v.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+            let cur: Option<String> = conn.query_row("SELECT summary_json FROM sport_sessions WHERE id = ?1", [&args.id], |r| r.get(0))?;
+            let mut sm: Value = cur.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({}));
+            sm["gps"] = g.clone();
+            conn.execute("UPDATE sport_sessions SET summary_json = ?2, updated_at = ?3 WHERE id = ?1", params![args.id, sm.to_string(), now])?;
+            conn.execute("INSERT OR REPLACE INTO sport_state (key, value) VALUES (?1, ?2)", params![format!("gps:{}", args.id), g.to_string()])?;
         }
         ("session", "reject") => {
             conn.execute("UPDATE sport_sessions SET label_type = 'aucune', label_status = 'rejected', updated_at = ?2 WHERE id = ?1", params![args.id, now])?;
