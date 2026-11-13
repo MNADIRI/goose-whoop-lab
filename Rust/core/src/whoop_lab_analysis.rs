@@ -1,20 +1,22 @@
 //! whoop-lab on-device analysis: WHOOP 5.0 R18 history -> per-day physiological results.
 //!
 //! This is the single source of the physiological values the app displays. It is a port of the
-//! reference Python lab (`lab/analyze.py`, validated on real data); both must give the same values.
+//! historical Python lab (`lab/analyze.py`). Review v10 intentionally changes quality policies;
+//! Python parity must be updated explicitly before it is used as an oracle again.
 //!
 //! Pipeline:
 //!   decoded_frames (type 47, 124 B)  --sync_biometric_table-->  whoop_lab_biometric (1 row / second)
 //!   whoop_lab_biometric              --analyze-->               whoop_lab_days (one JSON per local day)
 //!
-//! Each day is recomputed only when its input changed (row count / last second) or it is today or
-//! yesterday, so a run costs one or two days of work.
+//! Review v10 conservatively invalidates historical days when any tracked decoded input or
+//! analysis context changes. See docs/review/OPUS_REVIEW.md for migration and validation limits.
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 
 use crate::baselines::{self, Baseline};
@@ -24,13 +26,13 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "10"; // 10: composite sleep score (duration/continuity/regularity/architecture), awake resting vitals, strain %; 9: 9: split-beat merge + adaptive R-R artefact threshold, IMU start-up sentinel; 8: spectral HRV, CPC-refined stages, health indices // 5: signed R26 base, optical gain state; 6: on-strap SpO2
+const ALGORITHM_VERSION: &str = "11-review"; // 11: quality, provenance and cache integrity; retains upstream v10 metrics
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
 const MIN_PLAUSIBLE_TS: i64 = 1_577_836_800;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Profile {
     pub age: Option<f64>,
     pub sex: Option<String>,
@@ -88,6 +90,8 @@ fn f32_at(payload: &[u8], offset: usize) -> Option<f32> {
 /// Copies new R18 records from decoded_frames into the typed 1 Hz table (cursor on rowid).
 pub fn sync_biometric_table(conn: &Connection) -> GooseResult<usize> {
     ensure_tables(conn)?;
+    // Read the cursor, rows and high watermark in one snapshot; no concurrent insert can be skipped.
+    let tx = conn.unchecked_transaction()?;
     let cursor: i64 = conn
         .query_row("SELECT value FROM whoop_lab_state WHERE key = 'decoded_rowid'", [], |r| r.get::<_, String>(0))
         .optional()?
@@ -95,13 +99,12 @@ pub fn sync_biometric_table(conn: &Connection) -> GooseResult<usize> {
         .unwrap_or(0);
     let rows: Vec<(i64, String)> = {
         let mut st = conn.prepare(
-            "SELECT rowid, payload_hex FROM decoded_frames WHERE rowid > ?1 AND packet_type = 47 AND raw_len = 124 ORDER BY rowid",
+            "SELECT rowid, payload_hex FROM decoded_frames WHERE rowid > ?1 AND packet_type = 47 AND raw_len = 124 AND header_crc_valid = 1 AND payload_crc_valid = 1 ORDER BY rowid",
         )?;
         let mapped = st.query_map([cursor], |r| Ok((r.get(0)?, r.get(1)?)))?;
         mapped.collect::<Result<_, _>>()?
     };
     let max_rowid: i64 = conn.query_row("SELECT IFNULL(MAX(rowid), 0) FROM decoded_frames", [], |r| r.get(0))?;
-    let tx = conn.unchecked_transaction()?;
     let mut inserted = 0;
     {
         let mut ins = tx.prepare_cached(
@@ -439,15 +442,17 @@ fn sleep_period(s: &[Sample]) -> Option<SleepPeriod> {
 
 fn stage_epochs(s: &[Sample], onset: usize, wake: usize) -> (Vec<&'static str>, i64) {
     let t0 = s[onset].ts;
-    let n = ((s[wake].ts - t0) / EPOCH + 1) as usize;
+    // Score full epochs only; a partial final epoch is not a sensor dropout.
+    let n = ((s[wake].ts - t0 + 1) / EPOCH) as usize;
     let mut counts = vec![0.0; n];
     let mut moving = vec![0.0; n];
     let mut seen: Vec<f64> = vec![0.0; n];
     let mut hr_sum = vec![0.0; n];
-    let mut rr_by_epoch: Vec<Vec<f64>> = vec![Vec::new(); n];
+    let mut motion_seen = vec![0usize; n];
     let mut prev_g: Option<[f64; 3]> = None;
     for smp in &s[onset..=wake] {
         let k = ((smp.ts - t0) / EPOCH) as usize;
+        if k >= n { continue; }
         let dg = match (prev_g, smp.grav) {
             (Some(p), Some(g)) => ((g[0] - p[0]).powi(2) + (g[1] - p[1]).powi(2) + (g[2] - p[2]).powi(2)).sqrt(),
             _ => 0.0,
@@ -459,23 +464,35 @@ fn stage_epochs(s: &[Sample], onset: usize, wake: usize) -> (Vec<&'static str>, 
         moving[k] += if dg > 0.01 { 1.0 } else { 0.0 };
         seen[k] += 1.0;
         hr_sum[k] += smp.hr;
-        rr_by_epoch[k].extend(smp.rr.iter().copied());
+        if smp.grav.is_some() { motion_seen[k] += 1; }
     }
     let movefrac: Vec<f64> = (0..n).map(|k| moving[k] / seen[k].max(1.0)).collect();
     let hr: Vec<f64> = (0..n).map(|k| if seen[k] > 0.0 { hr_sum[k] / seen[k] } else { f64::NAN }).collect();
     let ck = cole_kripke(&counts);
-    let loc_rmssd: Vec<f64> = (0..n)
-        .map(|i| {
-            let lo = i.saturating_sub(5);
-            let hi = (i + 6).min(n);
-            let w: Vec<f64> = rr_by_epoch[lo..hi].iter().flatten().copied().filter(|v| (300.0..=2000.0).contains(v)).collect();
-            if w.len() < 20 {
-                return f64::NAN;
+    // Clean once, then aggregate squared differences by epoch. Never re-run adaptive QC for
+    // every overlapping window or concatenate beats across a rejected interval/data gap.
+    let (clean, _) = hrv_qc::clean(&beat_runs(&s[onset..=wake]));
+    let mut diff_count = vec![0usize; n + 1];
+    let mut diff_squares = vec![0.0; n + 1];
+    for segment in &clean {
+        for pair in segment.windows(2) {
+            let k = ((pair[1].ts - t0) / EPOCH) as usize;
+            if k < n {
+                diff_count[k + 1] += 1;
+                diff_squares[k + 1] += (pair[1].rr_ms - pair[0].rr_ms).powi(2);
             }
-            let d: Vec<f64> = w.windows(2).filter(|p| (p[1] - p[0]).abs() < 0.2 * p[0]).map(|p| p[1] - p[0]).collect();
-            if d.len() < 10 { f64::NAN } else { (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt() }
-        })
-        .collect();
+        }
+    }
+    for k in 1..=n {
+        diff_count[k] += diff_count[k - 1];
+        diff_squares[k] += diff_squares[k - 1];
+    }
+    let loc_rmssd: Vec<f64> = (0..n).map(|i| {
+        let (lo, hi) = (i.saturating_sub(5), (i + 6).min(n));
+        let count = diff_count[hi] - diff_count[lo];
+        if count < hrv_qc::MIN_DIFFS { f64::NAN }
+        else { ((diff_squares[hi] - diff_squares[lo]).max(0.0) / count as f64).sqrt() }
+    }).collect();
     let hr_var: Vec<f64> = (0..n)
         .map(|i| {
             let w: Vec<f64> = hr[i.saturating_sub(10)..(i + 10).min(n)].iter().copied().filter(|v| v.is_finite()).collect();
@@ -487,6 +504,7 @@ fn stage_epochs(s: &[Sample], onset: usize, wake: usize) -> (Vec<&'static str>, 
     let p_var65 = percentile(&hr_var, 65.0).unwrap_or(f64::INFINITY);
     let mut labels: Vec<&'static str> = (0..n)
         .map(|i| {
+            if seen[i] < 24.0 || motion_seen[i] < 24 { return "unknown"; }
             if !ck[i] || movefrac[i] > 0.15 {
                 return "wake";
             }
@@ -501,7 +519,8 @@ fn stage_epochs(s: &[Sample], onset: usize, wake: usize) -> (Vec<&'static str>, 
         })
         .collect();
     for i in 1..n.saturating_sub(1) {
-        if labels[i - 1] == labels[i + 1] && labels[i] != labels[i - 1] {
+        if labels[i - 1] != "unknown" && labels[i] != "unknown" && labels[i + 1] != "unknown"
+            && labels[i - 1] == labels[i + 1] && labels[i] != labels[i - 1] {
             labels[i] = labels[i - 1];
         }
     }
@@ -594,32 +613,26 @@ pub fn spo2_summary(values: &[(i64, u8)]) -> Value {
     })
 }
 
+fn resting_five_minute_hr(samples: &[Sample]) -> Option<f64> {
+    samples.windows(300).filter(|w| w.windows(2).all(|p| p[1].ts == p[0].ts + 1)
+        && w.iter().all(|s| s.hr.is_finite() && s.hr > 0.0))
+        .map(|w| w.iter().map(|s| s.hr).sum::<f64>() / 300.0).reduce(f64::min)
+}
+
 fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoop5_records::R26Record], spo2_values: &[(i64, u8)], extras: &std::collections::HashMap<i64, Extra>) -> Value {
     let Some(sp) = sleep_period(s) else { return json!({ "available": false, "firmware_sleep_min": s.iter().filter(|x| x.band == "sleep").count() / 60 }) };
-    let (mut stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
+    let (stages, onset_ts) = stage_epochs(s, sp.onset, sp.wake);
     let s1_night = to_s1(&s[sp.onset..=sp.wake], extras);
     let cpc_w = hi::cpc(&s1_night);
     let rule_counts = ["wake", "light", "deep", "rem"].map(|k| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round());
-    // CPC refinement: stable coupling in the first 2/3 of the night supports N3, very-low-frequency
-    // coupling after the first hour supports REM, unstable / VLF coupling contradicts N3
-    let n_ep = stages.len();
-    for (k, st) in stages.iter_mut().enumerate() {
-        let t = onset_ts + k as i64 * EPOCH;
-        let Some((_, class)) = cpc_w.iter().find(|(c, _)| (t - c).abs() <= 128) else { continue };
-        let frac = k as f64 / n_ep.max(1) as f64;
-        match (*st, *class) {
-            ("light", "stable") if frac < 0.66 => *st = "deep",
-            ("deep", "unstable") | ("deep", "vlf") => *st = "light",
-            ("light", "vlf") if k > 120 => *st = "rem",
-            _ => {}
-        }
-    }
+    // RR spectral classes are exploratory features, not cardiopulmonary coupling or PSG stages.
     let count = |k: &str| (stages.iter().filter(|x| **x == k).count() as f64 * EPOCH as f64 / 60.0).round();
     let (wake_m, light, deep, rem) = (count("wake"), count("light"), count("deep"), count("rem"));
     let asleep = light + deep + rem;
+    let unknown_m = count("unknown");
     let in_bed = ((s[sp.wake].ts - s[sp.bed].ts) as f64 / 60.0).round();
     let night = &s[sp.onset..=sp.wake];
-    let hr: Vec<f64> = night.iter().map(|x| x.hr).collect();
+    let hr: Vec<f64> = night.iter().map(|x| x.hr).filter(|v| v.is_finite() && *v > 0.0).collect();
     let spec = hi::spectral(&s1_night, 300, 150);
     let by_stage = |stage: &str| -> Value {
         let sel: Vec<&hi::SpecWin> = spec.iter().filter(|w| {
@@ -633,11 +646,8 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
     let (_, breathing) = hi::breathing(&s1_night);
     let surges = hi::hr_surges(&s1_night);
     let s1_bed = to_s1(&s[sp.bed..=sp.wake], extras);
-    let resting = if hr.len() > 300 {
-        hr.windows(300).map(|w| w.iter().sum::<f64>() / 300.0).fold(f64::INFINITY, f64::min)
-    } else {
-        hr.iter().copied().fold(f64::INFINITY, f64::min)
-    };
+    // NaN is encoded as null by serde_json; never substitute a single-sample minimum.
+    let resting = resting_five_minute_hr(night).unwrap_or(f64::NAN);
     let third = s[sp.onset].ts + 2 * (s[sp.wake].ts - s[sp.onset].ts) / 3;
     let last_third: Vec<Sample> = night.iter().filter(|x| x.ts >= third).cloned().collect();
     let skin_vals: Vec<f64> = night.iter().filter_map(|x| x.skin).collect();
@@ -703,16 +713,20 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
     let hr_by_ts: std::collections::HashMap<i64, f64> = night.iter().map(|x| (x.ts, x.hr)).collect();
     let night_optical: Vec<crate::whoop5_records::R26Record> = optical_windows.iter().filter(|w| w.ts >= s[sp.bed].ts && w.ts <= s[sp.wake].ts).cloned().collect();
     let optical = optical::summarize(&night_optical, &|t| hr_by_ts.get(&t).copied());
-    let code: String = stages.iter().map(|x| match *x { "wake" => 'W', "rem" => 'R', "deep" => 'D', _ => 'L' }).collect();
+    let code: String = stages.iter().map(|x| match *x { "wake" => 'W', "rem" => 'R', "deep" => 'D', "light" => 'L', _ => 'U' }).collect();
     let rr_count: usize = night.iter().map(|x| x.rr.len()).sum();
     let mut out = json!({
         "available": true,
         "bed_time": s[sp.bed].ts, "sleep_onset": s[sp.onset].ts, "wake_time": s[sp.wake].ts,
         "time_in_bed_min": in_bed, "asleep_min": asleep,
         "latency_min": ((s[sp.onset].ts - s[sp.bed].ts) as f64 / 60.0).round(),
-        "efficiency_pct": round(100.0 * asleep / in_bed.max(1.0), 1),
+        "efficiency_pct": if unknown_m == 0.0 { Some(round(100.0 * asleep / in_bed.max(1.0), 1)) } else { None },
+        "unknown_min": unknown_m,
+        "unscored_boundary_seconds": (s[sp.wake].ts - onset_ts + 1).rem_euclid(EPOCH),
+        "sleep_coverage_pct": round(100.0 * (stages.len() - stages.iter().filter(|x| **x == "unknown").count()) as f64 / stages.len().max(1) as f64, 1),
+        "sleep_duration_status": if unknown_m == 0.0 { "EXPERIMENTAL" } else { "INCOMPLETE_LOWER_BOUND" },
         "stages_min": {"wake": wake_m, "light": light, "deep": deep, "rem": rem},
-        "awakenings": stages.windows(2).filter(|w| w[0] != "wake" && w[1] == "wake").count(),
+        "awakenings": stages.windows(2).filter(|w| matches!(w[0], "light" | "deep" | "rem") && w[1] == "wake").count(),
         "hypnogram": code, "hypnogram_start": onset_ts,
         "resting_hr_bpm": round(resting, 1),
         "mean_sleep_hr_bpm": round(mean(&hr).unwrap_or(0.0), 1),
@@ -733,22 +747,23 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
         },
         "baselines": {
             "hrv_rmssd": baselines::deviation_json(hrv["rmssd_ms"].as_f64(), b_hrv, 1),
-            "resting_hr": baselines::deviation_json(Some(round(resting, 1)), b_rhr, 1),
+            "resting_hr": baselines::deviation_json(resting.is_finite().then(|| round(resting, 1)), b_rhr, 1),
             "respiration": baselines::deviation_json(respiration["rpm"].as_f64(), b_resp, 1),
         },
         "sleep_detail": {
             "source": "inferred locally (band state + Cole-Kripke + HR/HRV rules); firmware band state shown separately",
             "firmware_sleep_min": night.iter().filter(|x| x.band == "sleep").count() / 60,
             "waso_min": wake_m,
-            "fragmentation_per_h": round(stages.windows(2).filter(|w| w[0] != "wake" && w[1] == "wake").count() as f64 / (asleep / 60.0).max(0.1), 2),
+            "fragmentation_per_h": round(stages.windows(2).filter(|w| matches!(w[0], "light" | "deep" | "rem") && w[1] == "wake").count() as f64 / (asleep / 60.0).max(0.1), 2),
             "movement_pct": round(100.0 * moved as f64 / night.len().max(1) as f64, 1),
             "nocturnal_hr": {"mean": round(mean(&hr).unwrap_or(0.0), 1), "min_5min": round(resting, 1), "p95": percentile(&hr, 95.0).map(|v| round(v, 1))},
-            "stages_status": "EXPERIMENTAL (65-73 % epoch agreement ceiling without EEG)",
+            "stages_status": "EXPERIMENTAL; not validated against PSG",
         },
         "optical": optical,
         "stages_rule_v1_min": {"wake": rule_counts[0], "light": rule_counts[1], "deep": rule_counts[2], "rem": rule_counts[3]},
         "hrv_spectral": {"night": hi::spectral_summary(&spec), "deep": by_stage("deep"), "light": by_stage("light"), "rem": by_stage("rem")},
-        "cpc": hi::cpc_summary(&cpc_w),
+        "cpc": null,
+        "rr_spectral_pattern": hi::cpc_summary(&cpc_w),
         "breathing_regularity": breathing,
         "movement": hi::movement(&s1_bed),
         "morning_hrv": hi::morning_hrv(&s1_night, s[sp.wake].ts),
@@ -786,13 +801,16 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
     out["sleep_score"] = sleep_score(&out, &prev, SLEEP_NEED_MIN);
     out["recovery"] = baselines::recovery(&baselines::RecoveryInputs {
         rmssd: hrv["rmssd_ms"].as_f64(),
-        resting_hr: Some(round(resting, 1)),
+        resting_hr: resting.is_finite().then(|| round(resting, 1)),
         resp: respiration["rpm"].as_f64(),
         efficiency_pct: out["efficiency_pct"].as_f64(),
         hrv_base: b_hrv,
         rhr_base: b_rhr,
         resp_base: b_resp,
     });
+    if unknown_m > 0.0 {
+        out["recovery"] = json!({"score": null, "reason": "incomplete sleep coverage"});
+    }
     out
 }
 
@@ -816,6 +834,9 @@ fn ramp(v: f64, poor: f64, good: f64) -> f64 {
 ///   REM >= 20 % good, deep <= 5 % and REM <= 10 % poor (Ohayon 2004 norms, Ohayon 2017).
 /// Missing components are dropped and the remaining weights renormalised.
 fn sleep_score(n: &Value, prev: &[&Value], need_min: f64) -> Value {
+    if n["sleep_duration_status"] == "INCOMPLETE_LOWER_BOUND" {
+        return json!({"score": null, "need_min": need_min, "components": {}, "reason": "incomplete sleep coverage"});
+    }
     let asleep = n["asleep_min"].as_f64();
     let mut comps: Vec<(&str, f64, Option<f64>, Value)> = Vec::new();
     comps.push(("duration", 0.40, asleep.map(|a| ramp(a / need_min, 0.5, 1.0)), json!({"asleep_min": asleep, "need_min": need_min})));
@@ -1196,12 +1217,32 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// Runs the whole pipeline and returns all days (first day with data -> today), most recent last.
+/// Conservative invalidation: any relevant decoded mutation invalidates all derived days,
+/// including downstream baselines. Optimising to a dependency DAG is a separate migration.
+fn cache_context(conn: &Connection, options: &AnalyzeOptions) -> GooseResult<String> {
+    conn.execute("INSERT OR IGNORE INTO whoop_lab_state VALUES ('input_revision', '0')", [])?;
+    for table in ["whoop_lab_biometric", "whoop5_r18", "whoop5_r26", "whoop5_r20_slot", "whoop5_r21"] {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS lab_revision_{table}_{event} AFTER {event} ON {table}
+                 BEGIN UPDATE whoop_lab_state SET value = CAST(value AS INTEGER) + 1 WHERE key = 'input_revision'; END;"
+            ))?;
+        }
+    }
+    let revision: String = conn.query_row("SELECT value FROM whoop_lab_state WHERE key = 'input_revision'", [], |r| r.get(0))?;
+    let decoder: Option<String> = conn.query_row("SELECT value FROM whoop5_state WHERE key = 'decoder_version'", [], |r| r.get(0)).optional()?;
+    let context = json!({"revision": revision, "decoder": decoder, "profile": options.profile,
+        "utc_offset_seconds": options.utc_offset_seconds, "algorithm": ALGORITHM_VERSION});
+    Ok(format!("{}:{:x}", ALGORITHM_VERSION, Sha256::digest(context.to_string().as_bytes())))
+}
+
 pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
     let conn = Connection::open(&options.database_path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     sync_biometric_table(&conn)?;
     let layer_b = whoop5_store::ingest(&conn)?;
+    let cache_version = cache_context(&conn, options)?;
     let off = options.utc_offset_seconds;
     let now = options.now_unix.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0));
     let (first, last, total): (Option<i64>, Option<i64>, i64) =
@@ -1229,7 +1270,7 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?;
-        let reuse = cached.as_ref().is_some_and(|(c, l, v, _)| *c == cnt && *l == last_ts && v == ALGORITHM_VERSION) && day_start < today_start;
+        let reuse = cached.as_ref().is_some_and(|(c, l, v, _)| *c == cnt && *l == last_ts && v == &cache_version) && day_start < today_start;
         let result: Value = if let (true, Some((_, _, _, j))) = (reuse, &cached) {
             serde_json::from_str(j).unwrap_or(Value::Null)
         } else {
@@ -1252,7 +1293,7 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
             let value = json!({ "date": key, "night": night, "day": day });
             conn.execute(
                 "INSERT OR REPLACE INTO whoop_lab_days (date_key, input_count, input_last_ts, algorithm_version, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![key, cnt, last_ts, ALGORITHM_VERSION, value.to_string()],
+                params![key, cnt, last_ts, cache_version, value.to_string()],
             )?;
             value
         };
@@ -1274,22 +1315,24 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
         let hrr = d["day"]["training"]["workouts"]["sessions"].as_array().and_then(|a| a.iter().filter_map(|s| s["hr_recovery"]["drop_60s"].as_f64()).reduce(f64::max));
         hi::DaySeries {
             ln_rmssd: n["hrv_night"]["ln_rmssd"].as_f64(), rhr: n["resting_hr_bpm"].as_f64(), resp: n["respiration"]["rpm"].as_f64(),
-            skin: n["skin_temp_c"].as_f64(), spo2: n["spo2"]["median_pct"].as_f64(), asleep_min: n["asleep_min"].as_f64(),
+            skin: n["skin_temp_c"].as_f64(), spo2: n["spo2"]["median_pct"].as_f64(), asleep_min: if n["sleep_duration_status"] == "INCOMPLETE_LOWER_BOUND" { None } else { n["asleep_min"].as_f64() },
             need_min: 480.0, trimp: d["day"]["edwards_trimp"].as_f64().unwrap_or(0.0), hrr60: hrr,
             morning_ln_rmssd: n["morning_hrv"]["ln_rmssd"].as_f64(),
         }
     }).collect();
     let age = options.profile.age.unwrap_or(30.0);
     let rhrs: Vec<f64> = series.iter().filter_map(|x| x.rhr).collect();
-    let day_max: Vec<f64> = days.iter().filter_map(|d| d["day"]["hr_max"].as_f64()).collect();
+    let day_max: Vec<Option<f64>> = days.iter().map(|d| d["day"]["hr_max"].as_f64()).collect();
     for i in 0..days.len() {
         let upto = &series[..=i];
         let fat = hi::fatigue(upto);
         let rhr7 = median(&upto.iter().rev().filter_map(|x| x.rhr).take(7).collect::<Vec<_>>());
-        let hrmax = (208.0 - 0.7 * age).max(day_max.iter().copied().take(i + 1).fold(0.0, f64::max));
+        let hrmax = (208.0 - 0.7 * age).max(day_max.iter().take(i + 1).filter_map(|v| *v).fold(0.0, f64::max));
         days[i]["indices"] = json!({
             "fatigue": fat.clone(),
-            "recovery": hi::recovery_v2(upto),
+            "recovery": if days[i]["night"]["sleep_duration_status"] == "INCOMPLETE_LOWER_BOUND" {
+                json!({"score": null, "reason": "incomplete sleep coverage"})
+            } else { hi::recovery_v2(upto) },
             "early_warning": hi::early_warning(upto, fat["score"].as_f64()),
             "vo2max": {"ml_kg_min": rhr7.and_then(|r| hi::vo2max_uth(hrmax, r)), "hrmax_used": hrmax.round(), "resting_hr_7d": rhr7,
                        "method": "Uth 2004: 15.3 x HRmax / HRrest; HRmax = max(Tanaka, observed)"},
@@ -1326,6 +1369,60 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sleep_samples() -> Vec<Sample> {
+        (0..300).map(|ts| Sample { ts, hr: 60.0, rr: vec![1000.0],
+            grav: Some([0.0, 0.0, 1.0]), dyn_g: Some(0.0), steps: 0,
+            activity: None, skin: Some(33.0), band: "sleep".into() }).collect()
+    }
+
+    #[test]
+    fn resting_hr_requires_contiguous_five_minutes() {
+        let mut samples = sleep_samples();
+        assert_eq!(resting_five_minute_hr(&samples), Some(60.0));
+        for s in &mut samples[150..] { s.ts += 30; }
+        assert!(resting_five_minute_hr(&samples).is_none());
+    }
+
+    #[test]
+    fn missing_sleep_epochs_are_unknown_and_not_smoothed() {
+        let samples: Vec<_> = sleep_samples().into_iter().filter(|s| !(120..150).contains(&s.ts)).collect();
+        let (labels, _) = stage_epochs(&samples, 0, samples.len() - 1);
+        assert_eq!(labels[4], "unknown");
+        assert_ne!(labels[3], "unknown");
+        assert_ne!(labels[5], "unknown");
+    }
+
+    #[test]
+    fn missing_motion_cannot_establish_sleep() {
+        let mut samples = sleep_samples();
+        for sample in &mut samples[60..90] { sample.grav = None; }
+        assert_eq!(stage_epochs(&samples, 0, samples.len() - 1).0[2], "unknown");
+    }
+
+    #[test]
+    fn cache_tracks_value_edits_optical_deletes_and_profile() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_tables(&conn).unwrap();
+        whoop5_store::ensure_tables(&conn).unwrap();
+        let mut options = AnalyzeOptions { database_path: String::new(), utc_offset_seconds: 3600,
+            now_unix: None, profile: Profile::default() };
+        let a = cache_context(&conn, &options).unwrap();
+        conn.execute("INSERT INTO whoop_lab_biometric VALUES (1,60,'1000',0,0,1000,0,0,NULL,3300,'sleep')", []).unwrap();
+        let b = cache_context(&conn, &options).unwrap();
+        assert_ne!(a, b);
+        conn.execute("UPDATE whoop_lab_biometric SET hr = 61 WHERE ts = 1", []).unwrap();
+        let c = cache_context(&conn, &options).unwrap();
+        assert_ne!(b, c); // same row count and timestamp
+        options.profile.age = Some(40.0);
+        let d = cache_context(&conn, &options).unwrap();
+        assert_ne!(c, d);
+        options.utc_offset_seconds = 0;
+        assert_ne!(d, cache_context(&conn, &options).unwrap());
+        // Check optical invalidation without depending on decoder payload fixtures.
+        let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'lab_revision_whoop5_r26_DELETE'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("input_revision"));
+    }
 
     #[test]
     fn spo2_windows_from_real_sequences() {

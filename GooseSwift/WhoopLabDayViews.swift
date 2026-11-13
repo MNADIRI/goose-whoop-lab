@@ -207,6 +207,10 @@ struct LabNightCard: View {
         if let codes = night.hypnogram, let start = night.hypnogramStart {
           LabHypnogramChart(codes: Array(codes), start: start)
           LabStageBreakdown(stages: night.stagesMin ?? [:])
+          if let unknown = night.unknownMin, unknown > 0 {
+            Text("Données insuffisantes : \(labDuration(unknown)). Les interruptions restent vides sur le graphique.")
+              .font(.caption).foregroundStyle(.secondary)
+          }
         }
       } else {
         Text("Aucune nuit détectée : bracelet non porté ou pas de sommeil enregistré.").foregroundStyle(.secondary)
@@ -300,7 +304,7 @@ struct LabHypnogramChart: View {
             let y = CGFloat(run.stage.lane) * lane
             let rect = CGRect(x: x0, y: y + 5, width: max(x1 - x0, 1.5), height: lane - 10)
             context.fill(Path(roundedRect: rect, cornerRadius: min(4, rect.width / 2)), with: .color(run.stage.color))
-            if index + 1 < all.count {
+            if index + 1 < all.count, run.to == all[index + 1].from {
               let next = all[index + 1]
               let ya = y + lane / 2
               let yb = CGFloat(next.stage.lane) * lane + lane / 2
@@ -477,16 +481,14 @@ struct LabIndicesCard: View {
         LabMetric(title: "Fatigue", value: labFmt(ix?.fatigue?.score), unit: ix?.fatigue?.score != nil ? "/100" : "",
                   status: score(ix?.fatigue?.score, higherIsBetter: false),
                   detail: ix?.fatigue?.score == nil ? "après quelques jours de données" : "VFC 7 j, FC repos, charge, dette")
-        LabMetric(title: "VO₂max", value: labFmt(ix?.vo2max?.mlKgMin, 1), unit: "ml/kg/min", detail: "FC max / FC repos")
+        LabMetric(title: "VO₂max exploratoire", value: labFmt(ix?.vo2max?.mlKgMin, 1), unit: "ml/kg/min", detail: "FC max / FC repos")
         LabMetric(title: "VFC au réveil", value: labFmt(n.morningHrv?.rmssdMs), unit: "ms", detail: "10 dernières min de sommeil")
         if n.available {
-          LabMetric(title: "Sommeil stable", value: labFmt(n.cpc?.stablePct), unit: "%", detail: "couplage cardio-respiratoire")
-          LabMetric(title: "Équilibre LF/HF", value: labFmt(n.hrvSpectral?.night?.lfHf, 2), detail: "nuit ; HF \(labFmt(n.hrvSpectral?.night?.hfNu)) %")
+          LabMetric(title: "Rapport spectral LF/HF", value: labFmt(n.hrvSpectral?.night?.lfHf, 2), detail: "nuit ; HF \(labFmt(n.hrvSpectral?.night?.hfNu)) %")
           LabMetric(title: "Respiration", value: labFmt(n.breathingRegularity?.rateCvPct), unit: "% var.",
                     status: rangeStatus(n.breathingRegularity?.rateCvPct, good: 0...12, fair: 12...20), detail: "variabilité du rythme")
-          LabMetric(title: "Perturbations resp.", value: labFmt(n.respiratoryDisturbance?.index0100), unit: "/100",
-                    status: rangeStatus(n.respiratoryDisturbance?.index0100, good: 0...30, fair: 30...60),
-                    detail: "\(labFmt(n.respiratoryDisturbance?.hrSurgesPerH, 1)) accél. FC/h · \(n.respiratoryDisturbance?.desatWindows ?? 0) désat.")
+          LabMetric(title: "Accélérations FC nocturnes", value: labFmt(n.respiratoryDisturbance?.hrSurgesPerH, 1), unit: "/h",
+                    detail: "descriptif expérimental ; ne mesure pas les apnées")
           LabMetric(title: "Mouvements nuit", value: labFmt(n.movement?.postureChangesPerH, 1), unit: "/h", detail: "changements de position")
           LabMetric(title: "Peau à l'endormissement", value: n.skinOnsetWarmingC.map { String(format: "%+.1f", $0) } ?? "—", unit: "°C", detail: "réchauffement du poignet")
         }

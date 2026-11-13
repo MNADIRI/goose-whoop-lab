@@ -133,7 +133,8 @@ struct FormeDay {
 
   /// Composite sleep score (Rust: duration vs need, continuity, regularity, architecture).
   var sleepScore: Double? {
-    night["sleep_score"]["score"].d ?? asleepMin.map { min(100, ($0 / sleepNeed * 100).rounded()) }
+    guard night["sleep_duration_status"].s != "INCOMPLETE_LOWER_BOUND" else { return nil }
+    return night["sleep_score"]["score"].d ?? asleepMin.map { min(100, ($0 / sleepNeed * 100).rounded()) }
   }
   var sleepNeed: Double { night["sleep_score"]["need_min"].d ?? 480 }
 

@@ -905,7 +905,25 @@ pub fn rules_v1(f: &BTreeMap<&str, f64>) -> Vec<f64> {
     softmax(&[1.6 * run, 1.6 * tennis, 1.6 * strength, other])
 }
 
+fn valid_model_params(p: &Value) -> bool {
+    let decode = || -> Option<bool> {
+        let features: Vec<String> = serde_json::from_value(p.get("features")?.clone()).ok()?;
+        let classes: Vec<String> = serde_json::from_value(p.get("classes")?.clone()).ok()?;
+        let mu: Vec<f64> = serde_json::from_value(p.get("mean")?.clone()).ok()?;
+        let sd: Vec<f64> = serde_json::from_value(p.get("std")?.clone()).ok()?;
+        let weights: Vec<Vec<f64>> = serde_json::from_value(p.get("weights")?.clone()).ok()?;
+        let bias: Vec<f64> = serde_json::from_value(p.get("bias")?.clone()).ok()?;
+        Some(features == FEATURES && classes == CLASSES && mu.len() == FEATURES.len()
+            && sd.len() == FEATURES.len() && weights.len() == CLASSES.len()
+            && bias.len() == CLASSES.len() && sd.iter().all(|x| x.is_finite() && *x > 0.0)
+            && mu.iter().chain(bias.iter()).all(|x| x.is_finite())
+            && weights.iter().all(|row| row.len() == FEATURES.len() && row.iter().all(|x| x.is_finite())))
+    };
+    decode() == Some(true)
+}
+
 fn model_predict(params_json: &Value, f: &BTreeMap<&str, f64>) -> Option<Vec<f64>> {
+    if !valid_model_params(params_json) { return None; }
     let names: Vec<String> = serde_json::from_value(params_json.get("features")?.clone()).ok()?;
     let mu: Vec<f64> = serde_json::from_value(params_json.get("mean")?.clone()).ok()?;
     let sd: Vec<f64> = serde_json::from_value(params_json.get("std")?.clone()).ok()?;
@@ -1973,17 +1991,37 @@ pub struct InstallModelArgs {
     pub params: Value,
     #[serde(default)]
     pub metrics: Option<Value>,
+    /// Explicit reviewer promotion; importing a model alone must not change predictions.
+    #[serde(default)]
+    pub activate: bool,
 }
 
 pub fn install_model(args: &InstallModelArgs) -> GooseResult<Value> {
+    if args.kind != "logreg" || args.version.trim().is_empty() || !valid_model_params(&args.params) {
+        return Err(crate::GooseError::message("invalid model kind, version, feature contract or dimensions"));
+    }
+    if args.activate && !args.metrics.as_ref().is_some_and(|m|
+        m["review_status"] == "approved" && m["held_out_evaluation"].is_object()
+        && m["reviewed_by"].as_str().is_some_and(|s| !s.trim().is_empty())
+        && m["evaluation_artifact_sha256"].as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))) {
+        return Err(crate::GooseError::message("activation requires named review and a held-out evaluation artifact hash"));
+    }
     let conn = Connection::open(&args.database_path)?;
     ensure_tables(&conn)?;
-    conn.execute("UPDATE sport_models SET active = 0", [])?;
-    conn.execute(
-        "INSERT OR REPLACE INTO sport_models (version, kind, created_at, active, params_json, metrics_json) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-        params![args.version, args.kind, now_s(), args.params.to_string(), args.metrics.as_ref().map(|m| m.to_string())],
-    )?;
-    Ok(json!({"ok": true, "active": args.version}))
+    let tx = conn.unchecked_transaction()?;
+    // Candidate import cannot replace or deactivate an existing active version.
+    let existing: Option<String> = tx.query_row("SELECT params_json FROM sport_models WHERE version = ?1", [&args.version], |r| r.get(0)).optional()?;
+    if existing.as_ref().is_some_and(|p| serde_json::from_str::<Value>(p).ok().as_ref() != Some(&args.params)) {
+        return Err(crate::GooseError::message("model versions are immutable; use a new version"));
+    }
+    tx.execute("INSERT OR IGNORE INTO sport_models (version, kind, created_at, active, params_json, metrics_json) VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+        params![args.version, args.kind, now_s(), args.params.to_string(), args.metrics.as_ref().map(Value::to_string)])?;
+    if args.activate {
+        tx.execute("UPDATE sport_models SET active = 0", [])?;
+        tx.execute("UPDATE sport_models SET active = 1, metrics_json = ?2 WHERE version = ?1", params![args.version, args.metrics.as_ref().map(Value::to_string)])?;
+    }
+    tx.commit()?;
+    Ok(json!({"ok": true, "version": args.version, "activation_requested": args.activate}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2018,6 +2056,39 @@ mod tests {
             }
         }
         imu
+    }
+
+    fn test_model() -> Value {
+        json!({"features": FEATURES, "classes": CLASSES, "mean": vec![0.0;16], "std": vec![1.0;16],
+               "weights": vec![vec![0.0;16];4], "bias": vec![0.0;4]})
+    }
+
+    #[test]
+    fn malformed_model_never_indexes_out_of_bounds() {
+        let mut p = test_model();
+        assert!(model_predict(&p, &BTreeMap::new()).is_some());
+        p["mean"] = json!([]);
+        assert!(model_predict(&p, &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn model_import_is_inactive_and_failed_promotion_preserves_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("models.sqlite").to_string_lossy().to_string();
+        let mut args = InstallModelArgs { database_path: db.clone(), version: "candidate".into(), kind: "logreg".into(),
+            params: test_model(), metrics: None, activate: false };
+        install_model(&args).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        assert!(active_model(&conn).unwrap().is_none());
+        args.activate = true;
+        assert!(install_model(&args).is_err());
+        args.metrics = Some(json!({"review_status":"approved", "reviewed_by":"test-reviewer",
+            "held_out_evaluation":{"macro_f1":0.8}, "evaluation_artifact_sha256":"a".repeat(64)}));
+        install_model(&args).unwrap();
+        args.version = "broken".into();
+        args.params["std"] = json!([]);
+        assert!(install_model(&args).is_err());
+        assert_eq!(active_model(&conn).unwrap().unwrap().0, "candidate");
     }
 
     #[test]

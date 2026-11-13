@@ -177,6 +177,12 @@ script before compiling Swift.
 
 ## Documentation
 
+**Physiology review proposal:** start with [Opus review](docs/review/OPUS_REVIEW.md),
+[implementation plan](docs/review/IMPLEMENTATION_PLAN.md), and
+[models and capture contracts](docs/review/MODELS_AND_CAPTURE.md).
+Implemented corrections and unimplemented proposals are explicitly separated.
+
+
 Detailed implementation plans live in `docs/goose-swift-mvp/`:
 
 - `Home.md`: Home tab contract and remaining work.
