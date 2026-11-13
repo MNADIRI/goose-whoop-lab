@@ -221,6 +221,23 @@ final class WhoopLabResultsStore: ObservableObject {
   private var lastRunAt: Date?
   private let queue = DispatchQueue(label: "whoop-lab.analysis", qos: .utility)
 
+  /// The last analysis, kept on disk so the screens open on it instantly (no "analysis running"
+  /// screen at launch); the fresh analysis replaces it silently a moment later.
+  nonisolated private static var cacheURL: URL? {
+    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+      .appendingPathComponent("GooseSwift/forme_last_analysis.json")
+  }
+
+  init() {
+    guard let url = Self.cacheURL, let data = try? Data(contentsOf: url),
+          let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+    self.raw = raw
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    self.results = try? decoder.decode(LabResults.self, from: data)
+    self.status = "Dernière analyse"
+  }
+
   /// `force` bypasses the 20 s spacing (pull-to-refresh, end of a history sync).
   func refresh(force: Bool = false) {
     #if targetEnvironment(simulator)
@@ -276,6 +293,10 @@ final class WhoopLabResultsStore: ObservableObject {
     do {
       let value = try GooseRustBridge().request(method: "whoop_lab.analyze", args: args)
       let data = try JSONSerialization.data(withJSONObject: value)
+      if let url = cacheURL {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+      }
       let decoder = JSONDecoder()
       decoder.keyDecodingStrategy = .convertFromSnakeCase
       return .success((try decoder.decode(LabResults.self, from: data), value))

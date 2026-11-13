@@ -16,6 +16,7 @@ struct MoreView: View {
   @AppStorage(OnboardingStorage.unitSystem) private var profileUnitSystemRaw = "imperial"
   @AppStorage(OnboardingStorage.heightMm) private var profileHeightMm = 0
   @AppStorage(OnboardingStorage.weightGrams) private var profileWeightGrams = 0
+  @AppStorage(Forme.appearanceKey) private var appearance = "system"
 
   @MainActor
   init(healthStore: HealthDataStore) {
@@ -50,6 +51,7 @@ struct MoreView: View {
         .background { FrostCard(radius: 32, padding: 0) { Color.clear } }
         .accessibilityLabel("Modifier le profil")
 
+        appearanceCard
         group("Bracelet", MoreRoute.deviceRoutes)
         group("Application", MoreRoute.appRoutes + MoreRoute.settingsRoutes)
         group("Assistance", MoreRoute.supportRoutes + MoreRoute.developerRoutes)
@@ -72,6 +74,33 @@ struct MoreView: View {
       model.recordUIAction("page.opened", detail: "More")
       store.refreshBridgeStatus(model: model)
       store.refreshRecentCaptureSessions()
+    }
+  }
+
+  private var appearanceCard: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      Text("Apparence").font(Forme.sans(13, .bold, relativeTo: .footnote)).foregroundStyle(Forme.muted)
+        .textCase(.uppercase).tracking(0.6)
+        .padding(.top, 28).padding(.leading, 6)
+      HStack(spacing: 0) {
+        ForEach([("system", "Système", "circle.lefthalf.filled"), ("light", "Clair", "sun.max"), ("dark", "Sombre", "moon")], id: \.0) { opt in
+          Button { withAnimation(.snappy(duration: 0.25)) { appearance = opt.0 } } label: {
+            VStack(spacing: 4) {
+              Image(systemName: opt.2).font(.system(size: 17, weight: .semibold))
+              Text(opt.1).font(Forme.sans(13, .semibold, relativeTo: .footnote))
+            }
+            .foregroundStyle(Forme.ink)
+            .frame(maxWidth: .infinity, minHeight: 60)
+            .background(appearance == opt.0 ? Forme.selection : .clear, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .accessibilityAddTraits(appearance == opt.0 ? .isSelected : [])
+        }
+      }
+      .padding(6)
+      .background { FrostCard(radius: 28, padding: 0) { Color.clear } }
+      .padding(.top, 10)
     }
   }
 

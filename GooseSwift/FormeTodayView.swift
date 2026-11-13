@@ -322,11 +322,14 @@ struct FormeTodayView: View {
     .buttonStyle(FormePressStyle())
   }
 
-  private var emptyState: some View {
-    FrostCard(radius: 36, padding: 24, spacing: 10) {
-      FormeDisc(systemImage: labResults.isRunning ? "hourglass" : "waveform.path.ecg", fg: Forme.ink, bg: Forme.sunken, shadow: false)
-      Text(labResults.isRunning ? "Analyse en cours…" : "Pas encore de données").font(Forme.sans(20, .semibold, relativeTo: .title3)).foregroundStyle(Forme.ink)
-      Text("Porte le bracelet et laisse la synchronisation se faire. \(labResults.status)").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.ink2)
+  /// Only on a first install with no analysis yet; while the first analysis runs nothing is shown.
+  @ViewBuilder private var emptyState: some View {
+    if !labResults.isRunning {
+      FrostCard(radius: 36, padding: 24, spacing: 10) {
+        FormeDisc(systemImage: "waveform.path.ecg", fg: Forme.ink, bg: Forme.sunken, shadow: false)
+        Text("Pas encore de données").font(Forme.sans(20, .semibold, relativeTo: .title3)).foregroundStyle(Forme.ink)
+        Text("Porte le bracelet et laisse la synchronisation se faire.").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.ink2)
+      }
     }
   }
 }

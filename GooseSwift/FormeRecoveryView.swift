@@ -193,7 +193,7 @@ struct FormeEmpty: View {
   var body: some View {
     FrostCard(radius: 36, padding: 24, spacing: 8) {
       Text("Pas encore de données").font(Forme.sans(20, .semibold, relativeTo: .title3)).foregroundStyle(Forme.ink)
-      Text("Porte le bracelet et laisse la synchronisation se faire. \(status)").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.ink2)
+      Text("Porte le bracelet et laisse la synchronisation se faire.").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.ink2)
     }
   }
 }

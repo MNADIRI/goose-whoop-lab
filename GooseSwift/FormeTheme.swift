@@ -76,6 +76,16 @@ enum Forme {
   static let strainInk = dyn(0x9c2128, 0xffa8a3)
   static let selection = dyn(0x101618, 0xeef2f2, 0.07, 0.12)
   static let inset = dyn(0xf3f5f8, 0x20262b)
+
+  /// Appearance setting (Profil › Apparence): "system", "light" or "dark".
+  static let appearanceKey = "forme.appearance"
+  /// Applied on the windows themselves, so sheets, alerts and UIKit-backed colours follow too.
+  @MainActor static func applyAppearance(_ value: String) {
+    let style: UIUserInterfaceStyle = value == "light" ? .light : (value == "dark" ? .dark : .unspecified)
+    for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+      for window in scene.windows { window.overrideUserInterfaceStyle = style }
+    }
+  }
   /// Hairline highlight on light frosted chips (white in light, faint in dark).
   static let rim = dyn(0xffffff, 0xffffff, 0.8, 0.08)
 

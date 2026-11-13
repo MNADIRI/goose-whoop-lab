@@ -5,6 +5,7 @@ struct GooseSwiftApp: App {
   @Environment(\.scenePhase) private var scenePhase
   @StateObject private var model = GooseAppModel()
   @StateObject private var router = AppRouter()
+  @AppStorage(Forme.appearanceKey) private var appearance = "system"
 
   init() {
     GooseTheme.configureAppearance()
@@ -18,6 +19,8 @@ struct GooseSwiftApp: App {
         .environmentObject(model.packetMonitor)
         .environmentObject(model.ble.messageStore)
         .environmentObject(router)
+        .onAppear { Forme.applyAppearance(appearance) }
+        .onChange(of: appearance) { _, v in Forme.applyAppearance(v) }
         .onOpenURL { url in
           if model.handleDebugCommandDeepLink(url) {
             router.openMore(nil)
