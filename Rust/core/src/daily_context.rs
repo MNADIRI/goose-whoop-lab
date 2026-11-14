@@ -40,7 +40,8 @@ pub struct Settings {
     pub morning_duration_min: i64,
     /// evening starts this long before the recommended wind-down time
     pub evening_lead_min: i64,
-    /// local clock fallbacks (minutes after midnight) when no event is observed
+    /// local clock (minutes after midnight) at which the evening starts at the latest — and when
+    /// no wind-down is known. A late wake time must not keep the day card until 23:00.
     pub fallback_evening_start: i64,
     pub fallback_morning_end: i64,
     pub fallback_night_start: i64,
@@ -65,7 +66,7 @@ impl Default for Settings {
         Settings {
             morning_duration_min: 90,
             evening_lead_min: 60,
-            fallback_evening_start: 21 * 60,
+            fallback_evening_start: 20 * 60,
             fallback_morning_end: 11 * 60,
             fallback_night_start: 2 * 60,
             day_rollover: 4 * 60,
@@ -477,12 +478,13 @@ fn night_onset(now: i64, off: i64, sleep: &SleepObservation, s: &Settings) -> Op
 
 fn decide_context(now: i64, off: i64, a: &Analysis, sw: &SmartWakeInput, sleep: &SleepObservation, sched: &Schedule, prev: Option<&Previous>, s: &Settings) -> ContextDecision {
     let lm = local_min(now, off);
-    // tonight's evening start: wind-down − lead, else the fallback clock time
+    // tonight's evening start: wind-down − lead, but never later than the evening clock time
+    let clock_evening = at_local(now, off, s.fallback_evening_start);
     let evening_start = sched
         .wind_down
         .map(|w| w - s.evening_lead_min * 60)
         .filter(|e| (e - now).abs() < 20 * 3600)
-        .unwrap_or_else(|| at_local(now, off, s.fallback_evening_start));
+        .map_or(clock_evening, |e| e.min(clock_evening));
     let wake = awakening(now, a, sw, sleep, s);
     let mk = |context, since, trigger: &str| ContextDecision { context, since, trigger: trigger.into(), awakening: wake.map(|w| w.0), evening_start };
     // 1. confirmed sleep onset (not a nap), no sustained wake after it
@@ -512,7 +514,8 @@ fn decide_context(now: i64, off: i64, a: &Analysis, sw: &SmartWakeInput, sleep: 
         return if lm >= s.fallback_night_start { mk(Context::Night, at_local(now, off, s.fallback_night_start), "heure de repli (nuit)") } else { mk(Context::Evening, evening_start.min(now), "soirée (avant endormissement)") };
     }
     if now >= evening_start {
-        return mk(Context::Evening, evening_start, if sched.wind_down.is_some() { "approche de l'heure de décrocher" } else { "heure de repli (soirée)" });
+        let why = if evening_start < clock_evening { "approche de l'heure de décrocher" } else { "début de soirée" };
+        return mk(Context::Evening, evening_start, why);
     }
     // 4. daytime once the morning is over; before the fallback morning end without any awakening
     // seen today, the morning card is shown with its data pending
@@ -1139,7 +1142,9 @@ pub fn snapshot(args: &SnapshotArgs) -> GooseResult<Value> {
     let current = card(decision.context, &i, &decision, now, false);
     let mut entries = vec![Entry { at: now, context: decision.context, card: current.clone() }];
     let first_change = transitions.first().map_or(i64::MAX, |t| t.at);
-    let mut cross: Vec<i64> = current.primary.iter().chain(&current.secondary).flat_map(|m| [m.live_until, m.valid_until]).flatten().filter(|t| *t > now && *t < first_change).collect();
+    let mut cross: Vec<i64> = current.primary.iter().chain(&current.secondary).flat_map(|m| [m.live_until, m.valid_until]).flatten()
+        // one second after the limit: at the limit itself a value still counts as live / valid
+        .map(|t| t + 1).filter(|t| *t > now && *t < first_change).collect();
     if now + s.snapshot_stale_s < first_change {
         cross.push(now + s.snapshot_stale_s + 1);
     }
@@ -1384,9 +1389,12 @@ mod tests {
     fn irregular_schedule_limits_bedtime_advance() {
         // habitual bedtime 01:00 but the plan would want 22:45 (135 min earlier)
         let a = analysis(night(400.0, Some(60.0), 0.0, 0.0, "COMPLETE"), Some(55.0), day(5.0, 5000, None, 0.0));
-        // evening follows the realistic bedtime: wind-down 23:45, evening from 22:45
-        let r = run(&args(local(22, 0), a.clone(), sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
+        // wind-down 23:45 would start the evening at 22:45; it starts at 20:00 at the latest
+        let r = run(&args(local(19, 30), a.clone(), sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
         assert_eq!(r["context"], "daytime");
+        assert_eq!(r["transitions"][0]["at"], local(20, 0));
+        let r = run(&args(local(20, 14), a.clone(), sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
+        assert_eq!(r["context"], "evening");
         let r = run(&args(local(23, 0), a, sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
         let e0 = &r["entries"][0];
         assert_eq!(r["context"], "evening");

@@ -58,7 +58,7 @@ Les événements observés passent avant l'horloge :
 |---|---|---|
 | Nuit → Matin | réveil confirmé (Smart Wake), éveil soutenu ≥ 20 min (état du bracelet), ou nuit analysée | à partir de 04:00 sans aucune donnée, matin « en attente » jusqu'à 11:00 |
 | Matin → Journée | 90 min après le réveil | 11:00 |
-| Journée → Soir | 60 min avant l'heure de décrocher | 21:00 |
+| Journée → Soir | 60 min avant l'heure de décrocher, au plus tard 20:00 | 20:00 |
 | Soir → Nuit | endormissement soutenu ≥ 20 min (pas une sieste : bloc entre 09:00 et 19:00 de moins de 3 h) | 02:00 |
 
 Hystérésis : une nuit sans nouvelle donnée (Bluetooth coupé, bracelet retiré) reste une nuit jusqu'à 11:00 ; un réveil
