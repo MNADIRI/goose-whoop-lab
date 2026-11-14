@@ -2,8 +2,13 @@
 
 Code :
 - moteur : `Rust/core/src/smart_wake.rs` (méthodes du pont `smart_wake.update`, `smart_wake.replay`, `smart_wake.feedback`) ;
-- app : `GooseSwift/SmartWake.swift` (contrôleur et écran Alarme : modes « Heure fixe » / « Fenêtre flexible », anticipation
-  maximale, raison courte de la décision, état de l'alarme bracelet et du secours iPhone).
+- app : `GooseSwift/SmartWake.swift` (contrôleur et écran Réveil, au design Forme : heure et fenêtre, bouton Programmer /
+  Désactiver, réglages « Heure fixe » / « Fenêtre flexible » et anticipation maximale, état réel de la nuit — alarme du
+  bracelet, secours iPhone, suivi, décision —, plan du soir, détails techniques repliés).
+
+Les outils de test des capteurs (rampe de vibration, calibration silencieuse, tests mouvement et optique, session capteurs
+guidée, test optique de nuit) ont été **retirés de l'app le 14 novembre**. Leurs résultats ci-dessous restent comme
+historique ; la calibration et le test de vibration effaçaient aussi l'alarme de l'heure limite (`DISABLE_ALARM` global).
 
 ## 1. Ce qui est réellement disponible en direct (vérifié sur ce bracelet, firmware 50.38.1)
 
@@ -14,7 +19,7 @@ Code :
 | Double tap (événement 14) | oui (paquet 48) | ~1 s | nom vérifié, réception de nuit non testée |
 | PPG (R26) | non : rafales de 40 s toutes les 20 min | — | inutilisable en direct |
 | IMU brute (R21), mouvement en direct (R10/R11) | jamais observés | — | non utilisés |
-| Vibration (`SET_ALARM_TIME` 66, `RUN_ALARM` 68, `DISABLE_ALARM` 69) | commandes présentes dans goose | — | **jamais envoyées à ce bracelet, donc à vérifier** (bouton « Tester la vibration ») |
+| Vibration (`SET_ALARM_TIME` 66, `RUN_ALARM` 68, `DISABLE_ALARM` 69) | commandes présentes dans goose | — | vérifiées le 10 novembre (voir § 4) |
 
 Le flux FC à 1 Hz sert aussi à garder l'app active en arrière-plan toute la nuit (mode `bluetooth-central`).
 
@@ -103,9 +108,9 @@ La vibration a été vérifiée sur le bracelet le 10 novembre avec le motif WHO
 **Format du motif.** Il contient 8 effets, un mot de boucle par effet (u16), une boucle générale et une durée. Ce format
 correspond au séquenceur d'une puce TI de type DRV2625 avec sa bibliothèque standard. Le motif WHOOP `[47, 152]` se lit
 alors « vibration 100 % + pause 240 ms », c'est-à-dire des impulsions. Cette lecture est une hypothèse : le bracelet
-répond `VALID_PATTERN`, `INVALID_EFFECT` ou `INVALID_LOOPS` à chaque motif, et la réponse s'affiche dans l'onglet Alarme.
+répond `VALID_PATTERN`, `INVALID_EFFECT` ou `INVALID_LOOPS` à chaque motif, et la réponse était affichée par l'ancien écran de test.
 
-**Calibration silencieuse du 10 novembre** (bouton « Calibrer » : alarmes programmées dans 6 h puis annulées, aucune
+**Calibration silencieuse du 10 novembre** (ancien bouton « Calibrer » : alarmes programmées dans 6 h puis annulées, aucune
 vibration). Le bracelet accepte tous les effets testés (64, 118, 119–123, séquence montante, 47/152) et tous les mots de
 boucle (0, 0x5555, 0xFFFF). **Seule contrainte trouvée** : avec la boucle générale à 7 (continue), la durée doit être d'au
 moins 30 s ; 20, 15, 10 et 5 s sont refusées (`INVALID_DURATION`). Avec une boucle générale finie (0 à 3), 8 s est
@@ -153,8 +158,8 @@ condition d'abstention n'est vraie. Pas d'ouverture forcée avant l'heure limite
 **Indépendance de l'heure limite.** L'alarme de l'heure limite ne dépend pas de l'app en arrière-plan :
 - l'alarme du bracelet (id 1) est envoyée à l'armement et renvoyée jusqu'à la réponse `SUCCESS`, seulement tant que
   l'heure limite est à venir (une heure passée serait programmée pour le lendemain) ;
-- si un `DISABLE_ALARM` part pendant une session (arrêt de rampe, calibration), l'alarme limite est marquée à renvoyer ;
-  les tests de vibration et la calibration sont bloqués pendant une session armée ;
+- si un `DISABLE_ALARM` part pendant une session (arrêt de la rampe), l'alarme limite est marquée à renvoyer ;
+  les outils de test de vibration et de calibration ont été retirés de l'app ;
 - un palier de rampe envoyé en retard est abandonné au lieu d'être reporté au lendemain ;
 - la notification iOS de secours est programmée à l'armement (heure limite + 1 min) ; l'app affiche si elle est
   programmée ou non autorisée. Elle reste une notification ordinaire, non garantie en mode silencieux.
@@ -214,10 +219,9 @@ Ce qu'on peut en retenir :
 
 ## 7. À vérifier sur le bracelet
 
-1. La vibration : bouton « Tester la vibration ».
-2. La gestion de deux alarmes en parallèle.
-3. La réception des double taps la nuit.
-4. La tenue en arrière-plan toute la nuit : flux FC en direct et autonomie du bracelet avec le flux allumé.
+1. La gestion de deux alarmes en parallèle.
+2. La réception des double taps la nuit.
+3. La tenue en arrière-plan toute la nuit : flux FC en direct et autonomie du bracelet avec le flux allumé.
 
 ## 8. Vérification (10 novembre)
 
@@ -266,7 +270,7 @@ Tests unitaires : probabilité d'atteinte ≥ maximum des marginales, décision 
 
 ## 9. Mouvement en direct (tests du 10 novembre)
 
-Test silencieux « Mouvement en direct » de l'onglet Alarme, réponses du bracelet :
+Test silencieux « Mouvement en direct » (ancien outil de l'écran Alarme), réponses du bracelet :
 
 | Méthode | Réponse | Données reçues |
 |---|---|---|

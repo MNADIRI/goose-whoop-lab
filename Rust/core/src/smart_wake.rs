@@ -756,7 +756,7 @@ pub fn personal_context(conn: &Connection, before_ts: i64, utc_offset: i64) -> G
     let ctx = Context { priors, model, habitual_wake_min: (wake_mins.len() >= 3).then(|| circular_median(&wake_mins)), utc_offset };
     let info = json!({
         "past_nights": nights.len(), "sleep_need_min": need_min,
-        "recommended_sleep_min": plan(&PlanArgs { database_path: conn.path().unwrap_or_default().to_string(), latest_wake: before_ts + 8 * 3600, utc_offset_seconds: utc_offset, now_unix: Some(before_ts) }).ok().and_then(|p| p["recommended_sleep_min"].as_f64()), "sleep_debt_h": round(debt_h, 2),
+        "recommended_sleep_min": plan(&PlanArgs { database_path: conn.path().unwrap_or_default().to_string(), latest_wake: before_ts + 8 * 3600, utc_offset_seconds: utc_offset, now_unix: Some(before_ts), max_advance_min: DEFAULT_MAX_ADVANCE_MIN }).ok().and_then(|p| p["recommended_sleep_min"].as_f64()), "sleep_debt_h": round(debt_h, 2),
         "habitual_wake_local_min": ctx.habitual_wake_min.map(|v| v.round()),
         "priors": priors, "personalised_nights": ctx.model.personalised_nights,
     });
@@ -1185,6 +1185,9 @@ pub struct PlanArgs {
     pub utc_offset_seconds: i64,
     #[serde(default)]
     pub now_unix: Option<i64>,
+    /// user's maximum anticipation (minutes, 0 = fixed time), same meaning as in SessionConfig
+    #[serde(default = "default_max_advance")]
+    pub max_advance_min: i64,
 }
 
 /// Tonight's recommended sleep, bedtime and expected wake, with every component exposed.
@@ -1238,10 +1241,12 @@ pub fn plan(args: &PlanArgs) -> GooseResult<Value> {
     let early_by_min = habitual_bed.map(|h| (h - clock(bedtime) as f64) / 60.0);
     // expected wake if the plan is followed: the automatic window opens at onset + need
     let onset = bedtime + (latency * 60.0) as i64;
-    let win_start = (onset + (recommended * 60.0) as i64).clamp(args.latest_wake - 2700, args.latest_wake - 600);
+    // same window rule as the live engine: never before latest - max anticipation, no forced opening
+    let earliest = args.latest_wake - args.max_advance_min.clamp(0, MAX_ADVANCE_LIMIT_MIN) * 60;
+    let win_start = (onset + (recommended * 60.0) as i64).clamp(earliest, args.latest_wake);
     // if going to bed now
     let now_sleep = ((args.latest_wake - now) as f64 / 60.0 - latency).max(0.0);
-    let now_win = (now + (latency * 60.0) as i64 + (recommended * 60.0) as i64).clamp(args.latest_wake - 2700, args.latest_wake - 600);
+    let now_win = (now + (latency * 60.0) as i64 + (recommended * 60.0) as i64).clamp(earliest, args.latest_wake);
     Ok(json!({
         "recommended_sleep_min": recommended,
         "components": {
@@ -1572,7 +1577,7 @@ mod plan_real {
     #[ignore]
     fn smart_wake_plan_real() {
         let Ok(db) = std::env::var("GOOSE_DB") else { return };
-        let r = super::plan(&super::PlanArgs { database_path: db, latest_wake: 1_794_376_800, utc_offset_seconds: 3600, now_unix: Some(1_794_330_000) }).unwrap();
+        let r = super::plan(&super::PlanArgs { database_path: db, latest_wake: 1_794_376_800, utc_offset_seconds: 3600, now_unix: Some(1_794_330_000), max_advance_min: 30 }).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
     }
 }
@@ -1761,7 +1766,7 @@ mod e2e {
             let day = json!({"edwards_trimp": if i == 0 { 120.0 } else { 40.0 }});
             c.execute("INSERT INTO whoop_lab_days VALUES (?1, 0, 0, '4', ?2, '')", params![format!("2026-11-{:02}", 10 - i), json!({"night": night, "day": day}).to_string()]).unwrap();
         }
-        let r = plan(&PlanArgs { database_path: p, latest_wake: DEADLINE, utc_offset_seconds: 3600, now_unix: Some(BED) }).unwrap();
+        let r = plan(&PlanArgs { database_path: p, latest_wake: DEADLINE, utc_offset_seconds: 3600, now_unix: Some(BED), max_advance_min: 30 }).unwrap();
         let comp = &r["components"];
         // base: p75 of 420 = 420; debt 7 x (420-420) = 0; deep: (70-30)/2 = 20; activity > 0
         assert_eq!(comp["base_min"], 420.0);

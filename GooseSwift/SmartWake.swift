@@ -1,5 +1,3 @@
-import AVFoundation
-import Charts
 import Foundation
 import SwiftUI
 import UserNotifications
@@ -128,70 +126,6 @@ final class HapticRampPlayer: ObservableObject {
     ble.record(source: "smart_wake", title: "ramp.start", body: "level=\(level) total=\(offset)s")
   }
 
-  /// Silent validation: schedules each candidate pattern 6 h ahead (alarm id 4) so the strap only
-  /// answers VALID / INVALID_*; responses land in decoded_frames in this order. Then disables all.
-  static let probes: [(String, GooseBLEClient.AlarmHapticsPattern)] = {
-    func p(_ e: [UInt8], _ loop: UInt16, _ main: UInt8, _ d: UInt8) -> GooseBLEClient.AlarmHapticsPattern {
-      GooseBLEClient.AlarmHapticsPattern(waveformEffects: e + Array(repeating: 0, count: 8 - e.count), loopControl: loop, overallLoop: main, durationSeconds: d)
-    }
-    let hum100: [UInt8] = Array(repeating: 64, count: 8)
-    return [
-      ("default 47/152 d30", p([47, 152], 0, 7, 30)),
-      ("hum64x8 loop0 main7 d30", p(hum100, 0, 7, 30)),
-      ("hum64x8 loopFFFF main7 d30", p(hum100, 0xFFFF, 7, 30)),
-      ("hum64x8 loop0 main7 d20", p(hum100, 0, 7, 20)),
-      ("hum64x8 loop0 main7 d15", p(hum100, 0, 7, 15)),
-      ("hum64x8 loop0 main7 d10", p(hum100, 0, 7, 10)),
-      ("hum64x8 loop0 main7 d5", p(hum100, 0, 7, 5)),
-      ("hum64x8 loop0 main3 d30", p(hum100, 0, 3, 30)),
-      ("smooth123x8 loop0 main7 d30", p(Array(repeating: 123, count: 8), 0, 7, 30)),
-      ("ramp123..64 loop0 main7 d30", p([123, 122, 121, 120, 119, 66, 65, 64], 0, 7, 30)),
-      ("ramp123..64 loop5555 main7 d30", p([123, 122, 121, 120, 119, 66, 65, 64], 0x5555, 7, 30)),
-      ("long118 single d30", p([118], 0, 7, 30)),
-      ("default 47/152 main2 d8", p([47, 152], 0, 2, 8)),
-      ("hum64x8 loop0 main2 d8", p(hum100, 0, 2, 8)),
-      ("hum64x8 loopFFFF main2 d8", p(hum100, 0xFFFF, 2, 8)),
-      ("hum64x8 loop5555 main2 d8", p(hum100, 0x5555, 2, 8)),
-      ("hum64x8 loop0 main0 d8", p(hum100, 0, 0, 8)),
-      ("ramp123..64 loop0 main2 d8", p([123, 122, 121, 120, 119, 66, 65, 64], 0, 2, 8)),
-      ("default 47/152 d60", p([47, 152], 0, 7, 60)),
-      ("default 47/152 d120", p([47, 152], 0, 7, 120)),
-    ]
-  }()
-
-  @Published private(set) var probeStatus = ""
-
-  @Published private(set) var probeResults: [(name: String, response: String)] = []
-
-  func probe() {
-    guard let ble else { return }
-    stop(disableStrap: false)
-    probeResults = []
-    let at = Date().addingTimeInterval(6 * 3600)
-    for (i, item) in Self.probes.enumerated() {
-      DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 2.5) { [weak self, weak ble] in
-        ble?.setWhoopAlarm(at: at, alarmID: 4, pattern: item.1)
-        self?.probeStatus = "Calibration \(i + 1)/\(Self.probes.count) : \(item.0)"
-      }
-      // read the strap's answer just before the next probe
-      DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 2.5 + 2.2) { [weak self, weak ble] in
-        guard let ble else { return }
-        self?.probeResults.append((item.0, "\(ble.lastAlarmResponseSummary) | \(ble.lastAlarmResponsePayloadHex) | \(ble.alarmCommandStatus)"))
-      }
-    }
-    DispatchQueue.main.asyncAfter(deadline: .now() + Double(Self.probes.count) * 2.5 + 1) { [weak self, weak ble] in
-      ble?.disableWhoopAlarms()
-      guard let self else { return }
-      self.onStrapAlarmsDisabled?()
-      self.probeStatus = "Calibration terminée"
-      let rows = self.probeResults.map { ["probe": $0.name, "response": $0.response] }
-      if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-         let data = try? JSONSerialization.data(withJSONObject: rows, options: .prettyPrinted) {
-        try? data.write(to: dir.appendingPathComponent("haptic_probe.json"))
-      }
-    }
-  }
-
   func stop(disableStrap: Bool = true) {
     work.forEach { $0.cancel() }
     work.removeAll()
@@ -203,394 +137,6 @@ final class HapticRampPlayer: ObservableObject {
     }
     isPlaying = false
     percent = 0
-  }
-}
-
-// MARK: - Motion latency probe
-
-/// Measures how fast movement data can reach the phone: phase A = strap-pushed history
-/// (ENTER_HIGH_FREQ_SYNC, 15 s interval), latency = arrival - R18 record timestamp; phase B =
-/// realtime streams (TOGGLE_REALTIME_HR + SEND_R10_R11_REALTIME): which frames arrive, how often.
-/// No vibration. Results: on screen and Documents/motion_probe.json.
-@MainActor
-final class MotionProbe: ObservableObject {
-  @Published private(set) var status = ""
-  @Published private(set) var lines: [String] = []
-  private weak var ble: GooseBLEClient?
-  private var phase = ""
-  private var phaseStart = Date()
-  private var arrivals: [String: [Double]] = [:]   // key = phase|type|layout|len -> arrival offsets
-  private var samples: [String: [String]] = [:]
-  private var r18Latency: [String: [Double]] = [:]
-
-  func attach(ble: GooseBLEClient) { self.ble = ble }
-
-  func run(keepLiveHR: Bool) {
-    guard let ble else { return }
-    outputName = "motion_probe.json"
-    lines = []; arrivals = [:]; samples = [:]; r18Latency = [:]
-    ble.rawFrameSink = { [weak self] hex, date in
-      Task { @MainActor in self?.observe(hex: hex, at: date) }
-    }
-    status = "Attente d'un bracelet libre…"
-    // round 2: which high-frequency intervals the strap accepts, then realtime IMU mode
-    let intervals = [30, 60, 120, 180]
-    ble.whenFreeForCommands(timeout: 60) { [weak self] ble in
-      guard let self else { return }
-      var t = 0.0
-      for iv in intervals {
-        DispatchQueue.main.asyncAfter(deadline: .now() + t) {
-          self.begin("A_hfs_\(iv)s")
-          ble.whenFreeForCommands { $0.enterHighFrequencyHistorySync(intervalSeconds: iv, durationSeconds: 600) }
-        }
-        // stay long enough to see one push at this interval (max 70 s per try)
-        t += Double(min(iv, 60) + 10)
-        DispatchQueue.main.asyncAfter(deadline: .now() + t - 4) {
-          ble.whenFreeForCommands { $0.exitHighFrequencyHistorySync() }
-        }
-      }
-      DispatchQueue.main.asyncAfter(deadline: .now() + t + 2) {
-        self.begin("B_imu_realtime")
-        ble.whenFreeForCommands { $0.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")], requestedStatus: "Motion probe IMU", updatePhysiologyStatus: false) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-          ble.whenFreeForCommands { $0.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(false), name: "TOGGLE_IMU_MODE_OFF")], requestedStatus: "Motion probe IMU off", updatePhysiologyStatus: false) }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.finish() }
-        }
-      }
-    }
-    _ = keepLiveHR
-  }
-
-  /// Optical streams: live optical mode (107 + 108) for 45 s, then persistent R20 (153) recorded
-  /// for 60 s and fetched by a history sync. Everything switched back off at the end.
-  func runOptical() {
-    guard let ble else { return }
-    lines = []; arrivals = [:]; samples = [:]; r18Latency = [:]
-    outputName = "optical_probe.json"
-    ble.rawFrameSink = { [weak self] hex, date in
-      Task { @MainActor in self?.observe(hex: hex, at: date) }
-    }
-    typealias K = GooseBLEClient.SensorStreamCommandKind
-    let on = K.revisionBoolean(true), off = K.revisionBoolean(false)
-    status = "Attente d'un bracelet libre…"
-    ble.whenFreeForCommands(timeout: 60) { [weak self] ble in
-      guard let self else { return }
-      self.begin("C_optical_live")
-      ble.writeSensorStreamCommands([K(commandNumber: 107, payload: on, name: "ENABLE_OPTICAL_DATA_ON"), K(commandNumber: 108, payload: on, name: "TOGGLE_OPTICAL_MODE_ON")], requestedStatus: "Optical probe", updatePhysiologyStatus: false)
-      DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
-        self.begin("D_r20_persistent")
-        ble.whenFreeForCommands { $0.writeSensorStreamCommands([K(commandNumber: 153, payload: on, name: "TOGGLE_PERSISTENT_R20_ON")], requestedStatus: "Optical probe R20", updatePhysiologyStatus: false) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
-          ble.whenFreeForCommands { $0.syncHistoricalPackets() }
-          DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
-            ble.whenFreeForCommands { $0.writeSensorStreamCommands([
-              K(commandNumber: 153, payload: off, name: "TOGGLE_PERSISTENT_R20_OFF"),
-              K(commandNumber: 108, payload: off, name: "TOGGLE_OPTICAL_MODE_OFF"),
-              K(commandNumber: 107, payload: off, name: "ENABLE_OPTICAL_DATA_OFF"),
-            ], requestedStatus: "Optical probe off", updatePhysiologyStatus: false) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.finish() }
-          }
-        }
-      }
-    }
-  }
-
-  private var outputName = "motion_probe.json"
-
-  private func begin(_ p: String) {
-    phase = p
-    phaseStart = Date()
-    status = "Phase \(p)…"
-  }
-
-  private func observe(hex: String, at date: Date) {
-    guard !phase.isEmpty, hex.count >= 20 else { return }
-    func byte(_ i: Int) -> Int { Int(hex.dropFirst(2 * i).prefix(2), radix: 16) ?? -1 }
-    let type = byte(8), layout = byte(9), len = hex.count / 2
-    let key = "\(phase)|type\(type)|layout\(layout)|len\(len)"
-    arrivals[key, default: []].append(date.timeIntervalSince(phaseStart))
-    // keep full frames of the large (raw sensor) records for offline decoding, short prefix otherwise
-    let keep = len > 200 ? 6 : 3
-    if samples[key, default: []].count < keep { samples[key, default: []].append(len > 200 ? hex : String(hex.prefix(160))) }
-    if type == 47, layout == 18, len == 124 {
-      // R18 timestamp: u32 at frame byte 15
-      let ts = (15..<19).reversed().reduce(0) { $0 << 8 | byte($1) }
-      r18Latency[phase, default: []].append(date.timeIntervalSince1970 - Double(ts))
-    }
-  }
-
-  private func finish() {
-    ble?.rawFrameSink = nil
-    phase = ""
-    var out: [[String: Any]] = []
-    for (key, t) in arrivals.sorted(by: { $0.key < $1.key }) {
-      let gaps = zip(t.dropFirst(), t).map { $0 - $1 }.sorted()
-      let medianGap = gaps.isEmpty ? 0 : gaps[gaps.count / 2]
-      out.append(["key": key, "frames": t.count, "median_gap_s": medianGap, "first_s": t.first ?? 0, "samples": samples[key] ?? []])
-      lines.append("\(key): \(t.count) trames, écart médian \(String(format: "%.2f", medianGap)) s")
-    }
-    for (p, lat) in r18Latency.sorted(by: { $0.key < $1.key }) {
-      let s = lat.sorted()
-      let med = s[s.count / 2], minL = s.first ?? 0
-      out.append(["key": "\(p)|r18_latency", "frames": s.count, "median_s": med, "min_s": minL, "max_s": s.last ?? 0])
-      lines.append("\(p) retard R18 : médian \(Int(med)) s, min \(Int(minL)) s (\(s.count) enreg.)")
-    }
-    // NSJSONSerialization raises an uncatchable exception on NaN / infinity: sanitise and validate
-    func clean(_ v: Any) -> Any {
-      switch v {
-      case let d as Double: return d.isFinite ? d : NSNull()
-      case let a as [Any]: return a.map(clean)
-      case let m as [String: Any]: return m.mapValues(clean)
-      case let s as String: return s
-      case let i as Int: return i
-      default: return String(describing: v)
-      }
-    }
-    let payload: Any = ["lines": lines, "rows": out.map { clean($0) }]
-    if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-      let url = dir.appendingPathComponent(outputName)
-      if JSONSerialization.isValidJSONObject(payload), let data = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
-        try? data.write(to: url)
-      } else {
-        try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
-      }
-    }
-    status = "Test terminé"
-  }
-}
-
-// MARK: - Full sensor session
-
-/// Guided ~11 min session that switches every safe strap stream on one at a time (then all
-/// together, then the on-strap persistent recorders) while the user performs scripted actions.
-/// Every frame received is appended to Documents/sensor_session.tsv (unix time, phase, step, hex);
-/// the timeline of steps and commands goes to Documents/sensor_session_meta.json.
-@MainActor
-final class SensorSession: ObservableObject {
-  struct Step { let seconds: Int; let instruction: String }
-  struct Phase { let id: String; let title: String; let on: [GooseBLEClient.SensorStreamCommandKind]; let off: [GooseBLEClient.SensorStreamCommandKind]; let steps: [Step]; let syncAfter: Bool }
-
-  @Published private(set) var running = false
-  @Published private(set) var phaseTitle = ""
-  @Published private(set) var instruction = ""
-  @Published private(set) var remaining = 0
-  @Published private(set) var progress = 0.0
-  @Published private(set) var frameCount = 0
-  @Published private(set) var summary = ""
-
-  private weak var ble: GooseBLEClient?
-  private var phases: [Phase] = []
-  private var timeline: [[String: Any]] = []
-  private var timer: Timer?
-  private var phaseIndex = 0, stepIndex = 0, stepLeft = 0, elapsed = 0, total = 0
-  nonisolated(unsafe) private var tag = "idle|-"
-  nonisolated(unsafe) private var handle: FileHandle?
-  nonisolated(unsafe) private var counts: [String: Int] = [:]
-  nonisolated private let io = DispatchQueue(label: "sensor-session.io")
-  private let speech = AVSpeechSynthesizer()
-
-  func attach(ble: GooseBLEClient) { self.ble = ble }
-
-  private static func build() -> [Phase] {
-    typealias K = GooseBLEClient.SensorStreamCommandKind
-    let on = K.revisionBoolean(true), off = K.revisionBoolean(false)
-    let hrOn = K(commandNumber: 3, payload: [1], name: "TOGGLE_REALTIME_HR_ON"), hrOff = K(commandNumber: 3, payload: [0], name: "TOGGLE_REALTIME_HR_OFF")
-    let imuOn = K(commandNumber: 106, payload: on, name: "TOGGLE_IMU_MODE_ON"), imuOff = K(commandNumber: 106, payload: off, name: "TOGGLE_IMU_MODE_OFF")
-    let optOn = [K(commandNumber: 107, payload: on, name: "ENABLE_OPTICAL_DATA_ON"), K(commandNumber: 108, payload: on, name: "TOGGLE_OPTICAL_MODE_ON")]
-    let optOff = [K(commandNumber: 108, payload: off, name: "TOGGLE_OPTICAL_MODE_OFF"), K(commandNumber: 107, payload: off, name: "ENABLE_OPTICAL_DATA_OFF")]
-    let persOn = [K(commandNumber: 153, payload: on, name: "TOGGLE_PERSISTENT_R20_ON"), K(commandNumber: 154, payload: on, name: "TOGGLE_PERSISTENT_R21_ON")]
-    return [
-      Phase(id: "P0_baseline", title: "Référence sans flux", on: [], off: [], steps: [
-        Step(seconds: 60, instruction: "Avant-bras posé à plat, immobile, respiration normale")], syncAfter: false),
-      Phase(id: "P1_hr_live", title: "Fréquence cardiaque temps réel", on: [hrOn], off: [hrOff], steps: [
-        Step(seconds: 60, instruction: "Immobile, respiration normale"),
-        Step(seconds: 60, instruction: "Respiration lente : inspire 5 secondes, expire 5 secondes"),
-        Step(seconds: 30, instruction: "Retiens ta respiration 15 secondes si c'est confortable, puis respire normalement")], syncAfter: false),
-      Phase(id: "P2_imu_live", title: "Accéléromètre et gyroscope temps réel", on: [imuOn], off: [imuOff], steps: [
-        Step(seconds: 15, instruction: "Bras posé à plat, immobile"),
-        Step(seconds: 15, instruction: "Tourne lentement le poignet, paume vers le haut puis vers le bas"),
-        Step(seconds: 15, instruction: "Lève le bras à la verticale, puis redescends-le, lentement"),
-        Step(seconds: 20, instruction: "Marche sur place, bras le long du corps"),
-        Step(seconds: 10, instruction: "Tape deux fois sur le bracelet, pause, puis trois fois"),
-        Step(seconds: 15, instruction: "Secoue la main vivement"),
-        Step(seconds: 15, instruction: "Bras posé à plat, immobile")], syncAfter: false),
-      Phase(id: "P3_optical_live", title: "Capteur optique temps réel", on: optOn, off: optOff, steps: [
-        Step(seconds: 45, instruction: "Bras posé à plat, immobile"),
-        Step(seconds: 20, instruction: "Appuie fermement sur le bracelet avec deux doigts"),
-        Step(seconds: 20, instruction: "Serre le poing fort, relâche, recommence"),
-        Step(seconds: 30, instruction: "Bras posé à plat, immobile")], syncAfter: false),
-      Phase(id: "P4_all_live", title: "Tous les flux en même temps", on: [hrOn, imuOn] + optOn, off: [imuOff] + optOff + [hrOff], steps: [
-        Step(seconds: 30, instruction: "Immobile"),
-        Step(seconds: 30, instruction: "Marche sur place")], syncAfter: false),
-      Phase(id: "P5_persistent", title: "Enregistrement brut sur le bracelet", on: persOn, off: GooseBLEClient.SensorStreamCommandKind.stopPhysiologyCapture, steps: [
-        Step(seconds: 60, instruction: "Immobile"),
-        Step(seconds: 30, instruction: "Marche sur place")], syncAfter: true),
-      Phase(id: "P6_fetch", title: "Récupération de l'historique", on: [], off: [], steps: [
-        Step(seconds: 60, instruction: "Immobile, la session se termine")], syncAfter: false),
-    ]
-  }
-
-  func start() {
-    guard !running, let ble else { return }
-    phases = Self.build()
-    total = phases.flatMap(\.steps).reduce(0) { $0 + $1.seconds }
-    timeline = []; elapsed = 0; frameCount = 0; summary = ""
-    let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    let url = dir.appendingPathComponent("sensor_session.tsv")
-    try? Data("unix\tphase\tstep\thex\n".utf8).write(to: url)
-    io.sync { handle = try? FileHandle(forWritingTo: url); _ = try? handle?.seekToEnd(); counts = [:] }
-    ble.rawFrameSink = { [weak self] hex, date in self?.write(hex: hex, at: date) }
-    UIApplication.shared.isIdleTimerDisabled = true
-    running = true
-    phaseIndex = 0; stepIndex = -1
-    enterPhase()
-    timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
-  }
-
-  func stop() { finish(aborted: true) }
-
-  /// Every stream and recorder off, in the order that is known to stop the on-strap R20/R21
-  /// recorders (153 off then optical mode/data off; 154 off then IMU off). Repeated after 20 s.
-  func stopAllStreams() {
-    for delay in [0.0, 20.0] {
-      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-        self?.send(GooseBLEClient.SensorStreamCommandKind.stopPhysiologyCapture, label: "stop all")
-      }
-    }
-    summary = "Flux de test arrêtés"
-  }
-
-  nonisolated private func write(hex: String, at date: Date) {
-    io.async { [self] in
-      let line = String(format: "%.3f", date.timeIntervalSince1970) + "\t" + tag.replacingOccurrences(of: "|", with: "\t") + "\t" + hex + "\n"
-      handle?.write(Data(line.utf8))
-      let k = String(hex.dropFirst(16).prefix(4)) + "/\(hex.count / 2)"
-      counts[k, default: 0] += 1
-    }
-    Task { @MainActor in self.frameCount += 1 }
-  }
-
-  private func mark(_ event: String, _ extra: [String: Any] = [:]) {
-    var e: [String: Any] = ["unix": Date().timeIntervalSince1970, "event": event]
-    e.merge(extra) { a, _ in a }
-    timeline.append(e)
-    let payload: [String: Any] = ["timeline": timeline]
-    if JSONSerialization.isValidJSONObject(payload), let d = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
-      try? d.write(to: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("sensor_session_meta.json"))
-    }
-  }
-
-  private func send(_ cmds: [GooseBLEClient.SensorStreamCommandKind], label: String) {
-    guard !cmds.isEmpty, let ble else { return }
-    let requested = Date().timeIntervalSince1970
-    ble.whenFreeForCommands(timeout: 60) { [weak self] b in
-      b.writeSensorStreamCommands(cmds, requestedStatus: "Sensor session", updatePhysiologyStatus: false)
-      self?.mark("commands", ["label": label, "names": cmds.map(\.name), "requested": requested])
-    }
-  }
-
-  private func enterPhase() {
-    let p = phases[phaseIndex]
-    phaseTitle = p.title
-    mark("phase_start", ["phase": p.id])
-    send(p.on, label: "\(p.id) on")
-    if p.id == "P6_fetch" { ble?.whenFreeForCommands(timeout: 60) { $0.syncHistoricalPackets() } }
-    stepIndex = 0
-    enterStep()
-  }
-
-  private func enterStep() {
-    let p = phases[phaseIndex], s = p.steps[stepIndex]
-    stepLeft = s.seconds
-    instruction = s.instruction
-    tag = "\(p.id)|\(stepIndex)"
-    mark("step", ["phase": p.id, "step": stepIndex, "seconds": s.seconds, "instruction": s.instruction])
-    UINotificationFeedbackGenerator().notificationOccurred(.success)
-    speech.stopSpeaking(at: .immediate)
-    let u = AVSpeechUtterance(string: s.instruction)
-    u.voice = AVSpeechSynthesisVoice(language: "fr-FR")
-    speech.speak(u)
-    remaining = stepLeft
-  }
-
-  private func tick() {
-    guard running else { return }
-    stepLeft -= 1; elapsed += 1
-    remaining = stepLeft
-    progress = Double(elapsed) / Double(max(total, 1))
-    guard stepLeft <= 0 else { return }
-    let p = phases[phaseIndex]
-    if stepIndex + 1 < p.steps.count { stepIndex += 1; enterStep(); return }
-    send(p.off, label: "\(p.id) off")
-    if p.syncAfter { ble?.whenFreeForCommands(timeout: 60) { $0.syncHistoricalPackets() } }
-    mark("phase_end", ["phase": p.id])
-    if phaseIndex + 1 < phases.count { phaseIndex += 1; enterPhase() } else { finish(aborted: false) }
-  }
-
-  private func finish(aborted: Bool) {
-    guard running else { return }
-    timer?.invalidate(); timer = nil
-    running = false
-    // everything off, whatever phase we were in
-    typealias K = GooseBLEClient.SensorStreamCommandKind
-    let off = K.revisionBoolean(false)
-    _ = off
-    stopAllStreams()
-    mark(aborted ? "aborted" : "done")
-    UIApplication.shared.isIdleTimerDisabled = false
-    speech.stopSpeaking(at: .immediate)
-    instruction = ""; phaseTitle = ""
-    // keep capturing late frames (history fetch) for 20 s, then close the files
-    DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
-      guard let self else { return }
-      if !self.running { self.ble?.rawFrameSink = nil }
-      self.tag = "after|-"
-      let meta = self.timeline
-      self.io.async { [self] in
-        try? self.handle?.close(); self.handle = nil
-        let c = self.counts
-        Task { @MainActor in
-          let payload: [String: Any] = ["timeline": meta.map { $0.mapValues { v -> Any in (v as? Double).map { $0.isFinite ? $0 : 0 } ?? v } }, "frame_counts": c]
-          let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-          if JSONSerialization.isValidJSONObject(payload), let d = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
-            try? d.write(to: dir.appendingPathComponent("sensor_session_meta.json"))
-          }
-          self.summary = (aborted ? "Session arrêtée" : "Session terminée") + " : \(self.frameCount) trames enregistrées"
-        }
-      }
-    }
-  }
-}
-
-struct SensorSessionCard: View {
-  @ObservedObject var session: SensorSession
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Label("Session capteurs complète", systemImage: "waveform.path.ecg.rectangle").font(.headline)
-      if session.running {
-        Text(session.phaseTitle).font(.subheadline.weight(.semibold))
-        Text(session.instruction).font(.title3.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
-        HStack {
-          Text("\(session.remaining) s").font(.system(.largeTitle, design: .rounded).monospacedDigit().weight(.bold))
-          Spacer()
-          Text("\(session.frameCount) trames").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-        }
-        ProgressView(value: session.progress)
-        Button("Arrêter", role: .destructive) { session.stop() }.buttonStyle(.bordered)
-      } else {
-        Text("Environ 11 min, bracelet porté, téléphone à côté. Chaque consigne est lue à voix haute.")
-          .font(.footnote).foregroundStyle(.secondary)
-        HStack {
-          Button("Lancer la session") { session.start() }.buttonStyle(.borderedProminent)
-          Button("Arrêter les flux de test") { session.stopAllStreams() }.buttonStyle(.bordered)
-        }
-        if !session.summary.isEmpty { Text(session.summary).font(.caption) }
-      }
-    }
-    .padding(16)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
   }
 }
 
@@ -644,14 +190,20 @@ final class SmartWakeController: ObservableObject {
   /// anticipation actually requested from the engine
   var effectiveMaxAdvance: Int { mode == .fixed ? 0 : maxAdvanceMin }
 
+  /// the engine keeps the deadline tonight (short night, debt, missing data) and the window
+  /// would otherwise already be open: only then is the reason worth showing as a decision
+  var deadlineHeld: Bool {
+    guard let s = session, anticipationAllowed == false else { return false }
+    let adv = s.maxAdvanceMin ?? 30
+    return adv > 0 && Date() >= deadline.addingTimeInterval(-TimeInterval(adv * 60))
+  }
+
   /// window start worth showing (nil when it coincides with the deadline: fixed time)
   var displayWindowStart: Date? {
     guard let ws = windowStart, ws < deadline.addingTimeInterval(-30) else { return nil }
     return ws
   }
   let ramp = HapticRampPlayer()
-  let motionProbe = MotionProbe()
-  let sensorSession = SensorSession()
 
   private weak var ble: GooseBLEClient?
   private let queue = DispatchQueue(label: "smart-wake.engine", qos: .userInitiated)
@@ -672,7 +224,7 @@ final class SmartWakeController: ObservableObject {
     latest = (defaults.object(forKey: Self.latestKey) as? Date) ?? Calendar.current.date(byAdding: .minute, value: 7 * 60, to: base)!
     session = (defaults.data(forKey: Self.sessionKey)).flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
     feedbackPendingSessionID = defaults.string(forKey: Self.feedbackKey)
-    if session != nil { status = "Armé (repris)" }
+    if session != nil { status = "Surveillance du sommeil" }
     ramp.onStrapAlarmsDisabled = { [weak self] in self?.strapAlarmsWereDisabled() }
   }
 
@@ -706,9 +258,10 @@ final class SmartWakeController: ObservableObject {
   func attach(ble: GooseBLEClient) {
     self.ble = ble
     ramp.attach(ble: ble)
-    motionProbe.attach(ble: ble)
-    sensorSession.attach(ble: ble)
-    if session != nil { startHeartbeat() }
+    if let s = session {
+      startHeartbeat()
+      restoreBackup(deadline: Date(timeIntervalSince1970: TimeInterval(s.windowEnd)))
+    }
     ble.liveSampleSink = { [weak self] date, hr, rr, source in
       self?.ingest(date: date, hr: hr, rr: rr, source: source)
     }
@@ -721,7 +274,7 @@ final class SmartWakeController: ObservableObject {
 
   func refreshPlan() {
     defaults.set(latest, forKey: Self.latestKey)
-    let args: [String: Any] = ["database_path": HealthDataStore.defaultDatabasePath(), "latest_wake": Int(deadline.timeIntervalSince1970), "utc_offset_seconds": TimeZone.current.secondsFromGMT()]
+    let args: [String: Any] = ["database_path": HealthDataStore.defaultDatabasePath(), "latest_wake": Int(deadline.timeIntervalSince1970), "utc_offset_seconds": TimeZone.current.secondsFromGMT(), "max_advance_min": session.map { $0.maxAdvanceMin ?? 30 } ?? effectiveMaxAdvance]
     queue.async { [weak self] in
       let r = (try? GooseRustBridge().request(method: "smart_wake.plan", args: args)) ?? [:]
       Task { @MainActor in self?.plan = r }
@@ -744,24 +297,18 @@ final class SmartWakeController: ObservableObject {
     lastReasonCode = ""
     defaults.set(try? JSONEncoder().encode(s), forKey: Self.sessionKey)
     deadlineConfirmed = false
-    opticalStartedAt = nil
-    opticalDone = false
-    nightOpticalStatus = ""
     lastDeadlineAttempt = .distantPast
     lastLiveRequest = .distantPast
     ensureStrapSetup(now: now)
     startHeartbeat()
     scheduleBackupNotification(at: end.addingTimeInterval(60))
     let t = end.formatted(date: .omitted, time: .shortened)
-    status = effectiveMaxAdvance == 0 ? "Armé : réveil à \(t)" : "Armé : réveil au plus tard à \(t)"
+    status = "Programmation de l'alarme \(t) sur le bracelet…"
     ble.record(source: "smart_wake", title: "armed", body: "deadline=\(s.windowEnd) max_advance_min=\(effectiveMaxAdvance)")
   }
 
   func disarm(reason: String = "désactivé") {
     ramp.stop(disableStrap: false)
-    if let ble, opticalStartedAt != nil, !opticalDone { setPersistentR20(false, ble: ble); opticalDone = true }
-    opticalStartedAt = nil
-    onsetDate = nil
     session = nil
     windowStart = nil
     decisionReason = nil
@@ -798,16 +345,6 @@ final class SmartWakeController: ObservableObject {
     defaults.set(s.id, forKey: Self.feedbackKey)
     disarm(reason: "réveil confirmé")
     status = "Réveil confirmé. Bonne journée !"
-  }
-
-  /// Vibration tests and silent calibration send DISABLE_ALARM, which would also clear the deadline
-  /// alarm: they are not offered while a wake-up is armed.
-  var testsBlocked: Bool { session != nil }
-
-  func testVibration() {
-    guard !testsBlocked else { return }
-    ramp.play(level: 1)
-    status = "Test : rampe continue de 10 % à 100 % en 40 s, puis maintien 20 s"
   }
 
   func submitFeedback(rating: Int) {
@@ -851,14 +388,6 @@ final class SmartWakeController: ObservableObject {
   @Published private(set) var deadlineConfirmed = false
   @Published private(set) var liveStreamOK = false
   @Published private(set) var imuStreamOK = false
-  /// Night optical test: persistent R20 for 30 min, ~2 h after sleep onset (looks for the red / IR LED).
-  @Published var nightOpticalTest: Bool = UserDefaults.standard.bool(forKey: "smartWake.nightOpticalTest") {
-    didSet { UserDefaults.standard.set(nightOpticalTest, forKey: "smartWake.nightOpticalTest") }
-  }
-  @Published private(set) var nightOpticalStatus = ""
-  private var onsetDate: Date?
-  private var opticalStartedAt: Date?
-  private var opticalDone = false
   private var lastIMURequest = Date.distantPast
   private var imuRequested = false
   private var lastDeadlineAttempt = Date.distantPast
@@ -887,7 +416,6 @@ final class SmartWakeController: ObservableObject {
       imuRequested = true
       ble.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")], requestedStatus: "Smart wake: live IMU", updatePhysiologyStatus: false)
     }
-    runNightOpticalTest(now: now, ble: ble)
     let end = Date(timeIntervalSince1970: TimeInterval(s.windowEnd))
     // only while the deadline is still ahead: SET_ALARM_TIME takes a clock time, a passed one
     // would ring tomorrow
@@ -898,40 +426,10 @@ final class SmartWakeController: ObservableObject {
         guard let self, let ble else { return }
         if ble.lastAlarmResponseSummary.contains("SET_ALARM_TIME"), ble.lastAlarmResponseSummary.contains("SUCCESS") {
           self.deadlineConfirmed = true
+          if self.status.hasPrefix("Programmation") { self.status = "Alarme confirmée sur le bracelet · surveillance du sommeil" }
           ble.record(source: "smart_wake", title: "deadline.confirmed", body: "\(s.windowEnd)")
         }
       }
-    }
-  }
-
-  private func setPersistentR20(_ on: Bool, ble: GooseBLEClient) {
-    let cmd = GooseBLEClient.SensorStreamCommandKind(commandNumber: 153, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(on), name: on ? "TOGGLE_PERSISTENT_R20_ON" : "TOGGLE_PERSISTENT_R20_OFF")
-    ble.whenFreeForCommands(timeout: 120) { $0.writeSensorStreamCommands([cmd], requestedStatus: "Night optical test", updatePhysiologyStatus: false) }
-    ble.record(source: "smart_wake", title: on ? "night_optical.start" : "night_optical.stop", body: "")
-  }
-
-  private func runNightOpticalTest(now: Date, ble: GooseBLEClient) {
-    guard nightOpticalTest, !opticalDone else { return }
-    if let start = opticalStartedAt {
-      nightOpticalStatus = "Capture optique en cours (\(Int(now.timeIntervalSince(start) / 60))/30 min)"
-      if now.timeIntervalSince(start) >= 30 * 60 {
-        setPersistentR20(false, ble: ble)
-        opticalDone = true
-        nightOpticalStatus = "Capture optique terminée (30 min)"
-      }
-      return
-    }
-    guard let onset = onsetDate else { nightOpticalStatus = "Capture optique : en attente de l'endormissement"; return }
-    let begin = onset.addingTimeInterval(2 * 3600)
-    let latest = (windowStart ?? begin.addingTimeInterval(4 * 3600)).addingTimeInterval(-40 * 60)
-    if now >= begin, now < latest, ble.isFreeForCommands, !ramp.isPlaying {
-      opticalStartedAt = now
-      setPersistentR20(true, ble: ble)
-    } else if now >= latest {
-      opticalDone = true
-      nightOpticalStatus = "Capture optique annulée : trop près de la fenêtre de réveil"
-    } else {
-      nightOpticalStatus = "Capture optique prévue vers \(begin.formatted(date: .omitted, time: .shortened))"
     }
   }
 
@@ -992,7 +490,6 @@ final class SmartWakeController: ObservableObject {
     engineState = r["state"] as? String ?? engineState
     if let w = r["window"] as? [String: Any], let ws = w["start"] as? Int {
       windowStart = Date(timeIntervalSince1970: TimeInterval(ws))
-      if let o = w["onset_estimate"] as? Int { onsetDate = Date(timeIntervalSince1970: TimeInterval(o)) }
     }
     if let epoch = r["epoch"] as? [String: Any] {
       posterior = epoch["posterior"] as? [Double] ?? posterior
@@ -1054,6 +551,22 @@ final class SmartWakeController: ObservableObject {
     }
   }
 
+  /// After a relaunch: the notification scheduled at arming is still pending, or is scheduled again.
+  private func restoreBackup(deadline: Date) {
+    guard deadline > Date() else { return }
+    UNUserNotificationCenter.current().getPendingNotificationRequests { [weak self] reqs in
+      let pending = reqs.contains { $0.identifier == Self.notificationID }
+      Task { @MainActor in
+        guard let self, self.session != nil else { return }
+        if pending {
+          self.backupStatus = "Secours iPhone programmé à \(deadline.addingTimeInterval(60).formatted(date: .omitted, time: .shortened))"
+        } else {
+          self.scheduleBackupNotification(at: deadline.addingTimeInterval(60))
+        }
+      }
+    }
+  }
+
   private func scheduleBackupNotification(at date: Date) {
     let center = UNUserNotificationCenter.current()
     backupStatus = "Secours iPhone : programmation…"
@@ -1076,13 +589,15 @@ final class SmartWakeController: ObservableObject {
   }
 }
 
-// MARK: - Alarm tab
+// MARK: - Alarm screen (Forme)
 
+/// Smart wake screen. Answers three questions in order: when will I be woken, is it really
+/// programmed, what can I change. Model details stay folded in "Détails techniques".
 struct AlarmView: View {
   @ObservedObject var controller: SmartWakeController
   @ObservedObject private var ble: GooseBLEClient
   @ObservedObject private var ramp: HapticRampPlayer
-  @State private var showPicker = false
+  @State private var editingTime = false
 
   init(controller: SmartWakeController, ble: GooseBLEClient) {
     self.controller = controller
@@ -1090,383 +605,319 @@ struct AlarmView: View {
     _ble = ObservedObject(wrappedValue: ble)
   }
 
+  private var armed: Bool { controller.session != nil }
+  private var waking: Bool { controller.engineState == "stimulating" || controller.engineState == "probable_awake" || (armed && ramp.isPlaying) }
+  private var adv: Int { controller.session.map { $0.maxAdvanceMin ?? 30 } ?? controller.effectiveMaxAdvance }
+
   var body: some View {
-    ScrollView {
-      VStack(spacing: 18) {
-        hero
-        if controller.feedbackPendingSessionID != nil { feedbackCard }
-        if controller.session != nil { liveCard }
-        tonightCard
-        nightOpticalCard
-        nightsCard
-        vibrationCard
-        SensorSessionCard(session: controller.sensorSession)
-        MotionProbeCard(probe: controller.motionProbe, keepLiveHR: controller.session != nil)
-      }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 12)
-      .frame(maxWidth: 640)
-      .frame(maxWidth: .infinity)
+    FormeScroll {
+      DetailHeader(title: "Réveil")
+      hero.padding(.top, 24)
+      if waking { wakeCard.padding(.top, 12) }
+      if controller.feedbackPendingSessionID != nil, !armed { feedbackCard.padding(.top, 12) }
+      primaryButton.padding(.top, 16)
+      if armed { tonightStatus } else { settings }
+      planCard
+      if armed { TechDetails(subtitle: "Stades estimés, fenêtre et flux du bracelet", rows: techRows).padding(.top, 32) }
     }
-    .gooseScreenBackground()
-    .navigationTitle("Alarme")
-    .navigationBarTitleDisplayMode(.inline)
+    .formeScreen()
     .onAppear { controller.refreshPlan() }
     .onChange(of: controller.latest) { _, _ in controller.refreshPlan() }
+    .onChange(of: controller.mode) { _, _ in controller.refreshPlan() }
+    .onChange(of: controller.maxAdvanceMin) { _, _ in controller.refreshPlan() }
     .refreshable { controller.refreshPlan() }
+    .sheet(isPresented: $editingTime) { timeSheet }
   }
 
   // MARK: hero
 
   private var hero: some View {
-    VStack(spacing: 14) {
+    AuraCard(family: .sleep, radius: 44, padding: 24) {
       HStack {
-        Label(controller.session == nil ? "Réveil intelligent" : "Armé", systemImage: controller.session == nil ? "moon.zzz" : "alarm.waves.left.and.right.fill")
-          .font(.subheadline.weight(.semibold))
-          .foregroundStyle(.white.opacity(0.85))
+        Text(adv == 0 ? "Heure fixe" : "Fenêtre flexible")
+          .font(Forme.sans(20, .regular, relativeTo: .title3)).tracking(-0.2)
         Spacer()
-        Toggle("", isOn: Binding(get: { controller.session != nil }, set: { $0 ? controller.arm() : controller.disarm() }))
-          .labelsHidden().tint(.cyan)
+        VeilPill(text: armed ? "Armé" : "Désactivé", ink: armed ? Forme.Family.sleep.pillInk : Forme.onBright2)
       }
-      Picker("Mode", selection: $controller.mode) {
-        ForEach(SmartWakeController.Mode.allCases) { Text($0.title).tag($0) }
-      }
-      .pickerStyle(.segmented)
-      .disabled(controller.session != nil)
-      Button { if controller.session == nil { showPicker.toggle() } } label: {
-        VStack(spacing: 2) {
-          Text(controller.mode == .fixed ? "Réveil à" : "Au plus tard").font(.caption).foregroundStyle(.white.opacity(0.7))
-          Text(controller.session != nil ? controller.deadline : controller.latest, format: .dateTime.hour().minute())
-            .font(.system(size: 64, weight: .thin, design: .rounded))
-            .foregroundStyle(.white)
-            .contentTransition(.numericText())
+      Button { if !armed { editingTime = true } } label: {
+        VStack(alignment: .leading, spacing: 2) {
+          Text(adv == 0 ? "Réveil à" : "Au plus tard").font(Forme.sans(13, .semibold, relativeTo: .footnote)).foregroundStyle(Forme.onBright2)
+          DotNumber(value: FF.clock(armed ? controller.deadline : controller.latest), size: 84)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
-      .disabled(controller.session != nil)
-      if showPicker && controller.session == nil {
-        DatePicker("", selection: $controller.latest, displayedComponents: .hourAndMinute)
-          .datePickerStyle(.wheel).labelsHidden().colorScheme(.dark).frame(maxHeight: 140)
+      .allowsHitTesting(!armed)
+      .padding(.top, 18)
+      .accessibilityLabel("Heure de réveil \(FF.clock(armed ? controller.deadline : controller.latest))")
+      .accessibilityHint(armed ? "" : "Modifier l'heure")
+      Text(windowSentence)
+        .font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426))
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.top, 10)
+      VeilPanel {
+        HStack(spacing: 10) {
+          Image(systemName: armed ? (controller.deadlineConfirmed ? "checkmark.seal.fill" : "hourglass") : "hand.tap")
+            .font(.system(size: 15, weight: .semibold))
+          Text(armed ? controller.status : "Touche l'heure pour la modifier")
+            .font(Forme.sans(13, .semibold, relativeTo: .footnote))
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(Forme.onBright)
       }
-      if controller.mode == .flexible {
-        HStack {
-          Text("Anticipation maximale").font(.footnote)
-          Spacer()
-          Picker("Anticipation maximale", selection: $controller.maxAdvanceMin) {
-            ForEach(SmartWakeController.advanceChoices, id: \.self) { Text("\($0) min").tag($0) }
+      .padding(.top, 16)
+    }
+    .accessibilityElement(children: .contain)
+  }
+
+  private var windowSentence: String {
+    let end = FF.clock(controller.deadline)
+    if adv == 0 { return "Réveil à \(end) précises, sans anticipation." }
+    if controller.deadlineHeld, let r = controller.decisionReason {
+      return "Réveil à \(end) : \(r)."
+    }
+    if let ws = controller.displayWindowStart { return "Réveil possible entre \(FF.clock(ws)) et \(end)." }
+    let earliest = controller.deadline.addingTimeInterval(-TimeInterval(adv * 60))
+    return "Réveil possible entre \(FF.clock(earliest)) et \(end), si ton besoin de sommeil est couvert."
+  }
+
+  private var timeSheet: some View {
+    VStack(spacing: 20) {
+      Text("Heure de réveil").font(Forme.sans(17, .semibold, relativeTo: .headline)).foregroundStyle(Forme.ink)
+      DatePicker("Heure de réveil", selection: $controller.latest, displayedComponents: .hourAndMinute)
+        .datePickerStyle(.wheel).labelsHidden()
+      Button { editingTime = false } label: {
+        Text("Valider").font(Forme.sans(17, .semibold, relativeTo: .headline)).foregroundStyle(Forme.canvas)
+          .frame(maxWidth: .infinity, minHeight: 56).background(Forme.ink, in: Capsule())
+      }
+      .buttonStyle(.plain)
+    }
+    .padding(24)
+    .presentationDetents([.medium])
+    .background(FormeGround())
+  }
+
+  // MARK: primary action
+
+  private var primaryButton: some View {
+    Button {
+      armed ? controller.disarm() : controller.arm()
+    } label: {
+      Text(armed ? "Désactiver le réveil" : "Programmer le réveil")
+        .font(Forme.sans(17, .semibold, relativeTo: .headline))
+        .foregroundStyle(armed ? Forme.ink : Forme.canvas)
+        .frame(maxWidth: .infinity, minHeight: 56)
+        .background(armed ? Forme.sunken : Forme.ink, in: Capsule())
+    }
+    .buttonStyle(FormePressStyle())
+  }
+
+  // MARK: waking up
+
+  private var wakeCard: some View {
+    AuraCard(family: .calm, radius: 36, padding: 22) {
+      Text(controller.engineState == "probable_awake" ? "Éveil probable" : "C'est l'heure")
+        .font(Forme.sans(24, .regular, relativeTo: .title2)).tracking(-0.24)
+      Text(controller.engineState == "probable_awake"
+           ? "L'alarme de \(FF.clock(controller.deadline)) reste programmée tant que tu n'as pas confirmé."
+           : "Vibration en cours · \(ramp.percent) %. Un double tap sur le bracelet confirme aussi.")
+        .font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426))
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.top, 6)
+      Button { controller.acknowledgeAwake() } label: {
+        Text("Je suis réveillé").font(Forme.sans(19, .bold, relativeTo: .title3)).foregroundStyle(.white)
+          .frame(maxWidth: .infinity, minHeight: 60).background(Forme.onBright, in: Capsule())
+      }
+      .buttonStyle(FormePressStyle())
+      .accessibilityHint("Arrête la vibration et l'alarme de l'heure limite")
+      .padding(.top, 18)
+    }
+  }
+
+  // MARK: settings (before arming)
+
+  private var settings: some View {
+    Group {
+      SectionTitle(title: "Réglages", subtitle: "Modifiables tant que le réveil n'est pas programmé")
+      FrostCard(radius: 36, padding: 20, spacing: 16) {
+        FormeSegments(options: SmartWakeController.Mode.allCases.map { ($0.title, $0) }, selection: $controller.mode)
+        if controller.mode == .flexible {
+          VStack(alignment: .leading, spacing: 10) {
+            Text("Anticipation maximale").font(Forme.sans(13, .semibold, relativeTo: .footnote)).foregroundStyle(Forme.ink2)
+            FormeSegments(options: SmartWakeController.advanceChoices.map { ("\($0) min", $0) }, selection: $controller.maxAdvanceMin)
           }
-          .pickerStyle(.menu).tint(.white)
-          .disabled(controller.session != nil)
+          Text("Le sommeil total passe d'abord. Si un réveil plus tôt n'apporte pas de bénéfice clair — nuit courte, dette de sommeil, données insuffisantes — tu es réveillé à l'heure choisie.")
+            .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+        } else {
+          Text("Réveil à l'heure choisie, sans chercher de moment plus favorable.")
+            .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
         }
-        .foregroundStyle(.white.opacity(0.85))
       }
-      HStack(spacing: 8) {
-        Image(systemName: controller.mode == .fixed ? "alarm" : "wand.and.stars")
-        Text(windowText).font(.footnote)
-      }
-      .foregroundStyle(.white.opacity(0.85))
-      .padding(.horizontal, 12).padding(.vertical, 8)
-      .background(.white.opacity(0.12), in: Capsule())
-      if controller.mode == .flexible {
-        Text("Le sommeil total passe d'abord : si un réveil anticipé n'apporte pas de bénéfice clair (nuit courte, dette, données insuffisantes), le réveil reste à l'heure limite.")
-          .font(.caption2).foregroundStyle(.white.opacity(0.65)).multilineTextAlignment(.center)
-      }
-      Text(controller.status).font(.caption).foregroundStyle(.white.opacity(0.7)).multilineTextAlignment(.center)
+      .padding(.top, 12)
     }
-    .padding(20)
-    .frame(maxWidth: .infinity)
-    .background(
-      LinearGradient(colors: [Color(red: 0.10, green: 0.10, blue: 0.30), Color(red: 0.22, green: 0.12, blue: 0.42), Color(red: 0.05, green: 0.25, blue: 0.40)], startPoint: .topLeading, endPoint: .bottomTrailing),
-      in: RoundedRectangle(cornerRadius: 28, style: .continuous)
-    )
-    .shadow(color: .black.opacity(0.25), radius: 16, y: 8)
-    .animation(.snappy, value: showPicker)
   }
 
-  private var windowText: String {
-    let end = controller.deadline.formatted(date: .omitted, time: .shortened)
-    let adv = controller.session.map { $0.maxAdvanceMin ?? 30 } ?? controller.effectiveMaxAdvance
-    if adv == 0 { return "Réveil à \(end) précises, sans anticipation" }
-    let earliest = controller.deadline.addingTimeInterval(-TimeInterval(adv * 60)).formatted(date: .omitted, time: .shortened)
-    if controller.session != nil, controller.anticipationAllowed == false, let r = controller.decisionReason {
-      return "Réveil à \(end) : \(r)"
+  // MARK: tonight (armed)
+
+  private var tonightStatus: some View {
+    Group {
+      SectionTitle(title: "Cette nuit", subtitle: "Ce qui est réellement programmé")
+      FrostCard(radius: 36, padding: 20, spacing: 0) {
+        FormeRow(label: "Alarme du bracelet", sub: "Sonne même si le téléphone est éteint", value: controller.deadlineConfirmed ? "Confirmée" : "Envoi en cours", tone: controller.deadlineConfirmed ? Forme.posInk : Forme.ink2)
+        FormeDivider()
+        FormeRow(label: "Secours iPhone", sub: backupSub, value: backupValue, tone: backupValue == "Programmé" ? Forme.posInk : Forme.ink2)
+        FormeDivider()
+        FormeRow(label: "Suivi du sommeil", sub: controller.liveStreamOK ? "Fréquence cardiaque en direct" : "Direct activé 5 min avant la fenêtre", value: controller.liveStreamOK ? "Actif" : "Historique", tone: controller.liveStreamOK ? Forme.posInk : Forme.ink2)
+        if let r = controller.decisionReason, r != "avant la fenêtre" {
+          FormeDivider()
+          FormeRow(label: "Décision", sub: controller.deadlineHeld ? "Heure limite conservée" : nil, value: String(r.prefix(1)).uppercased() + String(r.dropFirst()))
+        }
+      }
+      .padding(.top, 12)
     }
-    if let ws = controller.displayWindowStart {
-      return "Réveil possible entre \(ws.formatted(date: .omitted, time: .shortened)) et \(end)"
-    }
-    return "Réveil possible entre \(earliest) et \(end), si ton besoin de sommeil est couvert"
   }
 
-  // MARK: live
+  private var backupValue: String {
+    let s = controller.backupStatus
+    if s.hasPrefix("Secours iPhone programmé") { return "Programmé" }
+    if s.contains("non autorisé") { return "Non autorisé" }
+    if s.contains("non programmé") { return "Échec" }
+    return s.isEmpty ? "—" : "En cours"
+  }
 
-  private var liveCard: some View {
-    card(title: "Cette nuit", icon: "waveform.path.ecg") {
-      // states that can be checked, spelled out (never colour alone)
-      VStack(alignment: .leading, spacing: 6) {
-        Label(controller.deadlineConfirmed ? "Alarme confirmée sur le bracelet" : "Alarme du bracelet : envoi en cours", systemImage: controller.deadlineConfirmed ? "checkmark.seal.fill" : "hourglass")
-          .foregroundStyle(controller.deadlineConfirmed ? .green : .orange)
-        if !controller.backupStatus.isEmpty {
-          Label(controller.backupStatus, systemImage: "iphone.radiowaves.left.and.right")
-            .foregroundStyle(.secondary)
+  private var backupSub: String {
+    backupValue == "Non autorisé" ? "Active les notifications de l'app" : "Notification 1 min après l'heure limite"
+  }
+
+  // MARK: tonight's plan
+
+  private func num(_ key: String) -> Double? {
+    let v = controller.plan[key]
+    return (v as? Double) ?? (v as? Int).map(Double.init)
+  }
+
+  @ViewBuilder private var planCard: some View {
+    SectionTitle(title: "Ce soir", subtitle: "Pour dormir ce dont tu as besoin")
+    FrostCard(radius: 36, padding: 20, spacing: 14) {
+      if let rec = num("recommended_sleep_min"), let bed = num("bedtime") {
+        HStack(alignment: .top, spacing: 8) {
+          MiniStat(label: "Décrocher", value: FF.clock(num("lights_out_advice")))
+          MiniStat(label: "Au lit à", value: FF.clock(bed))
+          MiniStat(label: "Sommeil", value: FF.dur(rec))
         }
-        Label(controller.liveStreamOK ? "Suivi physiologique actif" : "Suivi physiologique inactif (activé 5 min avant la fenêtre)", systemImage: controller.liveStreamOK ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
-          .foregroundStyle(controller.liveStreamOK ? .green : .secondary)
-        Label(controller.imuStreamOK ? "Mouvement en direct actif" : "Mouvement en direct inactif (activé 5 min avant la fenêtre)", systemImage: controller.imuStreamOK ? "figure.walk.motion" : "moon.zzz")
-          .foregroundStyle(controller.imuStreamOK ? .green : .secondary)
-      }
-      .font(.caption)
-      if let reason = controller.decisionReason {
-        Label("Décision : \(reason)", systemImage: "info.circle").font(.subheadline)
-      }
-      if controller.posterior.count == 4 {
-        HStack(alignment: .bottom, spacing: 12) {
-          stateBar("Éveil", controller.posterior[0], .orange)
-          stateBar("Léger", controller.posterior[1], .cyan)
-          stateBar("Profond", controller.posterior[2], .indigo)
-          stateBar("Paradoxal", controller.posterior[3], .purple)
+        if let lat = num("latency_min") {
+          Text("Tu mets en général \(Int(lat)) min à t'endormir : te coucher à \(FF.clock(bed)) couvre ton besoin avant \(FF.clock(controller.deadline)).")
+            .font(Forme.sans(13, .medium, relativeTo: .footnote)).foregroundStyle(Forme.ink2)
+            .fixedSize(horizontal: false, vertical: true)
         }
-        Text("Stades estimés à partir de la FC, de la VFC et du mouvement.").font(.caption2).foregroundStyle(.secondary)
+        if let c = controller.plan["components"] as? [String: Any] {
+          planRows(planParts(c))
+        }
+        if let note = controller.plan["circadian_note"] as? String {
+          Text(note).font(Forme.sans(12, .semibold, relativeTo: .caption)).foregroundStyle(Forme.strainInk)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        if let line = bedNowLine {
+          Text(line).font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
+        }
       } else {
-        Text("En attente des premières données du bracelet…").font(.subheadline).foregroundStyle(.secondary)
+        Text("Calcul du plan…").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.ink2)
       }
-      if controller.engineState == "stimulating" || controller.engineState == "probable_awake" || ramp.isPlaying {
-        VStack(alignment: .leading, spacing: 10) {
-          if controller.engineState == "probable_awake" {
-            Text("Éveil probable. L'alarme de \(controller.deadline.formatted(date: .omitted, time: .shortened)) reste programmée tant que tu n'as pas confirmé.")
-              .font(.footnote)
-          } else {
-            Label("Vibration \(ramp.percent) %", systemImage: "waveform").font(.subheadline.monospacedDigit())
-          }
-          Button { controller.acknowledgeAwake() } label: {
-            Text("Je suis réveillé").font(.title3.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 52)
-          }
-          .buttonStyle(.borderedProminent).tint(.cyan)
-          .accessibilityHint("Arrête la vibration et l'alarme de l'heure limite")
-        }
+    }
+    .padding(.top, 12)
+  }
+
+  private func planParts(_ c: [String: Any]) -> [(String, Double)] {
+    let keys: [(String, String)] = [("Base personnelle", "base_min"), ("Activité récente", "activity_min"), ("Dette de sommeil", "debt_min"), ("Rattrapage du profond", "deep_min")]
+    var out: [(String, Double)] = []
+    for (i, k) in keys.enumerated() {
+      let v = (c[k.1] as? Double) ?? (c[k.1] as? Int).map(Double.init) ?? 0
+      if i == 0 || v >= 1 { out.append((k.0, v)) }
+    }
+    return out
+  }
+
+  private func planRows(_ parts: [(String, Double)]) -> some View {
+    VStack(spacing: 0) {
+      ForEach(Array(parts.enumerated()), id: \.offset) { i, p in
+        if i > 0 { FormeDivider() }
+        FormeRow(label: p.0, value: i == 0 ? FF.dur(p.1) : "+\(FF.dur(p.1))")
       }
     }
   }
 
-  // MARK: tonight
-
-  private var tonightCard: some View {
-    card(title: "Ce soir", icon: "bed.double") {
-      if let rec = plan("recommended_sleep_min") as? Double, let bed = plan("bedtime") as? Int {
-        HStack(alignment: .top) {
-          metric("Au lit à", clock(bed), "conseillé", .indigo)
-          Spacer()
-          metric("Sommeil", duration(rec), "recommandé", .cyan)
-          Spacer()
-          if let w = plan("expected_wake") as? [String: Any], let m = w["most_likely"] as? Int {
-            metric("Réveil", clock(m), "prévu", .orange)
-          }
-        }
-        if let lo = plan("lights_out_advice") as? Int, let lat = plan("latency_min") as? Double {
-          Text("Commence à décrocher vers \(clock(lo)) : tu mets en général \(Int(lat)) min à t'endormir.")
-            .font(.footnote).foregroundStyle(.secondary)
-        }
-        if let c = plan("components") as? [String: Any] {
-          ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) { chips(c) }
-            VStack(alignment: .leading, spacing: 8) { chips(c) }
-          }
-        }
-        if let note = plan("circadian_note") as? String {
-          Label(note, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange)
-        }
-        if let now = plan("if_bed_now") as? [String: Any], let possible = now["sleep_possible_min"] as? Double, let deficit = now["deficit_min"] as? Double {
-          Divider()
-          HStack {
-            Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary)
-            Text(deficit > 0 ? "Couché maintenant : \(duration(possible)) possibles, \(duration(deficit)) de moins que conseillé." : "Couché maintenant : \(duration(possible)) possibles, ton besoin est couvert.")
-              .font(.footnote)
-          }
-        }
-      } else {
-        Text("Calcul du plan…").foregroundStyle(.secondary)
-      }
-    }
+  private var bedNowLine: String? {
+    guard let now = controller.plan["if_bed_now"] as? [String: Any] else { return nil }
+    let n: (String) -> Double? = { k in (now[k] as? Double) ?? (now[k] as? Int).map(Double.init) }
+    guard let possible = n("sleep_possible_min") else { return nil }
+    let deficit = n("deficit_min") ?? 0
+    // only meaningful in the evening, not in the middle of the day
+    if deficit <= 0, let rec = num("recommended_sleep_min"), possible > rec + 120 { return nil }
+    return deficit > 0 ? "Couché maintenant : \(FF.dur(possible)) possibles, \(FF.dur(deficit)) de moins que conseillé." : "Couché maintenant : \(FF.dur(possible)) possibles, ton besoin est couvert."
   }
 
-  @ViewBuilder
-  private func chips(_ c: [String: Any]) -> some View {
-    chip("Base", c["base_min"] as? Double, absolute: true, .gray)
-    chip("Activité", c["activity_min"] as? Double, absolute: false, .green)
-    chip("Dette", c["debt_min"] as? Double, absolute: false, .red)
-    chip("Profond", c["deep_min"] as? Double, absolute: false, .indigo)
-  }
-
-  // MARK: nights
-
-  private struct NightBar: Identifiable {
-    let id: Int
-    let label: String
-    let kind: String
-    let hours: Double
-  }
-
-  private var nightOpticalCard: some View {
-    card(title: "Test optique de nuit", icon: "light.max") {
-      Toggle(isOn: $controller.nightOpticalTest) {
-        Text("Enregistrer l'optique brute 30 min, environ 2 h après l'endormissement").font(.subheadline)
-      }
-      Text("Cherche la LED rouge / infrarouge utilisée pour la SpO₂. Fonctionne si le réveil intelligent est armé. Aucune vibration.")
-        .font(.caption).foregroundStyle(.secondary)
-      if !controller.nightOpticalStatus.isEmpty {
-        Text(controller.nightOpticalStatus).font(.caption)
-      }
-    }
-  }
-
-  private var nightsCard: some View {
-    card(title: "Dernières nuits", icon: "chart.bar") {
-      let nights = (plan("recent_nights") as? [[String: Any]] ?? []).reversed()
-      let bars: [NightBar] = nights.enumerated().flatMap { i, n -> [NightBar] in
-        let label = (n["wake_time"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)).formatted(.dateTime.weekday(.abbreviated)) } ?? "\(i)"
-        let asleep = (n["asleep_min"] as? Double ?? 0) / 60
-        let deep = (n["deep_min"] as? Double ?? 0) / 60
-        return [NightBar(id: i * 2, label: label, kind: "Profond", hours: deep), NightBar(id: i * 2 + 1, label: label, kind: "Autre sommeil", hours: max(0, asleep - deep))]
-      }
-      if bars.isEmpty {
-        Text("Pas encore de nuit analysée.").foregroundStyle(.secondary)
-      } else {
-        Chart(bars) { b in
-          BarMark(x: .value("Nuit", b.label), y: .value("Heures", b.hours))
-            .foregroundStyle(by: .value("Type", b.kind))
-            .cornerRadius(4)
-        }
-        .chartForegroundStyleScale(["Profond": Color.indigo, "Autre sommeil": Color.cyan.opacity(0.5)])
-        .chartYAxisLabel("h")
-        .frame(height: 150)
-        if let rec = plan("recommended_sleep_min") as? Double {
-          Text("Objectif ce soir : \(duration(rec)).").font(.caption).foregroundStyle(.secondary)
-        }
-      }
-    }
-  }
-
-  // MARK: vibration / feedback
-
-  private var vibrationCard: some View {
-    card(title: "Vibration", icon: "waveform") {
-      Text("Modulation continue, démarrage à peine perceptible puis rampe linéaire jusqu'à 100 % en 40 s. Sans réaction, la rampe reprend plus haut, puis plus vite. Si tu te lèves ou marches, elle se met en pause ; elle s'arrête complètement avec « Je suis réveillé » ou un double tap. Tant que le réveil n'est pas confirmé, l'alarme de l'heure limite reste programmée.")
-        .font(.footnote).foregroundStyle(.secondary)
-      if controller.testsBlocked {
-        Text("Tests indisponibles pendant un réveil programmé : ils effaceraient l'alarme de l'heure limite.")
-          .font(.caption).foregroundStyle(.secondary)
-      }
-      HStack {
-        Button(ramp.isPlaying && !controller.testsBlocked ? "Arrêter" : "Tester la rampe") { ramp.isPlaying ? ramp.stop() : controller.testVibration() }
-          .buttonStyle(.borderedProminent).tint(ramp.isPlaying ? .red : .indigo)
-          .disabled(controller.testsBlocked)
-        if ramp.isPlaying && !controller.testsBlocked {
-          ProgressView(value: Double(ramp.percent), total: 100).tint(.indigo)
-          Text("\(ramp.percent) %").font(.caption.monospacedDigit())
-        }
-      }
-      Button("Calibrer (silencieux, ~30 s)") { ramp.probe() }
-        .font(.footnote)
-        .disabled(controller.testsBlocked)
-      if !ramp.probeStatus.isEmpty {
-        Text(ramp.probeStatus).font(.caption2).foregroundStyle(.secondary)
-        ForEach(Array(ramp.probeResults.enumerated()), id: \.offset) { _, r in
-          Text("\(r.name) → \(r.response)").font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
-        }
-      }
-      Text("Réponse du bracelet : \(ble.lastAlarmResponseSummary)").font(.caption2).foregroundStyle(.secondary)
-    }
-  }
+  // MARK: feedback
 
   private var feedbackCard: some View {
-    card(title: "Ton réveil", icon: "sun.horizon") {
-      Text("Comment t'es-tu senti au réveil ?").font(.subheadline)
-      HStack(spacing: 10) {
+    FrostCard(radius: 36, padding: 20, spacing: 14) {
+      Text("Comment t'es-tu senti au réveil ?").font(Forme.sans(17, .semibold, relativeTo: .headline)).foregroundStyle(Forme.ink)
+      HStack(spacing: 8) {
         ForEach(1...5, id: \.self) { r in
           Button { controller.submitFeedback(rating: r) } label: {
-            Text(["😵", "😪", "😐", "🙂", "😃"][r - 1]).font(.title2).frame(maxWidth: .infinity, minHeight: 44)
+            Text("\(r)").font(Forme.sans(17, .bold, relativeTo: .headline)).foregroundStyle(Forme.ink)
+              .frame(maxWidth: .infinity, minHeight: 48).background(Forme.inset, in: Capsule())
           }
-          .buttonStyle(.bordered)
+          .buttonStyle(FormePressStyle())
+          .accessibilityLabel("Note \(r) sur 5")
         }
       }
-      Text("Tes notes affinent le choix du moment après 8 matins.").font(.caption2).foregroundStyle(.secondary)
-    }
-  }
-
-  // MARK: building blocks
-
-  private func plan(_ key: String) -> Any? { controller.plan[key] }
-
-  private func card<C: View>(title: String, icon: String, @ViewBuilder content: () -> C) -> some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Label(title, systemImage: icon).font(.headline)
-      content()
-    }
-    .padding(16)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-  }
-
-  private func metric(_ title: String, _ value: String, _ caption: String, _ color: Color) -> some View {
-    VStack(alignment: .leading, spacing: 2) {
-      Text(title).font(.caption).foregroundStyle(.secondary)
-      Text(value).font(.system(.title, design: .rounded).weight(.semibold)).foregroundStyle(color).minimumScaleFactor(0.6).lineLimit(1)
-      Text(caption).font(.caption2).foregroundStyle(.secondary)
-    }
-  }
-
-  private func chip(_ label: String, _ minutes: Double?, absolute: Bool, _ color: Color) -> some View {
-    let m = Int(minutes ?? 0)
-    return Text(absolute ? "\(label) \(duration(Double(m)))" : "\(label) +\(m) min")
-      .font(.caption.weight(.medium))
-      .padding(.horizontal, 10).padding(.vertical, 6)
-      .background(color.opacity(0.15), in: Capsule())
-      .foregroundStyle(color == .gray ? .primary : color)
-  }
-
-  private func stateBar(_ label: String, _ v: Double, _ color: Color) -> some View {
-    VStack(spacing: 4) {
-      GeometryReader { geo in
-        ZStack(alignment: .bottom) {
-          RoundedRectangle(cornerRadius: 6).fill(color.opacity(0.15))
-          RoundedRectangle(cornerRadius: 6).fill(color.gradient).frame(height: max(4, geo.size.height * v))
-        }
+      HStack {
+        Text("Groggy")
+        Spacer()
+        Text("En forme")
       }
-      .frame(height: 64)
-      .animation(.smooth, value: v)
-      Text(label).font(.caption2)
-      Text("\(Int(v * 100)) %").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+      .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
     }
-    .frame(maxWidth: .infinity)
   }
 
-  private func clock(_ ts: Int) -> String {
-    Date(timeIntervalSince1970: TimeInterval(ts)).formatted(date: .omitted, time: .shortened)
-  }
+  // MARK: technical details
 
-  private func duration(_ minutes: Double) -> String {
-    let m = Int(minutes.rounded())
-    return m >= 60 ? "\(m / 60) h \(String(format: "%02d", m % 60))" : "\(m) min"
+  private var techRows: [(String, String, String)] {
+    let p = controller.posterior
+    let pct: (Int) -> String = { i in p.count == 4 ? "\(Int((p[i] * 100).rounded())) %" : "—" }
+    return [
+      ("Éveil", "Probabilité estimée sur les 30 dernières secondes", pct(0)),
+      ("Sommeil léger", "", pct(1)),
+      ("Sommeil profond", "", pct(2)),
+      ("Sommeil paradoxal", "", pct(3)),
+      ("Ouverture de la fenêtre", "Endormissement estimé + sommeil recommandé", controller.displayWindowStart.map { FF.clock($0) } ?? "Heure limite"),
+      ("Anticipation maximale", "", adv == 0 ? "Aucune" : "\(adv) min"),
+      ("Mouvement en direct", "Accéléromètre, activé 5 min avant la fenêtre", controller.imuStreamOK ? "Actif" : "Inactif"),
+      ("Réponse du bracelet", "Dernière commande d'alarme", ble.lastAlarmResponseSummary.isEmpty ? "—" : ble.lastAlarmResponseSummary),
+    ]
   }
 }
 
-struct MotionProbeCard: View {
-  @ObservedObject var probe: MotionProbe
-  let keepLiveHR: Bool
-
+/// Segmented choice on glass, same look as the period picker.
+struct FormeSegments<T: Hashable>: View {
+  let options: [(String, T)]
+  @Binding var selection: T
   var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      Label("Capteurs : tests silencieux", systemImage: "figure.walk.motion").font(.headline)
-      Text("Mesure le retard du mouvement : synchro haute fréquence à 30, 60, 120 et 180 s, puis mode IMU temps réel. Sans vibration, environ 4 min, bracelet porté.")
-        .font(.footnote).foregroundStyle(.secondary)
-      HStack {
-        Button("Test mouvement") { probe.run(keepLiveHR: keepLiveHR) }.buttonStyle(.bordered)
-        Button("Test optique (~3 min)") { probe.runOptical() }.buttonStyle(.bordered)
+    HStack(spacing: 0) {
+      ForEach(Array(options.enumerated()), id: \.offset) { _, o in
+        Button { withAnimation(.snappy(duration: 0.25)) { selection = o.1 } } label: {
+          Text(o.0).font(Forme.sans(13, .bold, relativeTo: .footnote)).foregroundStyle(Forme.ink)
+            .lineLimit(1).minimumScaleFactor(0.8)
+            .frame(maxWidth: .infinity, minHeight: 40)
+            .background(selection == o.1 ? Forme.selection : .clear, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selection == o.1 ? .isSelected : [])
       }
-      if !probe.status.isEmpty { Text(probe.status).font(.caption) }
-      ForEach(probe.lines, id: \.self) { Text($0).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary) }
     }
-    .padding(16)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    .padding(4)
+    .glass(Capsule())
   }
 }
