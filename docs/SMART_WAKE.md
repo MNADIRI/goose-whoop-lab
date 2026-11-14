@@ -2,7 +2,8 @@
 
 Code :
 - moteur : `Rust/core/src/smart_wake.rs` (méthodes du pont `smart_wake.update`, `smart_wake.replay`, `smart_wake.feedback`) ;
-- app : `GooseSwift/SmartWake.swift` (contrôleur et carte « Réveil intelligent » de l'écran Aujourd'hui).
+- app : `GooseSwift/SmartWake.swift` (contrôleur et écran Alarme : modes « Heure fixe » / « Fenêtre flexible », anticipation
+  maximale, raison courte de la décision, état de l'alarme bracelet et du secours iPhone).
 
 ## 1. Ce qui est réellement disponible en direct (vérifié sur ce bracelet, firmware 50.38.1)
 
@@ -48,21 +49,52 @@ Transitions :
 - elles dépendent aussi de l'**heure de réveil habituelle** (médiane des nuits passées) : la probabilité de s'éveiller monte
   dans la demi-heure autour de cette heure.
 
-## 3. Décision : arrêt optimal prédictif
+## 3. Décision : la durée de sommeil d'abord
 
-1. **Coût d'un réveil immédiat** : la somme des probabilités d'état pondérées par l'inertie du réveil (profond 1,0,
-   paradoxal 0,45, léger 0,15, éveil 0), d'après Tassi & Muzet 2000 et Trotti 2017. On y ajoute une pénalité α par minute de
-   sommeil perdue avant l'heure limite. α augmente avec la dette de sommeil des 7 dernières nuits et si la nuit est encore
-   loin du besoin habituel.
-2. **Valeur de l'attente** : 256 trajectoires simulées avec le modèle de transition jusqu'à l'heure limite. Chaque trajectoire
-   suit une règle réalisable : se réveiller au premier moment favorable détecté (détection à 50 % par tranche, 3 % de
-   déclenchements à tort), sinon à l'heure limite.
-3. **Réveil** si le coût immédiat est au plus égal à la valeur de l'attente. Il y a aussi réveil si la personne est déjà
-   éveillée (P(éveil) ≥ 0,75 sur deux tranches) ou si l'heure limite est atteinte.
-4. **Aucun réveil sur des données périmées** (FC de plus de 2 min), sauf à l'heure limite.
+Politique `duration-first.v1` (`POLICY_VERSION` dans le moteur). Tous les seuils ci-dessous sont des **choix
+heuristiques**, documentés et versionnés ; aucun n'est validé sur des utilisateurs Goose, et le classificateur de stades
+n'a pas de validation par polysomnographie. Ils ne prouvent pas qu'un réveil anticipé apporte un bénéfice.
 
-L'app affiche aussi la probabilité d'un moment favorable dans les 10 prochaines minutes, marquée comme **prédite**. Les
-probabilités d'état sont marquées **estimées**, et les mesures **mesurées**.
+**Modes.** « Heure fixe » : réveil à l'heure choisie, sans anticipation (`max_advance_min = 0`). « Fenêtre flexible » :
+anticipation au plus égale à l'**anticipation maximale choisie** (10, 20, 30, 45 ou 60 min, 30 par défaut). Il n'y a plus
+d'ouverture obligatoire : la fenêtre ne s'ouvre jamais avant l'endormissement estimé + le sommeil recommandé ce soir, ni
+avant l'heure limite − anticipation maximale. Si le besoin n'est pas couvert, elle ne s'ouvre pas du tout.
+
+**Abstention (heure limite conservée)** dès qu'une de ces conditions est vraie (`hold_reasons`) :
+
+| Code | Raison affichée | Condition |
+|---|---|---|
+| `fixed_time` | heure fixe | anticipation maximale = 0 |
+| `onset_unknown` | endormissement non détecté | aucun endormissement observé (sur des époques mesurées) |
+| `short_night` | nuit courte | sommeil mesuré depuis l'endormissement < sommeil recommandé ce soir |
+| `sleep_debt` | dette de sommeil élevée | dette sur 7 nuits complètes ≥ 3 h (`DEBT_HOLD_H`) |
+| `low_coverage` | données insuffisantes | couverture de la nuit < 90 %, ou analyse de la nuit en cours déjà marquée `INCOMPLETE_LOWER_BOUND` |
+| `data_gap` | données insuffisantes | couverture < 80 % entre 30 min avant l'ouverture possible et maintenant (époques « U » près de la fenêtre) |
+
+Une époque sans mesure (équivalent live du code « U ») n'est **jamais** comptée comme sommeil, ni comme éveil. Les
+5 dernières minutes sont exclues du calcul de couverture parce que R18 n'arrive qu'à la synchronisation suivante.
+
+**Arbitrage dans la fenêtre** (si aucune abstention) :
+1. **Coût d'un réveil immédiat** : somme des probabilités d'état pondérées par un coût d'inertie supposé (profond 1,0,
+   paradoxal 0,45, léger 0,15, éveil 0) + une pénalité α par minute de sommeil perdue avant l'heure limite, plus forte
+   avec la dette et tant que le besoin n'est pas couvert. Ces poids ne sont pas une conversion validée.
+2. **Valeur de l'attente** : coût attendu d'une règle réalisable (se réveiller au premier moment favorable détecté — 50 %
+   par tranche en éveil/léger, 3 % de faux déclenchements en profond/paradoxal — sinon à l'heure limite), **calculé de façon
+   déterministe** en propageant la masse de probabilité non encore « arrêtée » dans le modèle de transition. L'ancien
+   tirage Monte-Carlo (256 trajectoires) faisait varier la décision d'un appel à l'autre sur les mêmes données.
+3. **Marge minimale** : réveil seulement si coût immédiat + 0,003 (`MIN_BENEFIT`) ≤ valeur de l'attente.
+4. **Persistance** : la décision de réveil et un état favorable (P(léger) + P(éveil) ≥ 0,6) doivent tenir sur les
+   **2 dernières tranches** (1 min), toutes deux mesurées. Un seul epoch léger ne suffit pas.
+5. **Données fraîches** obligatoires (FC de moins de 2 min), sauf à l'heure limite.
+
+**Journal.** Chaque appel (toutes les 30 s) écrit dans `smart_wake_log` la décision complète, **attentes comprises** :
+`policy.outcome` (`wait`, `fire`, `stimulating`, `probable_awake`), `policy.reason` (code + libellé), raisons
+d'abstention, persistance, couverture. L'app journalise en plus chaque changement de raison.
+
+**Probabilité exposée.** `p_reach_light_or_wake_10min` est une **probabilité d'atteinte** : la probabilité de passer au
+moins une fois par le sommeil léger ou l'éveil dans les 10 min, sous le modèle de transition (premier passage). L'ancienne
+sortie `p_light_or_wake_next_10min` prenait le maximum des probabilités marginales, ce qui n'est pas la probabilité d'au
+moins une occasion favorable ; elle est supprimée. Cette valeur reste dans le journal et n'est plus affichée.
 
 ## 4. Vibration, progression et sécurité
 
@@ -97,20 +129,39 @@ acceptée. C'est pourquoi la première rampe, en boucle continue avec des palier
 
 Filet de sécurité supplémentaire : une notification iOS avec son à l'heure limite + 1 min.
 
-**Arrêt.** Le réveil est considéré comme acquis, et la vibration s'arrête sans relance, dans ces cas :
-- le bracelet passe à l'état « levé » (UP, réveil soutenu, levé orthostatique) dans la fenêtre ; s'il était déjà levé avant
-  l'alarme, aucune vibration n'est envoyée ;
-- un double tap ;
-- le bouton « Je suis réveillé » ;
-- une hausse de FC soutenue d'au moins 12 bpm sur 60 s (au moins 40 échantillons) par rapport aux 5 min avant la vibration ;
-- P(éveil) ≥ 0,8 sur deux tranches.
+**Réaction, éveil probable, arrêt confirmé.** Trois niveaux de preuve, jamais confondus :
+
+| État | Indices | Effet |
+|---|---|---|
+| Réaction (`evidence.reaction`) | un seul indice : hausse de FC ≥ 12 bpm sur 60 s, **ou** P(éveil) ≥ 0,8 sur deux tranches mesurées | journalisée ; la progression continue, l'alarme de l'heure limite reste |
+| Éveil probable (`probable_awake`) | état « levé » (UP), marche/mouvement soutenu en IMU direct (70 s après la vibration), ou FC **et** état d'éveil concordants ; levé ou marche avant l'alarme dans la fenêtre | rampe en pause ; **l'alarme du bracelet à l'heure limite reste programmée** ; rendormissement (P(éveil) < 0,3 sur 4 tranches mesurées, sans mouvement, après 5 min) → nouvelle stimulation |
+| Arrêt confirmé (`awake`) | bouton « Je suis réveillé » ou double tap | tout s'arrête, y compris l'alarme de l'heure limite |
+
+- L'arrêt explicite fonctionne sans capteur et sans attendre le moteur : l'app désarme tout de suite et informe le
+  moteur ensuite.
+- Sans confirmation 30 min après l'heure limite, la session se termine (`timeout`).
+- **Un silence BLE n'est jamais un éveil** : une époque sans mesure ne compte pour aucun indice, et le test
+  `silence_after_the_vibration_is_never_read_as_awake` le vérifie (la progression continue).
 
 Pendant la phase de réveil, l'historique est synchronisé toutes les 45 s, entre deux rampes, pour voir passer l'état
 « levé » rapidement.
 
-**Fenêtre automatique.** Tu ne règles que l'heure limite. La fenêtre s'ouvre à l'endormissement estimé + le sommeil
-recommandé pour ce soir, en restant entre 45 et 10 min avant l'heure limite (30 min tant que l'endormissement n'est pas
-détecté).
+**Fenêtre.** Tu choisis l'heure limite et le mode. En fenêtre flexible, elle s'ouvre à l'endormissement estimé + le
+sommeil recommandé pour ce soir, jamais plus tôt que l'heure limite − anticipation maximale, et seulement si aucune
+condition d'abstention n'est vraie. Pas d'ouverture forcée avant l'heure limite.
+
+**Indépendance de l'heure limite.** L'alarme de l'heure limite ne dépend pas de l'app en arrière-plan :
+- l'alarme du bracelet (id 1) est envoyée à l'armement et renvoyée jusqu'à la réponse `SUCCESS`, seulement tant que
+  l'heure limite est à venir (une heure passée serait programmée pour le lendemain) ;
+- si un `DISABLE_ALARM` part pendant une session (arrêt de rampe, calibration), l'alarme limite est marquée à renvoyer ;
+  les tests de vibration et la calibration sont bloqués pendant une session armée ;
+- un palier de rampe envoyé en retard est abandonné au lieu d'être reporté au lendemain ;
+- la notification iOS de secours est programmée à l'armement (heure limite + 1 min) ; l'app affiche si elle est
+  programmée ou non autorisée. Elle reste une notification ordinaire, non garantie en mode silencieux.
+
+**Limites connues, non traitées ici** : confirmation de l'alarme limite déduite du dernier résumé de réponse
+(`lastAlarmResponseSummary`) et non d'une réponse corrélée à la commande ; annulation uniquement globale
+(`DISABLE_ALARM`) ; pas d'AlarmKit.
 
 **Planificateur du coucher** (`smart_wake.plan`). Sommeil recommandé = somme de :
 - la base personnelle : 75e centile des 14 dernières nuits, 8 h par défaut ;
@@ -189,11 +240,19 @@ avec des appels cadencés comme dans l'app.
 
 | Scénario | Résultat attendu et vérifié |
 |---|---|
-| Sommeil léger à partir de 6 h 35 | fenêtre = endormissement estimé (22 h 20 ± 2 min) + 8 h ; réveil dans la fenêtre, pas à l'heure limite ; arrêt « levé (UP) détecté » 150 s après |
+| Sommeil léger à partir de 6 h 35 (anticipation 30 min) | fenêtre = max(endormissement estimé + 8 h, limite − 30 min) ; réveil dans la fenêtre sur « sommeil léger persistant » ; « levé (UP) » 150 s après = éveil probable (alarme limite gardée) ; confirmation = arrêt |
+| Même nuit, anticipation 0 (heure fixe) | aucun réveil avant l'heure limite ; chaque attente journalisée avec la raison `fixed_time` |
+| Même nuit, analyse du soir `INCOMPLETE_LOWER_BOUND` | pas d'anticipation, raison « données insuffisantes » |
+| 20 min sans données juste avant la fenêtre | pas d'anticipation (`data_gap`) jusqu'à l'heure limite |
+| Couché à 3 h, limite 7 h | attente, raison « nuit courte » |
 | Sommeil profond jusqu'au bout | attente jusqu'à l'heure limite, puis niveau 2 à +120 s, niveau 3 à +240 s, arrêt sur confirmation |
+| Plus aucune donnée pendant la vibration | jamais « éveil probable » ni « réveillé » ; la progression continue |
 | Levé à 3 h (hors fenêtre) | la session continue |
-| Levé à 6 h 30 (dans la fenêtre) | « réveillé » sans aucune vibration |
+| Levé à 6 h 30 (dans la fenêtre) | éveil probable sans vibration, alarme limite conservée |
 | Plus de données à partir de 6 h | aucun déclenchement avant l'heure limite, données marquées périmées |
+
+Tests unitaires : probabilité d'atteinte ≥ maximum des marginales, décision déterministe, règles d'abstention, persistance
+(un seul epoch léger ne déclenche pas), `U` jamais REM, nuit incomplète sans dette.
 | Planificateur (7 nuits simulées) | base 420, profond +20, dette 0, activité > 0 ; somme = recommandation ; coucher = limite − (sommeil + délai d'endormissement) |
 
 **Sur la vraie nuit du 9 au 10 novembre** :

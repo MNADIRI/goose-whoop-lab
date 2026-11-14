@@ -74,14 +74,14 @@ struct FormeSleepView: View {
           FormeDisc(systemImage: "alarm", fg: Forme.calmInk, bg: Forme.calmBg, shadow: false)
           VStack(alignment: .leading, spacing: 1) {
             Text("Réveil intelligent").font(Forme.sans(15, .bold, relativeTo: .subheadline)).foregroundStyle(Forme.ink)
-            Text(smartWake.session != nil ? "Au plus tard \(FF.clock(smartWake.deadline))" : "Désactivé · touche pour régler")
+            Text(smartWake.session == nil ? "Désactivé · touche pour régler" : smartWake.session?.maxAdvanceMin == 0 ? "Heure fixe · \(FF.clock(smartWake.deadline))" : "Fenêtre flexible · au plus tard \(FF.clock(smartWake.deadline))")
               .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
           FormePill(text: smartWake.session != nil ? "Armé" : "Off", ink: smartWake.session != nil ? Forme.calmInk : Forme.ink2, bg: smartWake.session != nil ? Forme.calmBg : Forme.sunken)
         }
-        if let ws = smartWake.windowStart, smartWake.session != nil {
-          Text("Fenêtre \(FF.clock(ws)) – \(FF.clock(smartWake.deadline)) · \(smartWake.status)")
+        if smartWake.session != nil {
+          Text(smartWake.displayWindowStart.map { "Réveil possible entre \(FF.clock($0)) et \(FF.clock(smartWake.deadline)) · \(smartWake.status)" } ?? smartWake.status)
             .font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.ink2)
         }
         tonight

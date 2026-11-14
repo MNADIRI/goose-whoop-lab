@@ -72,6 +72,9 @@ final class HapticRampPlayer: ObservableObject {
   @Published private(set) var percent = 0
   private var work: [DispatchWorkItem] = []
   private weak var ble: GooseBLEClient?
+  /// Called whenever this player sends DISABLE_ALARM (it clears every strap alarm, the deadline
+  /// alarm included), so the owner can re-send the deadline alarm.
+  var onStrapAlarmsDisabled: (() -> Void)?
 
   func attach(ble: GooseBLEClient) { self.ble = ble }
 
@@ -94,6 +97,12 @@ final class HapticRampPlayer: ObservableObject {
       let at = start.addingTimeInterval(TimeInterval(offset))
       // send ~2 s before the step starts; the strap starts it on its own clock
       let send = DispatchWorkItem { [weak self, weak ble] in
+        // a late send must be dropped: SET_ALARM_TIME takes a clock time, and a time already
+        // passed would be scheduled for tomorrow by nextFutureAlarmDate
+        guard at.timeIntervalSinceNow > 0.5 else {
+          ble?.record(level: .warn, source: "smart_wake", title: "ramp.step_skipped", body: "step \(i) late by \(Int(-at.timeIntervalSinceNow)) s")
+          return
+        }
         ble?.setWhoopAlarm(at: at, alarmID: 2 + i % 2, pattern: Self.pattern(step))
         let show = DispatchWorkItem { self?.percent = step.percent }
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, at.timeIntervalSinceNow), execute: show)
@@ -173,6 +182,7 @@ final class HapticRampPlayer: ObservableObject {
     DispatchQueue.main.asyncAfter(deadline: .now() + Double(Self.probes.count) * 2.5 + 1) { [weak self, weak ble] in
       ble?.disableWhoopAlarms()
       guard let self else { return }
+      self.onStrapAlarmsDisabled?()
       self.probeStatus = "Calibration terminée"
       let rows = self.probeResults.map { ["probe": $0.name, "response": $0.response] }
       if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
@@ -185,7 +195,12 @@ final class HapticRampPlayer: ObservableObject {
   func stop(disableStrap: Bool = true) {
     work.forEach { $0.cancel() }
     work.removeAll()
-    if isPlaying && disableStrap { ble?.whenFreeForCommands { $0.disableWhoopAlarms() } }
+    if isPlaying && disableStrap {
+      ble?.whenFreeForCommands { [weak self] in
+        $0.disableWhoopAlarms()
+        self?.onStrapAlarmsDisabled?()
+      }
+    }
     isPlaying = false
     percent = 0
   }
@@ -583,26 +598,57 @@ struct SensorSessionCard: View {
 
 /// Smart wake-up: runs the Rust engine (`smart_wake.update`, Rust/core/src/smart_wake.rs) every 30 s
 /// on the live packet-40 HR / R-R stream, which also keeps the app running in the background
-/// (bluetooth-central). The user only sets the latest wake time; the engine opens the window when
-/// tonight's recommended sleep is covered (10-45 min before the deadline). Safety nets: strap-side
-/// alarm at the deadline (works even if the phone app dies) and an iOS notification one minute later.
+/// (bluetooth-central). The user sets the latest wake time and a mode: "Heure fixe" (no
+/// anticipation) or "Fenêtre flexible" with a maximum anticipation. Sleep duration comes first: on
+/// a short night, a high debt or poor data the engine keeps the deadline. The deadline never
+/// depends on this app running: strap-side alarm at the deadline (sent at arming, re-sent until
+/// the strap answers) and an iOS notification scheduled at arming for one minute later.
 @MainActor
 final class SmartWakeController: ObservableObject {
   struct Session: Codable {
     var id: String
     var startTs: Int
     var windowEnd: Int
+    /// nil in sessions saved before the modes existed (engine default)
+    var maxAdvanceMin: Int?
   }
 
+  enum Mode: String, CaseIterable, Identifiable {
+    case fixed, flexible
+    var id: String { rawValue }
+    var title: String { self == .fixed ? "Heure fixe" : "Fenêtre flexible" }
+  }
+
+  static let advanceChoices = [10, 20, 30, 45, 60]
+
   @Published var latest: Date
+  @Published var mode: Mode = Mode(rawValue: UserDefaults.standard.string(forKey: "smartWake.mode") ?? "") ?? .flexible {
+    didSet { UserDefaults.standard.set(mode.rawValue, forKey: "smartWake.mode") }
+  }
+  @Published var maxAdvanceMin: Int = (UserDefaults.standard.object(forKey: "smartWake.maxAdvance") as? Int) ?? 30 {
+    didSet { UserDefaults.standard.set(maxAdvanceMin, forKey: "smartWake.maxAdvance") }
+  }
   @Published private(set) var session: Session?
   @Published private(set) var status = "Inactif"
   @Published private(set) var posterior: [Double] = []
-  @Published private(set) var favourableNext10: Double?
   @Published private(set) var engineState = "idle"
   @Published private(set) var windowStart: Date?
+  /// short French reason of the current decision ("nuit courte", "données insuffisantes", …)
+  @Published private(set) var decisionReason: String?
+  @Published private(set) var anticipationAllowed: Bool?
+  @Published private(set) var backupStatus = ""
   @Published private(set) var feedbackPendingSessionID: String?
   @Published private(set) var plan: [String: Any] = [:]
+  private var lastReasonCode = ""
+
+  /// anticipation actually requested from the engine
+  var effectiveMaxAdvance: Int { mode == .fixed ? 0 : maxAdvanceMin }
+
+  /// window start worth showing (nil when it coincides with the deadline: fixed time)
+  var displayWindowStart: Date? {
+    guard let ws = windowStart, ws < deadline.addingTimeInterval(-30) else { return nil }
+    return ws
+  }
   let ramp = HapticRampPlayer()
   let motionProbe = MotionProbe()
   let sensorSession = SensorSession()
@@ -627,9 +673,24 @@ final class SmartWakeController: ObservableObject {
     session = (defaults.data(forKey: Self.sessionKey)).flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
     feedbackPendingSessionID = defaults.string(forKey: Self.feedbackKey)
     if session != nil { status = "Armé (repris)" }
+    ramp.onStrapAlarmsDisabled = { [weak self] in self?.strapAlarmsWereDisabled() }
   }
 
-  var deadline: Date { GooseBLEClient.nextFutureAlarmDate(from: latest) }
+  /// During a session: the session's own absolute deadline (never re-derived from the clock time,
+  /// which would jump to tomorrow once passed). Otherwise the next occurrence of the chosen time.
+  var deadline: Date {
+    if let s = session { return Date(timeIntervalSince1970: TimeInterval(s.windowEnd)) }
+    return GooseBLEClient.nextFutureAlarmDate(from: latest)
+  }
+
+  /// DISABLE_ALARM clears every strap alarm: while a session is armed and its deadline is still
+  /// ahead, the deadline alarm must be sent again.
+  private func strapAlarmsWereDisabled() {
+    guard session != nil else { return }
+    deadlineConfirmed = false
+    lastDeadlineAttempt = .distantPast
+    ble?.record(source: "smart_wake", title: "deadline.resend_needed", body: "strap alarms disabled during an armed session")
+  }
 
   private var heartbeat: Timer?
 
@@ -674,10 +735,13 @@ final class SmartWakeController: ObservableObject {
     defaults.set(latest, forKey: Self.latestKey)
     let end = deadline
     let now = Date()
-    let s = Session(id: "sw-\(Int(now.timeIntervalSince1970))", startTs: Int(now.timeIntervalSince1970), windowEnd: Int(end.timeIntervalSince1970))
+    let s = Session(id: "sw-\(Int(now.timeIntervalSince1970))", startTs: Int(now.timeIntervalSince1970), windowEnd: Int(end.timeIntervalSince1970), maxAdvanceMin: effectiveMaxAdvance)
     session = s
     acknowledged = false
     windowStart = nil
+    decisionReason = nil
+    anticipationAllowed = nil
+    lastReasonCode = ""
     defaults.set(try? JSONEncoder().encode(s), forKey: Self.sessionKey)
     deadlineConfirmed = false
     opticalStartedAt = nil
@@ -688,8 +752,9 @@ final class SmartWakeController: ObservableObject {
     ensureStrapSetup(now: now)
     startHeartbeat()
     scheduleBackupNotification(at: end.addingTimeInterval(60))
-    status = "Armé : réveil au plus tard à \(end.formatted(date: .omitted, time: .shortened))"
-    ble.record(source: "smart_wake", title: "armed", body: "deadline=\(s.windowEnd)")
+    let t = end.formatted(date: .omitted, time: .shortened)
+    status = effectiveMaxAdvance == 0 ? "Armé : réveil à \(t)" : "Armé : réveil au plus tard à \(t)"
+    ble.record(source: "smart_wake", title: "armed", body: "deadline=\(s.windowEnd) max_advance_min=\(effectiveMaxAdvance)")
   }
 
   func disarm(reason: String = "désactivé") {
@@ -699,6 +764,9 @@ final class SmartWakeController: ObservableObject {
     onsetDate = nil
     session = nil
     windowStart = nil
+    decisionReason = nil
+    anticipationAllowed = nil
+    backupStatus = ""
     heartbeat?.invalidate()
     heartbeat = nil
     defaults.removeObject(forKey: Self.sessionKey)
@@ -717,13 +785,27 @@ final class SmartWakeController: ObservableObject {
     engineState = "idle"
   }
 
+  /// Explicit confirmation: works without any sensor and without waiting for the engine. The
+  /// engine is told afterwards so the session is closed in its own journal.
   func acknowledgeAwake() {
+    guard let s = session else { ramp.stop(); return }
     acknowledged = true
-    ramp.stop()
-    forceUpdate()
+    let args = engineArgs(s, live: [], imu: [], acknowledged: true)
+    queue.async { _ = try? GooseRustBridge().request(method: "smart_wake.update", args: args) }
+    ble?.record(source: "smart_wake", title: "awake.confirmed", body: s.id)
+    ramp.stop(disableStrap: false)
+    feedbackPendingSessionID = s.id
+    defaults.set(s.id, forKey: Self.feedbackKey)
+    disarm(reason: "réveil confirmé")
+    status = "Réveil confirmé. Bonne journée !"
   }
 
+  /// Vibration tests and silent calibration send DISABLE_ALARM, which would also clear the deadline
+  /// alarm: they are not offered while a wake-up is armed.
+  var testsBlocked: Bool { session != nil }
+
   func testVibration() {
+    guard !testsBlocked else { return }
     ramp.play(level: 1)
     status = "Test : rampe continue de 10 % à 100 % en 40 s, puis maintien 20 s"
   }
@@ -790,7 +872,7 @@ final class SmartWakeController: ObservableObject {
     // its daytime optical configuration and never switches to its night (SpO2) mode (audit 11 Nov:
     // night mode came 55 min after the stream stopped). Before the window the engine uses R18.
     let opens = windowStart ?? Date(timeIntervalSince1970: TimeInterval(s.windowEnd - 2700))
-    let streamPhase = now >= opens.addingTimeInterval(-300) || engineState == "stimulating"
+    let streamPhase = now >= opens.addingTimeInterval(-300) || engineState == "stimulating" || engineState == "probable_awake"
     lock.lock(); let liveAge = now.timeIntervalSince1970 - lastLiveSample; lock.unlock()
     liveStreamOK = liveAge < 15
     if streamPhase, !liveStreamOK, now.timeIntervalSince(lastLiveRequest) >= 30, ble.isFreeForCommands {
@@ -806,9 +888,11 @@ final class SmartWakeController: ObservableObject {
       ble.writeSensorStreamCommands([GooseBLEClient.SensorStreamCommandKind(commandNumber: 106, payload: GooseBLEClient.SensorStreamCommandKind.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")], requestedStatus: "Smart wake: live IMU", updatePhysiologyStatus: false)
     }
     runNightOpticalTest(now: now, ble: ble)
-    if !deadlineConfirmed, now.timeIntervalSince(lastDeadlineAttempt) >= 20, ble.isFreeForCommands, !ramp.isPlaying {
+    let end = Date(timeIntervalSince1970: TimeInterval(s.windowEnd))
+    // only while the deadline is still ahead: SET_ALARM_TIME takes a clock time, a passed one
+    // would ring tomorrow
+    if !deadlineConfirmed, end.timeIntervalSince(now) > 5, now.timeIntervalSince(lastDeadlineAttempt) >= 20, ble.isFreeForCommands, !ramp.isPlaying {
       lastDeadlineAttempt = now
-      let end = Date(timeIntervalSince1970: TimeInterval(s.windowEnd))
       ble.setWhoopAlarm(at: end, alarmID: 1, pattern: HapticRampPlayer.deadlinePattern)
       DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak ble] in
         guard let self, let ble else { return }
@@ -880,23 +964,29 @@ final class SmartWakeController: ObservableObject {
     let imu = pendingIMU.map { [$0.0, $0.1] as [Any] }
     pendingIMU.removeAll()
     lock.unlock()
-    let args: [String: Any] = [
-      "database_path": HealthDataStore.defaultDatabasePath(),
-      "session": ["id": s.id, "start_ts": s.startTs, "window_start": 0, "window_end": s.windowEnd, "utc_offset_seconds": TimeZone.current.secondsFromGMT()],
-      "live": live,
-      "imu": imu,
-      "acknowledged": acknowledged,
-    ]
+    let args = engineArgs(s, live: live, imu: imu, acknowledged: acknowledged)
     queue.async { [weak self] in
       let result = try? GooseRustBridge().request(method: "smart_wake.update", args: args)
       Task { @MainActor in self?.apply(result) }
     }
   }
 
+  private func engineArgs(_ s: Session, live: [[Any]], imu: [[Any]], acknowledged: Bool) -> [String: Any] {
+    var session: [String: Any] = ["id": s.id, "start_ts": s.startTs, "window_start": 0, "window_end": s.windowEnd, "utc_offset_seconds": TimeZone.current.secondsFromGMT()]
+    if let adv = s.maxAdvanceMin { session["max_advance_min"] = adv }
+    return [
+      "database_path": HealthDataStore.defaultDatabasePath(),
+      "session": session,
+      "live": live,
+      "imu": imu,
+      "acknowledged": acknowledged,
+    ]
+  }
+
   private func apply(_ r: [String: Any]?) {
     running = false
     guard let r, let s = session else {
-      if session != nil { status = "Moteur indisponible" }
+      // engine hiccup: retried on the next tick; the strap deadline alarm does not depend on it
       return
     }
     engineState = r["state"] as? String ?? engineState
@@ -906,44 +996,82 @@ final class SmartWakeController: ObservableObject {
     }
     if let epoch = r["epoch"] as? [String: Any] {
       posterior = epoch["posterior"] as? [Double] ?? posterior
-      favourableNext10 = (epoch["decision"] as? [String: Any])?["p_light_or_wake_next_10min"] as? Double
     }
+    anticipationAllowed = (r["anticipation"] as? [String: Any])?["allowed"] as? Bool
+    if let reason = r["decision_reason"] as? [String: Any], let code = reason["code"] as? String {
+      decisionReason = reason["label"] as? String
+      // the engine journals every decision; the app log keeps each change of reason
+      if code != lastReasonCode {
+        lastReasonCode = code
+        ble?.record(source: "smart_wake", title: "decision", body: "\(code) state=\(engineState) action=\(r["action"] ?? "none")")
+      }
+    }
+    let why = r["why"] as? String ?? ""
     switch r["action"] as? String {
     case "stimulate":
       let level = r["level"] as? Int ?? 1
       ramp.play(level: level)
-      status = "Réveil en cours (niveau \(level)) : \(r["why"] as? String ?? "")"
-      ble?.record(source: "smart_wake", title: "stimulate", body: "level=\(level) why=\(r["why"] ?? "")")
+      status = "Réveil en cours (niveau \(level)) : \(why)"
+      ble?.record(source: "smart_wake", title: "stimulate", body: "level=\(level) why=\(why)")
+    case "probable_awake":
+      // strong but unconfirmed: pause the ramp, keep the deadline alarm on the strap
+      ramp.stop(disableStrap: false)
+      status = "Éveil probable (\(why)). Confirme pour couper l'alarme de \(deadline.formatted(date: .omitted, time: .shortened))."
+      ble?.record(source: "smart_wake", title: "probable_awake", body: "\(s.id) \(why)")
     case "awake":
       ramp.stop()
-      ble?.record(source: "smart_wake", title: "awake", body: "\(s.id) \(r["why"] ?? "")")
+      ble?.record(source: "smart_wake", title: "awake", body: "\(s.id) \(why)")
       feedbackPendingSessionID = s.id
       defaults.set(s.id, forKey: Self.feedbackKey)
-      disarm(reason: "réveillé")
-      status = "Réveillé (\(r["why"] as? String ?? "confirmé")). Bonne journée !"
+      disarm(reason: "réveil confirmé")
+      status = "Réveil confirmé (\(why)). Bonne journée !"
+    case "timeout":
+      ramp.stop(disableStrap: false)
+      ble?.record(source: "smart_wake", title: "timeout", body: s.id)
+      feedbackPendingSessionID = s.id
+      defaults.set(s.id, forKey: Self.feedbackKey)
+      disarm(reason: "terminé sans confirmation")
     case "deadline":
       status = "Heure limite : alarme du bracelet"
     default:
-      if engineState == "armed" {
-        if let ws = windowStart, Date() >= ws {
-          status = "Fenêtre ouverte : recherche du meilleur moment"
+      switch engineState {
+      case "probable_awake":
+        status = "Éveil probable. L'alarme de \(deadline.formatted(date: .omitted, time: .shortened)) reste programmée tant que tu n'as pas confirmé."
+      case "armed":
+        let reason = decisionReason.map { " · \($0)" } ?? ""
+        let adv = s.maxAdvanceMin ?? 30
+        let earliest = deadline.addingTimeInterval(-TimeInterval(adv * 60))
+        if adv > 0, Date() >= earliest, anticipationAllowed == false {
+          status = "Heure limite conservée\(reason)"
+        } else if let ws = displayWindowStart, Date() >= ws {
+          status = "Fenêtre ouverte\(reason)"
         } else {
           status = "Surveillance du sommeil"
         }
+      default:
+        break
       }
     }
   }
 
   private func scheduleBackupNotification(at date: Date) {
     let center = UNUserNotificationCenter.current()
-    center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-      guard granted else { return }
+    backupStatus = "Secours iPhone : programmation…"
+    center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+      guard granted else {
+        Task { @MainActor in self?.backupStatus = "Secours iPhone non autorisé (notifications désactivées)" }
+        return
+      }
       let content = UNMutableNotificationContent()
       content.title = "Réveil"
-      content.body = "Heure limite de ta fenêtre de réveil."
+      content.body = "Heure limite de ton réveil."
       content.sound = .default
       let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: date)
-      center.add(UNNotificationRequest(identifier: Self.notificationID, content: content, trigger: UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)))
+      center.add(UNNotificationRequest(identifier: Self.notificationID, content: content, trigger: UNCalendarNotificationTrigger(dateMatching: comps, repeats: false))) { error in
+        Task { @MainActor in
+          self?.backupStatus = error == nil ? "Secours iPhone programmé à \(date.formatted(date: .omitted, time: .shortened)) (son de notification, non garanti en mode silencieux)" : "Secours iPhone non programmé"
+        }
+      }
     }
   }
 }
@@ -1000,10 +1128,15 @@ struct AlarmView: View {
         Toggle("", isOn: Binding(get: { controller.session != nil }, set: { $0 ? controller.arm() : controller.disarm() }))
           .labelsHidden().tint(.cyan)
       }
+      Picker("Mode", selection: $controller.mode) {
+        ForEach(SmartWakeController.Mode.allCases) { Text($0.title).tag($0) }
+      }
+      .pickerStyle(.segmented)
+      .disabled(controller.session != nil)
       Button { if controller.session == nil { showPicker.toggle() } } label: {
         VStack(spacing: 2) {
-          Text("Au plus tard").font(.caption).foregroundStyle(.white.opacity(0.7))
-          Text(controller.latest, format: .dateTime.hour().minute())
+          Text(controller.mode == .fixed ? "Réveil à" : "Au plus tard").font(.caption).foregroundStyle(.white.opacity(0.7))
+          Text(controller.session != nil ? controller.deadline : controller.latest, format: .dateTime.hour().minute())
             .font(.system(size: 64, weight: .thin, design: .rounded))
             .foregroundStyle(.white)
             .contentTransition(.numericText())
@@ -1015,13 +1148,29 @@ struct AlarmView: View {
         DatePicker("", selection: $controller.latest, displayedComponents: .hourAndMinute)
           .datePickerStyle(.wheel).labelsHidden().colorScheme(.dark).frame(maxHeight: 140)
       }
+      if controller.mode == .flexible {
+        HStack {
+          Text("Anticipation maximale").font(.footnote)
+          Spacer()
+          Picker("Anticipation maximale", selection: $controller.maxAdvanceMin) {
+            ForEach(SmartWakeController.advanceChoices, id: \.self) { Text("\($0) min").tag($0) }
+          }
+          .pickerStyle(.menu).tint(.white)
+          .disabled(controller.session != nil)
+        }
+        .foregroundStyle(.white.opacity(0.85))
+      }
       HStack(spacing: 8) {
-        Image(systemName: "wand.and.stars")
+        Image(systemName: controller.mode == .fixed ? "alarm" : "wand.and.stars")
         Text(windowText).font(.footnote)
       }
       .foregroundStyle(.white.opacity(0.85))
       .padding(.horizontal, 12).padding(.vertical, 8)
       .background(.white.opacity(0.12), in: Capsule())
+      if controller.mode == .flexible {
+        Text("Le sommeil total passe d'abord : si un réveil anticipé n'apporte pas de bénéfice clair (nuit courte, dette, données insuffisantes), le réveil reste à l'heure limite.")
+          .font(.caption2).foregroundStyle(.white.opacity(0.65)).multilineTextAlignment(.center)
+      }
       Text(controller.status).font(.caption).foregroundStyle(.white.opacity(0.7)).multilineTextAlignment(.center)
     }
     .padding(20)
@@ -1035,29 +1184,40 @@ struct AlarmView: View {
   }
 
   private var windowText: String {
-    if let ws = controller.windowStart {
-      return "Fenêtre calculée : \(ws.formatted(date: .omitted, time: .shortened)) – \(controller.deadline.formatted(date: .omitted, time: .shortened))"
+    let end = controller.deadline.formatted(date: .omitted, time: .shortened)
+    let adv = controller.session.map { $0.maxAdvanceMin ?? 30 } ?? controller.effectiveMaxAdvance
+    if adv == 0 { return "Réveil à \(end) précises, sans anticipation" }
+    let earliest = controller.deadline.addingTimeInterval(-TimeInterval(adv * 60)).formatted(date: .omitted, time: .shortened)
+    if controller.session != nil, controller.anticipationAllowed == false, let r = controller.decisionReason {
+      return "Réveil à \(end) : \(r)"
     }
-    if let w = plan("expected_wake") as? [String: Any], let s = w["window_start"] as? Int {
-      return "Fenêtre prévue : \(clock(s)) – \(controller.deadline.formatted(date: .omitted, time: .shortened)), ajustée pendant la nuit"
+    if let ws = controller.displayWindowStart {
+      return "Réveil possible entre \(ws.formatted(date: .omitted, time: .shortened)) et \(end)"
     }
-    return "La fenêtre s'ouvre quand ton besoin de sommeil est couvert"
+    return "Réveil possible entre \(earliest) et \(end), si ton besoin de sommeil est couvert"
   }
 
   // MARK: live
 
   private var liveCard: some View {
     card(title: "Cette nuit", icon: "waveform.path.ecg") {
-      HStack(spacing: 14) {
-        Label(controller.liveStreamOK ? "FC en direct" : "FC en direct : activée 5 min avant la fenêtre", systemImage: controller.liveStreamOK ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
-          .foregroundStyle(controller.liveStreamOK ? .green : .orange)
-        Label(controller.deadlineConfirmed ? "Alarme limite sur le bracelet" : "Alarme limite en cours d'envoi", systemImage: controller.deadlineConfirmed ? "checkmark.seal.fill" : "hourglass")
+      // states that can be checked, spelled out (never colour alone)
+      VStack(alignment: .leading, spacing: 6) {
+        Label(controller.deadlineConfirmed ? "Alarme confirmée sur le bracelet" : "Alarme du bracelet : envoi en cours", systemImage: controller.deadlineConfirmed ? "checkmark.seal.fill" : "hourglass")
           .foregroundStyle(controller.deadlineConfirmed ? .green : .orange)
+        if !controller.backupStatus.isEmpty {
+          Label(controller.backupStatus, systemImage: "iphone.radiowaves.left.and.right")
+            .foregroundStyle(.secondary)
+        }
+        Label(controller.liveStreamOK ? "Suivi physiologique actif" : "Suivi physiologique inactif (activé 5 min avant la fenêtre)", systemImage: controller.liveStreamOK ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+          .foregroundStyle(controller.liveStreamOK ? .green : .secondary)
+        Label(controller.imuStreamOK ? "Mouvement en direct actif" : "Mouvement en direct inactif (activé 5 min avant la fenêtre)", systemImage: controller.imuStreamOK ? "figure.walk.motion" : "moon.zzz")
+          .foregroundStyle(controller.imuStreamOK ? .green : .secondary)
       }
       .font(.caption)
-      Label(controller.imuStreamOK ? "Mouvement en direct (IMU)" : "Mouvement en direct : activé 5 min avant la fenêtre", systemImage: controller.imuStreamOK ? "figure.walk.motion" : "moon.zzz")
-        .font(.caption)
-        .foregroundStyle(controller.imuStreamOK ? .green : .secondary)
+      if let reason = controller.decisionReason {
+        Label("Décision : \(reason)", systemImage: "info.circle").font(.subheadline)
+      }
       if controller.posterior.count == 4 {
         HStack(alignment: .bottom, spacing: 12) {
           stateBar("Éveil", controller.posterior[0], .orange)
@@ -1065,18 +1225,23 @@ struct AlarmView: View {
           stateBar("Profond", controller.posterior[2], .indigo)
           stateBar("Paradoxal", controller.posterior[3], .purple)
         }
-        if let p = controller.favourableNext10 {
-          ProgressView(value: p) { Text("Moment favorable dans les 10 min").font(.caption) } currentValueLabel: { Text("\(Int(p * 100)) %").font(.caption.monospacedDigit()) }
-            .tint(.cyan)
-        }
+        Text("Stades estimés à partir de la FC, de la VFC et du mouvement.").font(.caption2).foregroundStyle(.secondary)
       } else {
         Text("En attente des premières données du bracelet…").font(.subheadline).foregroundStyle(.secondary)
       }
-      if controller.engineState == "stimulating" || ramp.isPlaying {
-        HStack {
-          Label("Vibration \(ramp.percent) %", systemImage: "waveform").font(.subheadline.monospacedDigit())
-          Spacer()
-          Button("Je suis réveillé") { controller.acknowledgeAwake() }.buttonStyle(.borderedProminent).tint(.cyan)
+      if controller.engineState == "stimulating" || controller.engineState == "probable_awake" || ramp.isPlaying {
+        VStack(alignment: .leading, spacing: 10) {
+          if controller.engineState == "probable_awake" {
+            Text("Éveil probable. L'alarme de \(controller.deadline.formatted(date: .omitted, time: .shortened)) reste programmée tant que tu n'as pas confirmé.")
+              .font(.footnote)
+          } else {
+            Label("Vibration \(ramp.percent) %", systemImage: "waveform").font(.subheadline.monospacedDigit())
+          }
+          Button { controller.acknowledgeAwake() } label: {
+            Text("Je suis réveillé").font(.title3.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 52)
+          }
+          .buttonStyle(.borderedProminent).tint(.cyan)
+          .accessibilityHint("Arrête la vibration et l'alarme de l'heure limite")
         }
       }
     }
@@ -1184,18 +1349,24 @@ struct AlarmView: View {
 
   private var vibrationCard: some View {
     card(title: "Vibration", icon: "waveform") {
-      Text("Modulation continue, démarrage à peine perceptible puis rampe linéaire jusqu'à 100 % en 40 s. Si aucun réveil n'est détecté, la rampe reprend plus haut, puis plus vite. Elle s'arrête dès que tu te lèves (état « levé » du bracelet), à un double tap, ou avec le bouton.")
+      Text("Modulation continue, démarrage à peine perceptible puis rampe linéaire jusqu'à 100 % en 40 s. Sans réaction, la rampe reprend plus haut, puis plus vite. Si tu te lèves ou marches, elle se met en pause ; elle s'arrête complètement avec « Je suis réveillé » ou un double tap. Tant que le réveil n'est pas confirmé, l'alarme de l'heure limite reste programmée.")
         .font(.footnote).foregroundStyle(.secondary)
+      if controller.testsBlocked {
+        Text("Tests indisponibles pendant un réveil programmé : ils effaceraient l'alarme de l'heure limite.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       HStack {
-        Button(ramp.isPlaying ? "Arrêter" : "Tester la rampe") { ramp.isPlaying ? ramp.stop() : controller.testVibration() }
+        Button(ramp.isPlaying && !controller.testsBlocked ? "Arrêter" : "Tester la rampe") { ramp.isPlaying ? ramp.stop() : controller.testVibration() }
           .buttonStyle(.borderedProminent).tint(ramp.isPlaying ? .red : .indigo)
-        if ramp.isPlaying {
+          .disabled(controller.testsBlocked)
+        if ramp.isPlaying && !controller.testsBlocked {
           ProgressView(value: Double(ramp.percent), total: 100).tint(.indigo)
           Text("\(ramp.percent) %").font(.caption.monospacedDigit())
         }
       }
       Button("Calibrer (silencieux, ~30 s)") { ramp.probe() }
         .font(.footnote)
+        .disabled(controller.testsBlocked)
       if !ramp.probeStatus.isEmpty {
         Text(ramp.probeStatus).font(.caption2).foregroundStyle(.secondary)
         ForEach(Array(ramp.probeResults.enumerated()), id: \.offset) { _, r in
