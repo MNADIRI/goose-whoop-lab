@@ -1127,13 +1127,17 @@ fn stress(s: &[Sample], rhr: f64, hrmax: f64) -> Value {
     for x in calm {
         buckets.entry((x.ts - t0) / 300).or_default().push(((x.hr - rhr) / (0.4 * reserve)).clamp(0.0, 1.0) * 100.0);
     }
-    let scores: Vec<f64> = buckets.values().filter(|v| v.len() >= 120).filter_map(|v| mean(v)).collect();
+    let scored: Vec<(i64, f64)> = buckets.iter().filter(|(_, v)| v.len() >= 120).filter_map(|(k, v)| Some((*k, mean(v)?))).collect();
+    let scores: Vec<f64> = scored.iter().map(|(_, v)| *v).collect();
     if scores.is_empty() {
         return Value::Null;
     }
     let band = |lo: f64, hi: f64| scores.iter().filter(|v| **v > lo && **v <= hi).count() as f64 * 5.0;
+    // most recent calm 5-min bucket (end time): lets a consumer show "recent" stress with its age
+    let (last_k, last_v) = *scored.last().unwrap();
     json!({
         "mean": mean(&scores).unwrap().round(), "max": scores.iter().copied().fold(0.0, f64::max).round(),
+        "last": {"score": last_v.round(), "ts": t0 + (last_k + 1) * 300},
         "minutes": {"repos": band(-1.0, 25.0), "bas": band(25.0, 50.0), "moyen": band(50.0, 75.0), "haut": band(75.0, 101.0)},
         "buckets": scores.len(),
     })
@@ -1212,7 +1216,7 @@ fn provenance() -> Value {
 
 // ------------------------------------------------------------------ driver
 
-fn date_key(local_midnight: i64, offset: i64) -> String {
+pub(crate) fn date_key(local_midnight: i64, offset: i64) -> String {
     let days = (local_midnight + offset).div_euclid(DAY);
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")

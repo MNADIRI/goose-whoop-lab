@@ -2515,6 +2515,10 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(|args| crate::sport::install_model(&args))
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "daily.snapshot" => request_args::<crate::daily_context::SnapshotArgs>(&request)
+            .and_then(|args| crate::daily_context::snapshot(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "smart_wake.update" => request_args::<crate::smart_wake::UpdateArgs>(&request)
             .and_then(|args| crate::smart_wake::update(&args))
             .map(|value| bridge_ok(&request.request_id, value))

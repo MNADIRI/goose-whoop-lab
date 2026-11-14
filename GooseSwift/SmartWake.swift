@@ -185,6 +185,8 @@ final class SmartWakeController: ObservableObject {
   @Published private(set) var backupStatus = ""
   @Published private(set) var feedbackPendingSessionID: String?
   @Published private(set) var plan: [String: Any] = [:]
+  /// last explicit "Je suis réveillé" / double tap (read by the daily widget as a confirmed awakening)
+  @Published private(set) var confirmedAwakeAt: Date? = UserDefaults.standard.object(forKey: "smartWake.confirmedAwakeAt") as? Date
   private var lastReasonCode = ""
 
   /// anticipation actually requested from the engine
@@ -340,11 +342,17 @@ final class SmartWakeController: ObservableObject {
     let args = engineArgs(s, live: [], imu: [], acknowledged: true)
     queue.async { _ = try? GooseRustBridge().request(method: "smart_wake.update", args: args) }
     ble?.record(source: "smart_wake", title: "awake.confirmed", body: s.id)
+    markConfirmedAwake()
     ramp.stop(disableStrap: false)
     feedbackPendingSessionID = s.id
     defaults.set(s.id, forKey: Self.feedbackKey)
     disarm(reason: "réveil confirmé")
     status = "Réveil confirmé. Bonne journée !"
+  }
+
+  private func markConfirmedAwake() {
+    confirmedAwakeAt = Date()
+    defaults.set(confirmedAwakeAt, forKey: "smartWake.confirmedAwakeAt")
   }
 
   func submitFeedback(rating: Int) {
@@ -516,6 +524,7 @@ final class SmartWakeController: ObservableObject {
       status = "Éveil probable (\(why)). Confirme pour couper l'alarme de \(deadline.formatted(date: .omitted, time: .shortened))."
       ble?.record(source: "smart_wake", title: "probable_awake", body: "\(s.id) \(why)")
     case "awake":
+      markConfirmedAwake()
       ramp.stop()
       ble?.record(source: "smart_wake", title: "awake", body: "\(s.id) \(why)")
       feedbackPendingSessionID = s.id

@@ -7,6 +7,7 @@ import WidgetKit
 struct GooseWorkoutLiveActivityBundle: WidgetBundle {
   var body: some Widget {
     GooseWorkoutLiveActivityWidget()
+    MNHealthDailyWidget()
   }
 }
 

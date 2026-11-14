@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Workout</string>
+	<string>mn health</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -20,6 +20,15 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Fonts/Doto-ExtraBold.ttf</string>
+		<string>Fonts/Manrope-Bold.ttf</string>
+		<string>Fonts/Manrope-ExtraBold.ttf</string>
+		<string>Fonts/Manrope-Medium.ttf</string>
+		<string>Fonts/Manrope-Regular.ttf</string>
+		<string>Fonts/Manrope-SemiBold.ttf</string>
+	</array>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>

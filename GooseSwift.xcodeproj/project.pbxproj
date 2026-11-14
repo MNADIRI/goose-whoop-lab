@@ -137,6 +137,11 @@
 			A10000000000000000000027 /* CoachTips.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000027 /* CoachTips.swift */; };
 				B10000000000000000000001 /* WorkoutLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* WorkoutLiveActivityAttributes.swift */; };
 			B10000000000000000000002 /* WorkoutLiveActivityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* WorkoutLiveActivityController.swift */; };
+			E1000000000000000000D001 /* DailyHealthSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000000000000000000D001 /* DailyHealthSnapshot.swift */; };
+			E1000000000000000000D002 /* DailyHealthSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000000000000000000D001 /* DailyHealthSnapshot.swift */; };
+			E1000000000000000000D003 /* MNHealthMetricRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000000000000000000D002 /* MNHealthMetricRepository.swift */; };
+			E1000000000000000000D004 /* MNHealthWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2000000000000000000D003 /* MNHealthWidget.swift */; };
+			E1000000000000000000D005 /* Fonts in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F1FF00 /* Fonts */; };
 			B10000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift */; };
 			B10000000000000000000004 /* WorkoutLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* WorkoutLiveActivityAttributes.swift */; };
 			B10000000000000000000005 /* GooseWorkoutLiveActivityExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* GooseWorkoutLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -289,6 +294,10 @@
 			A20000000000000000000027 /* CoachTips.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoachTips.swift; sourceTree = "<group>"; };
 				B20000000000000000000001 /* WorkoutLiveActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkoutLiveActivityAttributes.swift; sourceTree = "<group>"; };
 			B20000000000000000000002 /* WorkoutLiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkoutLiveActivityController.swift; sourceTree = "<group>"; };
+			E2000000000000000000D001 /* DailyHealthSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DailyHealthSnapshot.swift; sourceTree = "<group>"; };
+			E2000000000000000000D002 /* MNHealthMetricRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MNHealthMetricRepository.swift; sourceTree = "<group>"; };
+			E2000000000000000000D003 /* MNHealthWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MNHealthWidget.swift; sourceTree = "<group>"; };
+			E2000000000000000000D004 /* GooseWorkoutLiveActivityExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = GooseWorkoutLiveActivityExtension.entitlements; sourceTree = "<group>"; };
 			B20000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GooseWorkoutLiveActivityWidget.swift; sourceTree = "<group>"; };
 			B20000000000000000000004 /* GooseWorkoutLiveActivityExtension.appex */ = {isa = PBXFileReference; explicitFileType = wrapper.app-extension; includeInIndex = 0; path = GooseWorkoutLiveActivityExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 			B20000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -378,6 +387,8 @@
 				D2000000000000000000F002 /* WhoopLabResults.swift */,
 				D2000000000000000000F003 /* WhoopLabDayViews.swift */,
 				D2000000000000000000F004 /* SmartWake.swift */,
+				E2000000000000000000D001 /* DailyHealthSnapshot.swift */,
+				E2000000000000000000D002 /* MNHealthMetricRepository.swift */,
 				D2000000000000000000F005 /* Sport.swift */,
 				D20000000000000000F11000 /* FormeTheme.swift */,
 				D20000000000000000F11100 /* FormeData.swift */,
@@ -513,6 +524,8 @@
 			isa = PBXGroup;
 			children = (
 				B20000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift */,
+				E2000000000000000000D003 /* MNHealthWidget.swift */,
+				E2000000000000000000D004 /* GooseWorkoutLiveActivityExtension.entitlements */,
 				B20000000000000000000005 /* Info.plist */,
 			);
 			path = GooseWorkoutLiveActivityExtension;
@@ -642,6 +655,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E1000000000000000000D005 /* Fonts in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -689,6 +703,8 @@
 				D1000000000000000000F002 /* WhoopLabResults.swift in Sources */,
 				D1000000000000000000F003 /* WhoopLabDayViews.swift in Sources */,
 				D1000000000000000000F004 /* SmartWake.swift in Sources */,
+				E1000000000000000000D001 /* DailyHealthSnapshot.swift in Sources */,
+				E1000000000000000000D003 /* MNHealthMetricRepository.swift in Sources */,
 				D1000000000000000000F005 /* Sport.swift in Sources */,
 				D10000000000000000F11000 /* FormeTheme.swift in Sources */,
 				D10000000000000000F11100 /* FormeData.swift in Sources */,
@@ -820,6 +836,8 @@
 			files = (
 				B10000000000000000000003 /* GooseWorkoutLiveActivityWidget.swift in Sources */,
 				B10000000000000000000004 /* WorkoutLiveActivityAttributes.swift in Sources */,
+				E1000000000000000000D002 /* DailyHealthSnapshot.swift in Sources */,
+				E1000000000000000000D004 /* MNHealthWidget.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -958,6 +976,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = GooseSwift/GooseSwift.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = LZ627586HA;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
@@ -1001,6 +1020,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = GooseSwift/GooseSwift.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = LZ627586HA;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
@@ -1041,7 +1061,9 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				ARCHS = arm64;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = GooseWorkoutLiveActivityExtension/GooseWorkoutLiveActivityExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = LZ627586HA;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = GooseWorkoutLiveActivityExtension/Info.plist;
@@ -1070,7 +1092,9 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				ARCHS = arm64;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = GooseWorkoutLiveActivityExtension/GooseWorkoutLiveActivityExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = LZ627586HA;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = GooseWorkoutLiveActivityExtension/Info.plist;
