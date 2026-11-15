@@ -459,7 +459,14 @@ fn awakening(now: i64, a: &Analysis, sw: &SmartWakeInput, sleep: &SleepObservati
     }
     // a later sustained sleep block (back to bed, nap) cancels an earlier awakening
     let latest_onset = sleep.onset.filter(|o| sleep.wake.is_none_or(|w| w < *o));
-    cands.into_iter().filter(|(t, _)| latest_onset.is_none_or(|o| *t > o)).max_by_key(|(t, _)| *t)
+    let observed = cands.into_iter().filter(|(t, _)| latest_onset.is_none_or(|o| *t > o)).max_by_key(|(t, _)| *t);
+    // without any observation (strap disconnected, history late), the passed alarm deadline still
+    // starts the morning instead of keeping the night card until the fallback morning end
+    observed.or_else(|| {
+        sw.deadline
+            .filter(|d| sw.armed && *d <= now && *d > horizon && latest_onset.is_none_or(|o| *d > o))
+            .map(|d| (d, "heure du réveil passée"))
+    })
 }
 
 /// Night-like onset: not a daytime nap (a block starting 09:00–19:00 and shorter than 3 h).
@@ -487,8 +494,10 @@ fn decide_context(now: i64, off: i64, a: &Analysis, sw: &SmartWakeInput, sleep: 
         .map_or(clock_evening, |e| e.min(clock_evening));
     let wake = awakening(now, a, sw, sleep, s);
     let mk = |context, since, trigger: &str| ContextDecision { context, since, trigger: trigger.into(), awakening: wake.map(|w| w.0), evening_start };
-    // 1. confirmed sleep onset (not a nap), no sustained wake after it
-    if let Some(o) = night_onset(now, off, sleep, s) {
+    // 1. confirmed sleep onset (not a nap), with no awakening after it from any source. The
+    // sensor's own sustained-wake detection lags (R18 history arrives minutes late), so a
+    // Smart Wake confirmation or the analysed night's wake time also ends the night.
+    if let Some(o) = night_onset(now, off, sleep, s).filter(|o| wake.is_none_or(|(w, _)| w <= *o)) {
         return mk(Context::Night, o, "endormissement observé");
     }
     // 2. confirmed awakening: morning for `morning_duration_min`
@@ -1454,12 +1463,23 @@ mod tests {
         x.now_unix = Some(local(24 + 4, 30));
         x.sleep = Some(SleepObservation::default());
         assert_eq!(run(&x)["context"], "night");
+        // 07:03: still no data, but the 07:00 alarm deadline has passed → morning, not night
+        x.now_unix = Some(local(24 + 7, 3));
+        let r = run(&x);
+        assert_eq!(r["context"], "morning");
+        assert_eq!(r["trigger"], "heure du réveil passée");
         // 07:05: user confirmed awake via Smart Wake → morning
         x.now_unix = Some(local(24 + 7, 5));
         x.smart_wake.confirmed_awake_at = Some(local(24 + 7, 2));
         let r = run(&x);
         assert_eq!(r["context"], "morning");
         assert_eq!(r["trigger"], "réveil confirmé (Smart Wake)");
+        // same, while the sensor still reports the night's onset without a sustained wake yet
+        // (history lag): the confirmed awakening wins over the stale onset
+        x.sleep = Some(SleepObservation { onset: Some(local(23, 5)), wake: None, last_sample_ts: Some(local(24 + 7, 4)) });
+        let r = run(&x);
+        assert_eq!(r["context"], "morning");
+        assert_eq!(r["entries"][0]["card"]["pending"], false);
         // a daytime nap is not a night
         let mut y = args(local(14, 40), a, sw(tomorrow_7h(), 30), plan(480.0, 0.0, 0.0, 0.0));
         y.sleep = Some(SleepObservation { onset: Some(local(14, 0)), wake: None, last_sample_ts: Some(local(14, 39)) });

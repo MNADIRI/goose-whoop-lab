@@ -26,9 +26,12 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "12"; // 12: unknown epochs + coverage, shared RR QC for stages, no CPC relabelling, contiguous resting HR, no SpO2 screening score, context-aware cache; 11: Banister seeded, 28-day calibration; 10: composite sleep score, awake resting vitals, strain %
+const ALGORITHM_VERSION: &str = "13"; // 13: awake rest windows at 45 mg / 85 % (Hildebrand sedentary); 12: unknown epochs + coverage, shared RR QC for stages, no CPC relabelling, contiguous resting HR, no SpO2 screening score, context-aware cache; 11: Banister seeded, 28-day calibration; 10: composite sleep score, awake resting vitals, strain %
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
+/// Awake rest windows: sedentary dynamic-acceleration cut-point and share of seconds below it.
+const REST_DYN_G: f64 = 0.045;
+const REST_STILL_FRAC: f64 = 0.85;
 /// Minimum share of scored epochs between sleep onset and wake for a night to be scored.
 const SLEEP_MIN_COVERAGE: f64 = 0.9;
 const CK_WEIGHTS: [f64; 7] = [106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0];
@@ -889,8 +892,10 @@ fn sleep_score(n: &Value, prev: &[&Value], need_min: f64) -> Value {
     })
 }
 
-/// Awake resting vitals: 5-min windows after the morning wake, awake (band != sleep), still for
-/// >= 90 % of seconds (dynamic acceleration < 0.03 g), R-R dropped on strap motion flags.
+/// Awake resting vitals: 5-min windows after the morning wake, awake (band != sleep), sedentary for
+/// >= 85 % of seconds (dynamic acceleration < 45 mg, the wrist sedentary cut-point of Hildebrand
+/// 2014), R-R dropped on strap motion flags. The former 30 mg / 90 % rule found 0-1 window on
+/// ordinary days (phone, keyboard): the card stayed empty.
 /// Comparable from day to day; not comparable to the night (posture, digestion, caffeine...).
 /// SpO2 is only computed by the strap during sleep, so it has no daytime value.
 fn day_rest_vitals(s: &[Sample], after: i64, extras: &std::collections::HashMap<i64, Extra>) -> Value {
@@ -901,7 +906,7 @@ fn day_rest_vitals(s: &[Sample], after: i64, extras: &std::collections::HashMap<
     }
     let still: Vec<Vec<&Sample>> = wins
         .into_values()
-        .filter(|w| w.len() >= 270 && w.iter().filter(|x| x.dyn_g.is_some_and(|d| d < 0.03)).count() as f64 >= 0.9 * w.len() as f64)
+        .filter(|w| w.len() >= 270 && w.iter().filter(|x| x.dyn_g.is_some_and(|d| d < REST_DYN_G)).count() as f64 >= REST_STILL_FRAC * w.len() as f64)
         .collect();
     let skin: Vec<f64> = awake.iter().filter_map(|x| x.skin).collect();
     let skin_med = median(&skin).map(|v| round(v, 2));
@@ -931,7 +936,7 @@ fn day_rest_vitals(s: &[Sample], after: i64, extras: &std::collections::HashMap<
         "rmssd_ms": hrv["rmssd_ms"].clone(),
         "respiration_rpm": resp["rpm"].clone(),
         "skin_temp_c": skin_med,
-        "method": "awake 5-min windows, >= 90 % still (< 0.03 g), after wake; HRV/respiration on R-R without strap motion flags",
+        "method": "awake 5-min windows, >= 85 % sedentary (< 45 mg, Hildebrand 2014), after wake; HRV/respiration on R-R without strap motion flags",
         "status": "EXPERIMENTAL",
     })
 }

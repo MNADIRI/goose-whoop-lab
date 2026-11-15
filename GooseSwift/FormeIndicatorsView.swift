@@ -321,7 +321,7 @@ struct FormeMethodsView: View {
       ("Calories", "Actives : Keytel 2005 au-dessus du repos ; totales : + métabolisme de base (Mifflin-St Jeor)."),
       ("Stress", "Pouls au-dessus du repos, éveillé et immobile, rapporté à la réserve cardiaque."),
       ("Pas", "Compteur du bracelet : il compte au poignet, le téléphone compte dans la poche."),
-      ("Mesures du jour", "Pouls, VFC et respiration sur des fenêtres de 5 min éveillé et immobile ; comparées à tes autres journées, pas à la nuit."),
+      ("Mesures du jour", "Pouls, VFC et respiration sur des fenêtres de 5 min éveillé et au calme (85 % du temps sous le seuil sédentaire du poignet) ; comparées à tes autres journées, pas à la nuit."),
       ("Séances", "Détection sur le pouls et la signature du mouvement, puis type et exercices reconnus par l'IMU."),
     ]),
   ]

@@ -242,7 +242,7 @@ struct FormeTodayView: View {
     } else {
       FrostCard(radius: 32, padding: 18, spacing: 6) {
         Text("En attente de moments calmes").font(Forme.sans(15, .semibold, relativeTo: .subheadline)).foregroundStyle(Forme.ink)
-        Text("Pouls, VFC et respiration du jour se mesurent dès que tu restes immobile quelques minutes (assis, au bureau). Les valeurs de la nuit sont dans Sommeil.")
+        Text("Pouls, VFC et respiration du jour se mesurent après 15 min au calme dans la journée (assis, au bureau). Les valeurs de la nuit sont dans Sommeil.")
           .font(Forme.sans(13, .medium, relativeTo: .footnote)).foregroundStyle(Forme.muted).fixedSize(horizontal: false, vertical: true)
       }
       .padding(.top, 12)
