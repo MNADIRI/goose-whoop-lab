@@ -65,6 +65,13 @@ Gesture signatures: walking 1.70 Hz in |a| (= 102 steps/min); double tap = two 5
 apart; triple tap = three 6–10 g spikes ~0.45 s apart; flat wrist → gravity on Y/Z, walking arm →
 gravity on X.
 
+Triple-tap cancel (sport auto-start): taps are 3–12 g peaks only 1–2 samples wide (third tap of a
+triple can be ~3 g); shaking, walking, gym and daily life give peaks >= 3 samples wide. Rule
+(`sport::triple_taps`): three sharp peaks >= 2.5 g, 0.2–0.8 s apart, no other peak within 1 s
+before or after. Checked on 5.3 h of stored IMU (gym, sessions, daily life): one match, a deliberate
+tap during the 15 Nov alarm. The firmware DOUBLE_TAP event (14) is not used for this: it fired
+dozens of times during the 11 Nov tennis match and the 13 Nov gym session.
+
 ## 4. Optical (R20, 2 140 B)
 
 Five blocks at frame offsets 26/448/870/1292/1714; each: count u8, two slots (A/B) with source
@@ -87,6 +94,37 @@ Responses: firm press → AC ×10, DC +22 %; clenched fist → AC ×10–20, DC 
 (contact / venous volume change). PPG pulse rate at rest 55.9 bpm vs strap HR 57.6 bpm; while
 walking the PPG spectral peak is wrong (46 bpm vs 67 bpm) → raw PPG needs accelerometer-referenced
 motion cancellation before use in motion.
+
+## 4b. Temperature (R18, 1 Hz)
+
+Three thermometers per one-second R18 record, plus a battery reading in the strap events:
+
+| Field | Offset | Scale | Worn, daytime | Night | Role (inferred) |
+|---|---|---|---|---|---|
+| `skin_temp` | 73, u16 | 0.01 °C | 29–34 °C | 31–33.6 °C | contact thermistor on the skin side |
+| `aux_temp_1` | 69, i16 | 0.1 °C | 24–31 °C | 28–32 °C | outer side of the board: follows the air, fastest to heat |
+| `aux_temp_2` | 71, i16 | 0.1 °C | 27–32 °C | 29–32 °C | inner side / battery: heats first when charging |
+| event 63 u16@5 | — | 0.1 °C | — | — | battery temperature candidate (42.5 °C in the sauna, 37.3 °C charging) |
+
+Worn normally heat flows from the wrist outwards: skin > aux 2 > aux 1 (aux 1 is 3–5 °C below the
+skin). The decoder keeps aux values in 0–60 °C and skin in 5–45 °C (raw skin is also stored).
+
+Observed episodes (11–15 Nov):
+
+- **Dry sauna, 15 Nov 13:28–13:42**: aux 1 rises 2.3–2.4 °C/min from 28.6 to 45.4 °C (flat at 45.4
+  for 3 min: possibly a ceiling), aux 2 to 42.8, skin to 40.8 °C (8 min ≥ 38 °C). aux 1 passes the
+  skin 4 min after entry and stays above it (gradient inverted: the heat comes from the air). Heart
+  rate 98 → 127 bpm with almost no movement. Exit: aux 1 falls 3.4 °C/min, back below the skin in 3 min.
+- **Battery pack charging, 13 Nov 18:38–18:59** (CHARGING_ON … CHARGING_OFF, BATTERY_PACK_REMOVED):
+  aux 2 leads (32.7 vs aux 1 29.6 °C one minute in), aux 1 reaches 43.1, skin 37.9 °C; heart rate
+  stays at 53–60 bpm.
+
+Sauna rule (`sport::heat`): minutes with aux 1 ≥ 38 °C, aux 1 ≥ skin + 1 °C and skin ≥ 34 °C, at least
+5 such minutes (gaps ≤ 2 min), median heart rate over them ≥ awake rest + 20 bpm, and no charge /
+battery-pack event within 10 min. Bounds: back from the first hot minute while aux 1 rises ≥ 1 °C/min
+(entry), forward to the last minute before it falls ≥ 1 °C/min (exit). Checked on every recovered
+R18 minute (9–15 Nov): the sauna is found, the charging spell is rejected by its heart rate alone. A
+hot bath or a steam room gives the same picture and is reported as a sauna.
 
 ## 5. On-strap history (sync)
 

@@ -322,7 +322,8 @@ struct FormeMethodsView: View {
       ("Stress", "Pouls au-dessus du repos, éveillé et immobile, rapporté à la réserve cardiaque."),
       ("Pas", "Compteur du bracelet : il compte au poignet, le téléphone compte dans la poche."),
       ("Mesures du jour", "Pouls, VFC et respiration sur des fenêtres de 5 min éveillé et au calme (85 % du temps sous le seuil sédentaire du poignet) ; comparées à tes autres journées, pas à la nuit."),
-      ("Séances", "Détection sur le pouls et la signature du mouvement, puis type et exercices reconnus par l'IMU."),
+      ("Séances", "Détection sur le pouls et la signature du mouvement, puis type et exercices reconnus par l'IMU. Au départ automatique, 3 vibrations ; un triple tap sur le bracelet (3 pics brefs à 0,2–0,8 s d'écart, isolés) dans les 10 min annule la séance."),
+      ("Sauna", "Trois thermomètres dans le bracelet : la peau, et deux capteurs internes. Au sauna, le capteur côté extérieur dépasse 38 °C et passe au-dessus de la peau (la chaleur vient de l'air), pendant au moins 5 min, le pouls monte d'au moins 20 bpm au-dessus du repos, et aucune recharge n'a lieu. Entrée et sortie : montée ou chute de plus de 1 °C par minute. Un bain chaud ou un hammam donnent la même signature."),
     ]),
   ]
 

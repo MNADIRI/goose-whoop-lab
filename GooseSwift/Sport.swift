@@ -78,6 +78,12 @@ struct SportSession: Identifiable, Hashable {
   let maxHR: Double?
   let hrSeries: [(Date, Double)]
   let segments: [SportSegment]
+  /// sauna (R18 temperatures): skin and outer-sensor peaks, minutes with the skin >= 38 degC
+  let skinMaxC: Double?
+  let outerMaxC: Double?
+  let skinAbove38Min: Int?
+  let hrStart: Double?
+  let skinSeries: [(Date, Double)]
 
   init(_ d: [String: Any]) {
     id = d["id"] as? String ?? ""
@@ -112,6 +118,15 @@ struct SportSession: Identifiable, Hashable {
       return (Date(timeIntervalSince1970: t), v)
     }
     segments = (d["segments"] as? [[String: Any]] ?? []).map(SportSegment.init)
+    let heat = s["heat"] as? [String: Any] ?? [:]
+    skinMaxC = heat["skin_max_c"] as? Double
+    outerMaxC = heat["outer_max_c"] as? Double
+    skinAbove38Min = heat["skin_above_38_min"] as? Int
+    hrStart = s["hr_start"] as? Double
+    skinSeries = (s["temp_series"] as? [[Any]] ?? []).compactMap { p in
+      guard p.count >= 2, let t = (p[0] as? Int).map(Double.init) ?? (p[0] as? Double), let v = p[1] as? Double else { return nil }
+      return (Date(timeIntervalSince1970: t), v)
+    }
   }
 
   static func == (a: SportSession, b: SportSession) -> Bool { a.id == b.id && a.labelStatus == b.labelStatus && a.label == b.label && a.segments == b.segments }
@@ -141,13 +156,14 @@ struct SportSession: Identifiable, Hashable {
 }
 
 enum SportKind: String, CaseIterable, Identifiable {
-  case course, tennis, musculation, autre
+  case course, tennis, musculation, sauna, autre
   var id: String { rawValue }
   var title: String {
     switch self {
     case .course: "Course"
     case .tennis: "Tennis"
     case .musculation: "Musculation"
+    case .sauna: "Sauna"
     case .autre: "Autre"
     }
   }
@@ -156,6 +172,7 @@ enum SportKind: String, CaseIterable, Identifiable {
     case .course: "figure.run"
     case .tennis: "figure.tennis"
     case .musculation: "dumbbell.fill"
+    case .sauna: "flame.fill"
     case .autre: "figure.mixed.cardio"
     }
   }
@@ -164,6 +181,7 @@ enum SportKind: String, CaseIterable, Identifiable {
     case .course: .orange
     case .tennis: .green
     case .musculation: .purple
+    case .sauna: .red
     case .autre: .blue
     }
   }
@@ -297,9 +315,41 @@ final class SportController: ObservableObject {
     let want = r["want_streams"] as? Bool ?? false
     if want && !capturing { setStreams(true) }
     if !want && capturing { setStreams(false) }
-    if let event = r["event"] as? String, event == "end" || event == "start" {
+    if let event = r["event"] as? String, event == "end" || event == "start" || event == "cancelled" {
+      if event == "start" {
+        buzz(Self.startAlert, "start")
+      } else if event == "cancelled" {
+        buzz(Self.cancelAck, "cancelled")
+        current = [:]
+      }
       refresh()
-      if event == "end" { exportDataset() }
+      if event != "start" { exportDataset() }
+    }
+    // a triple tap cancels an auto-detected session for 10 minutes after the alert: read the live
+    // IMU every 5 s meanwhile so the cancel is felt quickly
+    // a sauna found in the temperatures is stored as a finished session
+    if (r["saunas"] as? [Any])?.isEmpty == false {
+      refresh()
+      exportDataset()
+    }
+    if r["tap_cancel_open"] as? Bool == true {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.update() }
+    }
+  }
+
+  /// Auto-detected session started: three strong vibrations (two 100 % buzzes each, 0.5 s apart).
+  /// Effect 47 = buzz 100 %, 0x80 | n = wait n x 10 ms (WHOOP's default pattern uses 47 / 152).
+  static let startAlert = GooseBLEClient.AlarmHapticsPattern(waveformEffects: [47, 47, 178, 47, 47, 178, 47, 47], loopControl: 0, overallLoop: 0, durationSeconds: 8)
+  /// Session cancelled by a triple tap: one long, smooth 100 % vibration.
+  static let cancelAck = GooseBLEClient.AlarmHapticsPattern(waveformEffects: [64, 64, 64, 64, 64, 0, 0, 0], loopControl: 0, overallLoop: 0, durationSeconds: 8)
+
+  /// Played on the strap clock 3 s ahead through alarm slot 3. Slot 1 is the user's alarm and the
+  /// smart-wake deadline; slots 2 / 3 are the smart-wake ramp, which only plays while a smart wake is
+  /// armed, and auto-detection is paused then, so the slots never overlap.
+  private func buzz(_ pattern: GooseBLEClient.AlarmHapticsPattern, _ why: String) {
+    ble?.whenFreeForCommands(timeout: 60) { ble in
+      ble.setWhoopAlarm(at: Date().addingTimeInterval(3), alarmID: 3, pattern: pattern)
+      ble.record(source: "sport", title: "haptic.\(why)")
     }
   }
 

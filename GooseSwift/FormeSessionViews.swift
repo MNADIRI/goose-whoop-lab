@@ -23,6 +23,7 @@ struct FormeSessionView: View {
         pulse(s, kind)
         if kind == .musculation { exercises(s) }
         if kind == .tennis { tennis(s) }
+        if kind == .sauna { sauna(s) }
         if kind != .musculation { zones(s) }
         if kind == .course { running(s) }
         // a session you started yourself has a known type: no "detection" to confirm
@@ -103,6 +104,10 @@ struct FormeSessionView: View {
             MiniStat(label: "Frappes", value: "\(s.strokes ?? 0)", labelColor: Forme.onBright2)
             MiniStat(label: "Échanges", value: "\(s.segments.filter { $0.kind == "exchange" }.count)", labelColor: Forme.onBright2)
             MiniStat(label: "Pouls moyen", value: FF.num(s.hrMean), unit: "bpm", labelColor: Forme.onBright2)
+          case .sauna:
+            MiniStat(label: "Peau max", value: FF.num(s.skinMaxC, 1), unit: "°C", labelColor: Forme.onBright2)
+            MiniStat(label: "Bracelet max", value: FF.num(s.outerMaxC, 1), unit: "°C", labelColor: Forme.onBright2)
+            MiniStat(label: "Pouls max", value: FF.num(s.hrMax), unit: "bpm", labelColor: Forme.onBright2)
           case .autre:
             MiniStat(label: "Pouls moyen", value: FF.num(s.hrMean), unit: "bpm", labelColor: Forme.onBright2)
             MiniStat(label: "Pouls max", value: FF.num(s.hrMax), unit: "bpm", labelColor: Forme.onBright2)
@@ -186,6 +191,29 @@ struct FormeSessionView: View {
     HStack(spacing: 12) {
       MetricTile(label: "Frappes", value: "\(s.strokes ?? 0)", note: "Sur toute la séance")
       MetricTile(label: "Par échange", value: ex.isEmpty ? "—" : FF.num(Double(ex.compactMap(\.repsPred).reduce(0, +)) / Double(ex.count), 1), note: "\(ex.count) échanges")
+    }
+    .padding(.top, 12)
+  }
+
+  // MARK: sauna
+
+  @ViewBuilder private func sauna(_ s: SportSession) -> some View {
+    SectionTitle(title: "Chaleur", subtitle: "Température de la peau sous le bracelet")
+    FrostCard(radius: 36, padding: 20, spacing: 12) {
+      if s.skinSeries.count >= 2 {
+        HRChart(points: s.skinSeries)
+          .frame(height: 110)
+          .accessibilityLabel("Température de la peau, maximum \(FF.num(s.skinMaxC, 1)) degrés")
+        HStack {
+          Text(FF.clock(s.skinSeries.first?.0)); Spacer(); Text(FF.clock(s.skinSeries.last?.0))
+        }
+        .font(Forme.sans(12, .medium, relativeTo: .caption)).foregroundStyle(Forme.muted)
+      }
+      HStack(spacing: 8) {
+        MiniStat(label: "Peau ≥ 38 °C", value: s.skinAbove38Min.map { "\($0)" } ?? "—", unit: "min")
+        MiniStat(label: "Pouls à l'entrée", value: FF.num(s.hrStart), unit: "bpm")
+        MiniStat(label: "Pouls max", value: FF.num(s.hrMax), unit: "bpm")
+      }
     }
     .padding(.top, 12)
   }
@@ -402,7 +430,7 @@ struct FormeStartSheet: View {
       Toggle(isOn: $sport.enabled) {
         VStack(alignment: .leading, spacing: 1) {
           Text("Détection automatique").font(Forme.sans(15, .semibold)).foregroundStyle(Forme.ink)
-          Text("Course, tennis, musculation reconnus seuls").font(Forme.sans(12, .medium)).foregroundStyle(Forme.muted)
+          Text("Course, tennis, musculation reconnus seuls. 3 vibrations au départ ; tape 3 fois le bracelet dans les 10 min pour annuler.").font(Forme.sans(12, .medium)).foregroundStyle(Forme.muted)
         }
       }
       .tint(Forme.ink)
@@ -451,6 +479,8 @@ struct FormeLiveSessionView: View {
           MetricTile(label: "Séries · rép.", value: "\(sport.current["sets_last10"] as? Int ?? 0) · \(sport.current["reps_last10"] as? Int ?? 0)", note: "10 dernières minutes")
         case .tennis:
           MetricTile(label: "Frappes", value: "\(sport.current["strokes_last10"] as? Int ?? 0)", note: "10 dernières minutes")
+        case .sauna:
+          MetricTile(label: "Température", value: "—", note: "Courbe après la synchro")
         case .autre:
           MetricTile(label: "Type probable", value: SportKind.of(sport.current["guess"] as? String).title, note: (sport.current["guess_p"] as? Double).map { "\(Int($0 * 100)) %" })
         }

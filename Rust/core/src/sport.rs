@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 use crate::dsp::{mean, median, percentile, round};
 use crate::GooseResult;
 
+pub mod heat;
+
 pub const ENGINE_VERSION: &str = "sport-3"; // 3: neutral-palm walking excluded, strength signature = 3 named sets + cardiac load; 2: repetition-based sets
 pub const RULES_MODEL: &str = "rules-v1";
 pub const CLASSES: [&str; 4] = ["course", "tennis", "musculation", "autre"];
@@ -425,6 +427,54 @@ pub fn strokes(imu: &Imu) -> Vec<(f64, f64, f64)> {
                 }
             }
             _ => out.push((imu.t[i], gm[i], amax)),
+        }
+    }
+    out
+}
+
+/// Sharp accelerometer spikes from tapping the strap housing. Sensor session 12 Nov (arm flat):
+/// taps are 3-12 g peaks only 1-2 samples wide at 100 Hz (the third tap of a triple can be weak,
+/// ~3 g); shaking the hand, walking, gym and daily life give wider peaks (>= 3 samples above half
+/// the peak within +-50 ms). Returns (time, peak g, sharp).
+fn accel_spikes(imu: &Imu) -> Vec<(f64, f64, bool)> {
+    let n = imu.len();
+    let am: Vec<f64> = (0..n).map(|i| (imu.a[0][i].powi(2) + imu.a[1][i].powi(2) + imu.a[2][i].powi(2)).sqrt()).collect();
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i + 1 < n {
+        if am[i] >= TAP_MIN_G {
+            let lo = i.saturating_sub(5);
+            let hi = (i + 5).min(n - 1);
+            if (lo..=hi).all(|j| am[j] <= am[i]) {
+                let wide = (lo..=hi).filter(|&j| am[j] > 0.5 * am[i]).count();
+                out.push((imu.t[i], am[i], wide <= 2));
+                i += 6;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+const TAP_MIN_G: f64 = 2.5;
+
+/// Deliberate triple taps on the strap: exactly three sharp spikes, 0.2-0.8 s apart, with no other
+/// spike (sharp or not) within 1 s before the first or after the last, so running impacts, sets,
+/// shaking and four or more taps never match. Returns the time of each third tap.
+pub fn triple_taps(imu: &Imu) -> Vec<f64> {
+    let s = accel_spikes(imu);
+    let mut out = Vec::new();
+    for k in 0..s.len().saturating_sub(2) {
+        let (a, b, c) = (s[k], s[k + 1], s[k + 2]);
+        let gap_ok = |x: f64| (0.2..=0.8).contains(&x);
+        if !(a.2 && b.2 && c.2 && gap_ok(b.0 - a.0) && gap_ok(c.0 - b.0)) {
+            continue;
+        }
+        let before = k == 0 || a.0 - s[k - 1].0 > 1.0;
+        let after = k + 3 >= s.len() || s[k + 3].0 - c.0 > 1.0;
+        if before && after {
+            out.push(c.0);
         }
     }
     out
@@ -1348,6 +1398,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
     let session_id = st["session_id"].as_str().map(String::from);
     let mut next = state.clone();
     let mut event: Option<&str> = None;
+    let mut cancelled: Option<String> = None;
     if args.paused && !manual {
         if state != "idle" && state != "active" && state != "ending" {
             next = "idle".into();
@@ -1363,7 +1414,12 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                 }
             }
             "watch" => {
-                let sig = signature(&mins, &p, &imu, &steps_per_second(&secs), now);
+                let mut sig = signature(&mins, &p, &imu, &steps_per_second(&secs), now);
+                // a sauna raises the heart rate without effort: it is reported as a sauna instead
+                if sig["by"] == "effort soutenu" && heat::hot_now(&conn, now)? {
+                    sig["confirmed"] = json!(false);
+                    sig["by"] = json!("chaleur");
+                }
                 st["signature"] = sig.clone();
                 let quiet_watch = recent(8).iter().all(|v| *v <= 0.35);
                 if active_recent(6) >= 3 && sig["confirmed"].as_bool() == Some(true) {
@@ -1384,6 +1440,9 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                     let id = new_session(&conn, start - PRE_BUFFER_S, "auto", None, now)?;
                     st["session_id"] = json!(id);
                     st["active_start"] = json!(start);
+                    // the phone vibrates now; taps after the vibration may cancel the session
+                    st["tap_from"] = json!(now + TAP_ALERT_S);
+                    st["tap_until"] = json!(now + TAP_CANCEL_WINDOW_S);
                     next = "active".into();
                     event = Some("start");
                 } else if quiet_watch || now - st["watch_since"].as_i64().unwrap_or(now) > 20 * 60 {
@@ -1392,6 +1451,17 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                     next = "idle".into();
                     event = Some("watch_dropped");
                 }
+            }
+            "active" | "ending" if !manual && tap_cancel_requested(&imu, &st, now) => {
+                // triple tap on the strap after the start alert: detection mistake, session removed
+                if let Some(id) = &session_id {
+                    remove_session(&conn, id, now, "triple_tap")?;
+                }
+                cancelled = session_id.clone();
+                // "after" too: a later session cannot be backdated into the cancelled minutes
+                st = json!({"state": "idle", "cooldown_until": now + TAP_CANCEL_COOLDOWN_S, "after": now + TAP_CANCEL_COOLDOWN_S});
+                next = "idle".into();
+                event = Some("cancelled");
             }
             "active" | "ending" => {
                 let last_active = scores.iter().rev().find(|s| s.1 > 0.5).map(|s| s.0).unwrap_or(st["last_active"].as_i64().unwrap_or(now));
@@ -1448,7 +1518,17 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
     }
     st["state"] = json!(next);
     state_set(&conn, "engine", &st)?;
+    // saunas, from the R18 temperatures (every 5 min, last 6 h): stored as ended sessions
+    let mut saunas: Vec<String> = Vec::new();
+    if !args.replay {
+        let last = state_get(&conn, "heat")?.and_then(|v| v["checked"].as_i64()).unwrap_or(0);
+        if now - last >= 300 {
+            saunas = heat::sync(&conn, now - 6 * 3600, now + 1, p.rest, now)?;
+            state_set(&conn, "heat", &json!({"checked": now}))?;
+        }
+    }
     let want = matches!(next.as_str(), "watch" | "active" | "ending");
+    let tap_cancel_open = matches!(next.as_str(), "active" | "ending") && !manual && now <= st["tap_until"].as_i64().unwrap_or(0) + TAP_LATE_S;
     let live_session = st["session_id"].as_str().map(String::from);
     let current = match &live_session {
         Some(id) if next != "idle" => {
@@ -1465,7 +1545,7 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
         _ => Value::Null,
     };
     Ok(json!({
-        "state": next, "event": event, "want_streams": want, "sync_interval_s": if want { 120 } else { 300 },
+        "state": next, "event": event, "want_streams": want, "tap_cancel_open": tap_cancel_open, "cancelled": cancelled, "saunas": saunas, "sync_interval_s": if want { 120 } else { 300 },
         "data_until": data_until, "lag_s": now - data_until, "minute_scores": scores.iter().rev().take(10).map(|s| json!([s.0, round(s.1, 2)])).collect::<Vec<_>>(),
         "current": current, "analysis": analysis, "signature": st["signature"].clone(), "stored": {"live": stored.0, "imu": stored.1},
         "profile": {"rest": round(p.rest, 0), "hrmax": round(p.hrmax, 0)}, "engine_version": ENGINE_VERSION,
@@ -1765,6 +1845,7 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
     }
     let conn = Connection::open(&args.database_path)?;
     state_set(&conn, "engine", &saved.unwrap_or_else(|| json!({"state": "idle"})))?;
+    let saunas = heat::sync(&conn, from, to, p.rest, now)?;
     state_set(&conn, "backfill", &json!({"done_until": to, "at": now}))?;
     let mut labelled = 0;
     for l in &args.labels {
@@ -1784,7 +1865,7 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
         .prepare("SELECT id, start_ts, end_ts, status, source, predicted_type, probs_json, confidence, summary_json, model_version, label_type, label_status FROM sport_sessions WHERE start_ts >= ?1 AND start_ts <= ?2 ORDER BY start_ts")?
         .query_map(params![from - 3600, to], row_session)?
         .collect::<Result<_, _>>()?;
-    Ok(json!({"from": from, "to": to, "windows": windows.len(), "replayed": replayed, "labelled": labelled, "sessions": sessions}))
+    Ok(json!({"from": from, "to": to, "windows": windows.len(), "replayed": replayed, "labelled": labelled, "sessions": sessions, "saunas": saunas}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1796,19 +1877,53 @@ pub struct DeleteArgs {
 /// Removes a session started by mistake (and its segments). The deletion itself is kept in
 /// sport_annotations so the dataset history stays auditable; the exported folder is removed at
 /// the next export. Deleting the running session stops it.
+/// Removes a session and its segments; the deletion stays in the annotation log (old type, who
+/// removed it: "app" button or "triple_tap" on the strap).
+fn remove_session(conn: &Connection, id: &str, now: i64, by: &str) -> GooseResult<()> {
+    let row: Option<(String, Option<String>)> = conn.query_row("SELECT COALESCE(label_type, predicted_type, ''), source FROM sport_sessions WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let Some((ty, source)) = row else { return Ok(()) };
+    conn.execute(
+        "INSERT INTO sport_annotations (ts, target, target_id, field, old_value, new_value, engine_version, source) VALUES (?1, 'session', ?2, 'deleted', ?3, ?4, ?5, ?6)",
+        params![now, id, ty, if by == "app" { None } else { Some(by) }, ENGINE_VERSION, source.unwrap_or_default()],
+    )?;
+    conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [id])?;
+    conn.execute("DELETE FROM sport_sessions WHERE id = ?1", [id])?;
+    conn.execute("UPDATE sport_acquisition SET session_id = NULL WHERE session_id = ?1", [id])?;
+    Ok(())
+}
+
+/// Auto-start alert (3 strong vibrations) then a 10-minute window in which a triple tap on the
+/// strap cancels the session. Taps are only counted once the vibration is over (it shakes the
+/// accelerometer), and the session cannot restart for 30 minutes after a cancel.
+const TAP_ALERT_S: i64 = 8;
+const TAP_CANCEL_WINDOW_S: i64 = 10 * 60;
+/// live IMU reaches the engine at the next tick: taps made before the window end are still read
+const TAP_LATE_S: i64 = 120;
+const TAP_CANCEL_COOLDOWN_S: i64 = 30 * 60;
+
+fn tap_cancel_requested(imu: &Imu, st: &Value, now: i64) -> bool {
+    let (Some(from), Some(until)) = (st["tap_from"].as_i64(), st["tap_until"].as_i64()) else { return false };
+    if now > until + TAP_LATE_S || imu.is_empty() {
+        return false;
+    }
+    let i0 = imu.t.partition_point(|t| *t < from as f64);
+    let i1 = imu.t.partition_point(|t| *t <= until as f64);
+    if i1 <= i0 {
+        return false;
+    }
+    let part = Imu { t: imu.t[i0..i1].to_vec(), a: [0, 1, 2].map(|k| imu.a[k][i0..i1].to_vec()), g: [0, 1, 2].map(|k| imu.g[k][i0..i1].to_vec()) };
+    !triple_taps(&part).is_empty()
+}
+
 pub fn delete_session(args: &DeleteArgs) -> GooseResult<Value> {
     let conn = Connection::open(&args.database_path)?;
     ensure_tables(&conn)?;
     let now = now_s();
     let row: Option<(String, Option<String>)> = conn.query_row("SELECT COALESCE(label_type, predicted_type, ''), source FROM sport_sessions WHERE id = ?1", [&args.id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    let Some((ty, source)) = row else { return Ok(json!({"ok": false, "reason": "not_found"})) };
-    conn.execute(
-        "INSERT INTO sport_annotations (ts, target, target_id, field, old_value, new_value, engine_version, source) VALUES (?1, 'session', ?2, 'deleted', ?3, NULL, ?4, ?5)",
-        params![now, args.id, ty, ENGINE_VERSION, source.unwrap_or_default()],
-    )?;
-    conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [&args.id])?;
-    conn.execute("DELETE FROM sport_sessions WHERE id = ?1", [&args.id])?;
-    conn.execute("UPDATE sport_acquisition SET session_id = NULL WHERE session_id = ?1", [&args.id])?;
+    if row.is_none() {
+        return Ok(json!({"ok": false, "reason": "not_found"}));
+    }
+    remove_session(&conn, &args.id, now, "app")?;
     let mut stopped = false;
     if let Some(st) = state_get(&conn, "engine")? {
         if st["session_id"].as_str() == Some(args.id.as_str()) {
@@ -1840,8 +1955,8 @@ pub fn list(args: &ListArgs) -> GooseResult<Value> {
     ensure_tables(&conn)?;
     // a newer engine re-analyses finished sessions once (human-labelled segments are kept)
     let stale: Vec<String> = conn
-        .prepare("SELECT id FROM sport_sessions WHERE status = 'ended' AND engine_version != ?1")?
-        .query_map([ENGINE_VERSION], |r| r.get(0))?
+        .prepare("SELECT id FROM sport_sessions WHERE status = 'ended' AND engine_version != ?1 AND source != ?2")?
+        .query_map([ENGINE_VERSION, heat::SAUNA_SOURCE], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     let reanalyzed = stale.len();
     for id in stale {
@@ -2171,6 +2286,177 @@ mod tests {
         assert_eq!(ty, "course");
     }
 
+    /// arm flat (1 g on Z) with one-sample tap spikes at the given times
+    fn taps_at(times: &[f64], secs: f64, peak: f64) -> Imu {
+        let times = times.to_vec();
+        imu_from(move |t| {
+            let z = if times.iter().any(|x| (t - x).abs() < 0.005) { peak } else { 1.0 };
+            ([0.0, 0.0, z], [0.0; 3])
+        }, secs)
+    }
+
+    #[test]
+    fn triple_tap_detected_and_isolated() {
+        assert_eq!(triple_taps(&taps_at(&[3.0, 3.45, 3.9], 6.0, 7.0)).len(), 1);
+        // a weak third tap (sensor session: ~3 g) still counts
+        assert_eq!(triple_taps(&taps_at(&[3.0, 3.42, 3.92], 6.0, 3.0)).len(), 1);
+        // double tap, four taps, taps too slow, a running-like impact train: no cancel
+        assert!(triple_taps(&taps_at(&[3.0, 3.32], 6.0, 7.0)).is_empty());
+        assert!(triple_taps(&taps_at(&[3.0, 3.4, 3.8, 4.2], 6.0, 7.0)).is_empty());
+        assert!(triple_taps(&taps_at(&[2.0, 3.0, 4.0], 6.0, 7.0)).is_empty());
+        let train: Vec<f64> = (0..20).map(|i| 1.0 + 0.36 * i as f64).collect();
+        assert!(triple_taps(&taps_at(&train, 10.0, 6.0)).is_empty());
+        // wide peaks (hand shaking, 6 Hz with 8 g swings) are not taps
+        let shake = imu_from(|t| ([0.0, 0.0, 1.0 + 7.0 * (2.0 * std::f64::consts::PI * 6.0 * t).sin().max(0.0)], [0.0; 3]), 6.0);
+        assert!(triple_taps(&shake).is_empty());
+    }
+
+    #[test]
+    fn tap_cancel_only_after_alert_and_inside_window() {
+        let imu = taps_at(&[20.0, 20.4, 20.8], 40.0, 7.0);
+        let t0 = 1_800_000_000;
+        let st = |from: i64, until: i64| json!({"tap_from": from, "tap_until": until});
+        assert!(tap_cancel_requested(&imu, &st(t0 + 10, t0 + 600), t0 + 30));
+        // taps during the alert vibration, or after the window, do not count
+        assert!(!tap_cancel_requested(&imu, &st(t0 + 21, t0 + 600), t0 + 30));
+        assert!(!tap_cancel_requested(&imu, &st(t0 - 600, t0 + 10), t0 + 30));
+        assert!(!tap_cancel_requested(&imu, &json!({}), t0 + 30));
+    }
+
+    /// End to end, as on the phone: auto start, then the real tap frames of the 12 Nov sensor session
+    /// (double tap, pause, triple tap) re-stamped and sent as live IMU through `update`.
+    #[test]
+    #[ignore]
+    fn triple_tap_cancels_auto_session_end_to_end() {
+        let Ok(path) = std::env::var("GOOSE_SENSOR_TSV") else { return };
+        let phase = |want: &str| -> Vec<Vec<u8>> {
+            std::fs::read_to_string(&path).unwrap().lines().skip(1).filter_map(|line| {
+                let c: Vec<&str> = line.split('\t').collect();
+                let b = hex::decode(c[3]).ok()?;
+                (format!("{}|{}", c[1], c[2]) == want && b.len() == 1244 && b[8] == 43).then_some(b)
+            }).collect()
+        };
+        // R21 strap time = payload bytes 7..11 (+ 1/32768 s at 11..13); new CRCs
+        let restamp = |frames: &[Vec<u8>], at: i64| -> Vec<(f64, String)> {
+            let base = u32::from_le_bytes(frames[0][15..19].try_into().unwrap()) as i64;
+            frames.iter().map(|f| {
+                let mut pl = f[8..f.len() - 4].to_vec();
+                let ts = u32::from_le_bytes(pl[7..11].try_into().unwrap()) as i64 - base + at;
+                pl[7..11].copy_from_slice(&(ts as u32).to_le_bytes());
+                // same header (length unchanged), new payload CRC-32
+                let mut fr = f[..8].to_vec();
+                fr.extend_from_slice(&pl);
+                fr.extend_from_slice(&crc32fast::hash(&pl).to_le_bytes());
+                (ts as f64, hex::encode(fr))
+            }).collect()
+        };
+        let original = phase("P2_imu_live|4");
+        assert_eq!(original.len(), 10);
+        assert_eq!(hex::decode(&restamp(&original, u32::from_le_bytes(original[0][15..19].try_into().unwrap()) as i64)[0].1).unwrap(), original[0], "frame rebuild");
+
+        let run = |imu_phase: &str, offset: i64| -> (Vec<(i64, String, Value)>, Connection, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.keep().join("t.sqlite");
+            let conn = Connection::open(&db).unwrap();
+            ensure_tables(&conn).unwrap();
+            crate::whoop5_store::ensure_tables(&conn).unwrap();
+            let t0: i64 = 1_800_000_000;
+            for t in t0..t0 + 4000 {
+                let on = (300..3600).contains(&(t - t0));
+                conn.execute(
+                    "INSERT INTO whoop5_r18 (ts, record_index, frame_id, hr, rr_ms, steps, dyn_accel_g, activity, band_state, decoder_version) VALUES (?1, ?2, 'f', ?3, '', ?4, ?5, ?6, 'wake', 'v')",
+                    params![t, t - t0, if on { 150 } else { 55 }, ((t - t0) * if on { 3 } else { 0 }) % 65536, if on { 0.3 } else { 0.01 }, if on { "run" } else { "still" }],
+                ).unwrap();
+            }
+            let dbs = db.to_string_lossy().to_string();
+            let mut log = Vec::new();
+            let mut start_at = None;
+            let mut sid = String::new();
+            let mut now = t0 + 60;
+            while now < t0 + 3600 {
+                let mut imu = vec![];
+                if let Some(s) = start_at {
+                    // taps sent `offset` s after the start alert, arriving at the next tick
+                    if (now - 30..now).contains(&(s + offset)) {
+                        imu = restamp(&phase(imu_phase), s + offset);
+                    }
+                }
+                let r = update(&UpdateArgs { database_path: dbs.clone(), now_unix: Some(now), live: vec![], imu, age: Some(30.0), capturing: true, paused: false, history_lag_s: None, replay: false }).unwrap();
+                if r["event"] == "start" && start_at.is_none() {
+                    start_at = Some(now);
+                    sid = r["current"]["id"].as_str().unwrap().to_string();
+                }
+                log.push((now - t0, r["state"].as_str().unwrap().to_string(), json!({"event": r["event"], "tap_open": r["tap_cancel_open"], "cancelled": r["cancelled"], "want": r["want_streams"], "stored_imu": r["stored"]["imu"]})));
+                now += if start_at.is_some() && r["tap_cancel_open"] == true { 5 } else { 30 };
+            }
+            (log, conn, sid)
+        };
+
+        // 1) triple tap 60 s after the alert: cancelled, session gone, streams off, no restart
+        let (log, conn, sid) = run("P2_imu_live|4", 60);
+        let start = log.iter().find(|l| l.2["event"] == "start").expect("auto start");
+        let cancel = log.iter().find(|l| l.2["event"] == "cancelled").expect("cancelled");
+        println!("start at +{} s, cancel at +{} s ({} s after the alert): {}", start.0, cancel.0, cancel.0 - start.0, cancel.2);
+        assert_eq!(cancel.1, "idle");
+        assert_eq!(cancel.2["cancelled"].as_str(), Some(sid.as_str()), "sid {sid}");
+        assert_eq!(cancel.2["want"], false);
+        assert!(cancel.0 - start.0 <= 60 + 30 + 5, "latency");
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM sport_sessions WHERE id = ?1", [&sid], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+        let note: String = conn.query_row("SELECT new_value FROM sport_annotations WHERE target_id = ?1 AND field = 'deleted'", [&sid], |r| r.get(0)).unwrap();
+        assert_eq!(note, "triple_tap");
+        // still running afterwards: nothing for 30 min, then a new session that starts after the cooldown
+        let restart = log.iter().find(|l| l.0 > cancel.0 && l.2["event"] == "start");
+        assert!(restart.is_none_or(|l| l.0 >= cancel.0 + TAP_CANCEL_COOLDOWN_S), "cooldown");
+        let starts: Vec<i64> = conn.prepare("SELECT start_ts FROM sport_sessions").unwrap().query_map([], |r| r.get(0)).unwrap().flatten().collect();
+        let cancel_ts = 1_800_000_000 + cancel.0;
+        println!("restart at +{:?} s, session starts {:?} (cancel at {cancel_ts})", restart.map(|l| l.0), starts.iter().map(|t| t - cancel_ts).collect::<Vec<_>>());
+        assert!(starts.iter().all(|t| *t >= cancel_ts + TAP_CANCEL_COOLDOWN_S - PRE_BUFFER_S), "backdated into the cancelled minutes");
+
+        // 2) shaking the hand instead of tapping: the session goes on
+        let (log, conn, sid) = run("P2_imu_live|5", 60);
+        assert!(log.iter().all(|l| l.2["event"] != "cancelled"));
+        let st: String = conn.query_row("SELECT status FROM sport_sessions WHERE id = ?1", [&sid], |r| r.get(0)).unwrap();
+        println!("shake: session {sid} status {st}");
+
+        // 3) taps after the 10-minute window: ignored
+        let (log, _, _) = run("P2_imu_live|4", 11 * 60);
+        assert!(log.iter().all(|l| l.2["event"] != "cancelled"));
+        println!("taps after the window: no cancel");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_triple_taps() {
+        // sensor session 12 Nov (step "tape deux fois, pause, puis trois fois") and every IMU second
+        // stored on the phone (daily life, gym, sessions): one triple, and none elsewhere
+        let sp = std::env::var("GOOSE_SENSOR_TSV").ok();
+        if let Some(path) = sp {
+            let mut by: BTreeMap<String, Imu> = BTreeMap::new();
+            for line in std::fs::read_to_string(path).unwrap().lines().skip(1) {
+                let c: Vec<&str> = line.split('\t').collect();
+                let Ok(b) = hex::decode(c[3]) else { continue };
+                if b.len() != 1244 || b[8] != 43 { continue }
+                if let Some(r) = crate::whoop5_records::decode_r21(&b[8..b.len() - 4]) { by.entry(format!("{}|{}", c[1], c[2])).or_default().push_record(&r); }
+            }
+            for (k, imu) in &by {
+                println!("{k}: {} triple(s)", triple_taps(imu).len());
+                assert_eq!(triple_taps(imu).len(), usize::from(k == "P2_imu_live|4"), "{k}");
+            }
+        }
+        if let Ok(db) = std::env::var("GOOSE_DB") {
+            let conn = Connection::open_with_flags(format!("file:{db}?immutable=1"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
+            let mut imu = Imu::default();
+            let mut q = conn.prepare("SELECT frame FROM sport_imu ORDER BY ts").unwrap();
+            for f in q.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap().flatten() {
+                if f.len() < crate::whoop5_records::HEADER_LEN + 4 { continue }
+                if let Some(r) = crate::whoop5_records::decode_r21(&f[crate::whoop5_records::HEADER_LEN..f.len() - 4]) { imu.push_record(&r); }
+            }
+            let spikes = accel_spikes(&imu);
+            println!("phone IMU {} s, spikes {} (sharp {}), triples {:?}", imu.len() / 100, spikes.len(), spikes.iter().filter(|s| s.2).count(), triple_taps(&imu));
+        }
+    }
+
     #[test]
     #[ignore]
     fn real_sensor_session() {
@@ -2370,3 +2656,4 @@ mod tests {
         }
     }
 }
+
