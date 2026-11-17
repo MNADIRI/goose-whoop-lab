@@ -56,6 +56,7 @@ final class MNHealthMetricRepository {
       "analysis": labResults?.raw ?? [:],
     ]
     if let sw = smartWake {
+      sw.alignWakeWithDayType()
       var cfg: [String: Any] = [
         "armed": sw.session != nil,
         "deadline": Int(sw.deadline.timeIntervalSince1970),

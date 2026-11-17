@@ -551,6 +551,13 @@ pub fn fatigue(days: &[DaySeries]) -> Value {
         (v.len() >= 5).then(|| round(100.0 * std_sample(&v).unwrap() / mean(&v).unwrap(), 1))
     };
     let mut out = composite(&[("hrv_7d_vs_swc", 0.35, hrv_z), ("rhr_7d", 0.20, rhr_z), ("acute_chronic_load", 0.25, load_z), ("sleep_debt", 0.20, debt_z)], 1.2, 0.0);
+    if hrv_z.is_none() {
+        // the 7-night window is compared with >= 5 HRV nights before it: ~12 nights in all
+        out["score"] = Value::Null;
+        out["baseline_nights"] = json!(hrv_base.len());
+        out["baseline_needed"] = json!(5);
+        out["reason"] = json!(format!("Référence VFC en cours : {}/5 nuits avant les 7 dernières", hrv_base.len().min(5)));
+    }
     out["ln_rmssd_7d"] = json!(hrv7.map(|v| round(v, 3)));
     out["rmssd_cv_7d_pct"] = json!(cv);
     out["sleep_debt_7d_h"] = json!(round(debt_h, 1));

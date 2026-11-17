@@ -317,6 +317,10 @@ final class GooseAppModel: ObservableObject {
     smartWake.attach(ble: ble)
     sport.attach(ble: ble, smartWake: smartWake, export: whoopLabExport)
     healthWidget.attach(labResults: labResults, smartWake: smartWake, sport: sport, ble: ble)
+    WeeklySummaryStore.shared.attach(labResults: labResults)
+    NightOpticsController.shared.attach(ble: ble)
+    // body composition summary at launch: profile weight from the latest weighing
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { BodyCompStore.shared.refresh() }
     whoopDataSignalPipeline = WhoopDataSignalPipeline(
       ble: ble,
       packetUIStateAggregator: packetUIStateAggregator,

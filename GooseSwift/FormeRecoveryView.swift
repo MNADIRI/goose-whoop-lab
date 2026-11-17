@@ -14,7 +14,7 @@ struct FormeRecoveryView: View {
         hero(day).padding(.top, 24)
         components(day)
         HStack(spacing: 12) {
-          MetricTile(label: "Fatigue", value: FF.num(day.fatigue), unit: "/100", note: day.fatigue.map { $0 < 40 ? "Basse · VFC et charge sur 7 j" : ($0 < 65 ? "Modérée · VFC et charge sur 7 j" : "Élevée · lève le pied") } ?? "Après 5 nuits de référence", noteColor: (day.fatigue ?? 0) < 40 ? Forme.posInk : Forme.muted)
+          MetricTile(label: "Fatigue", value: FF.num(day.fatigue), unit: "/100", note: day.fatigue.map { $0 < 40 ? "Basse · VFC et charge sur 7 j" : ($0 < 65 ? "Modérée · VFC et charge sur 7 j" : "Élevée · lève le pied") } ?? day.fatiguePending, noteColor: (day.fatigue ?? 0) < 40 ? Forme.posInk : Forme.muted)
           MetricTile(label: "VFC au réveil", value: FF.num(day.morningHRV), unit: "ms", note: "10 dernières min de sommeil")
         }
         .padding(.top, 12)

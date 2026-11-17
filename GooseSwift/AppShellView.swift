@@ -222,6 +222,8 @@ enum FormeRoute: Hashable {
   case smartWake
   case trends
   case methods
+  case bodyComposition
+  case optical
 }
 
 private struct FormeDestinations: ViewModifier {
@@ -249,6 +251,8 @@ private struct FormeDestinations: ViewModifier {
         case .smartWake: AlarmView(controller: model.smartWake, ble: model.ble)
         case .trends: FormeTrendsView(labResults: model.labResults)
         case .methods: FormeMethodsView()
+        case .bodyComposition: FormeBodyCompView(store: .shared)
+        case .optical: FormeOpticalView(labResults: model.labResults)
         }
   }
 }

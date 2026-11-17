@@ -77,6 +77,11 @@ struct FormeDay {
   var baselineStatus: String? { night["baselines"]["hrv_rmssd"]["status"].s }
   var morningHRV: Double? { night["morning_hrv"]["rmssd_ms"].d }
   var fatigue: Double? { indices["fatigue"]["score"].d }
+  /// why the fatigue index is not computed yet: the 7 last nights need >= 5 HRV nights before them
+  var fatiguePending: String {
+    guard let n = indices["fatigue"]["baseline_nights"].i else { return "Référence en cours" }
+    return "Référence \(min(n, 5))/5 nuits · ~\(max(0, 5 - n)) j"
+  }
   var vo2max: Double? { indices["vo2max"]["ml_kg_min"].d }
   var banister: (atl: Double?, ctl: Double?, tsb: Double?) {
     let b = indices["fatigue"]["banister"]

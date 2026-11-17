@@ -237,6 +237,33 @@ final class SmartWakeController: ObservableObject {
     return GooseBLEClient.nextFutureAlarmDate(from: latest)
   }
 
+  /// When nothing is armed, the picker follows the kind of morning ahead: the time last chosen for
+  /// weekdays or for weekends. 15 Nov: Sunday's 10:00 alarm stayed in the picker, so Monday's
+  /// recommended bedtime (widget, Sommeil) was computed for a 10:00 wake (~01:30) until the 07:05
+  /// alarm was armed at 22:36.
+  func alignWakeWithDayType() {
+    guard session == nil else { return }
+    let cal = Calendar.current
+    let next = GooseBLEClient.nextFutureAlarmDate(from: latest)
+    guard let m = defaults.object(forKey: Self.wakeKey(next)) as? Int else { return }
+    let c = cal.dateComponents([.hour, .minute], from: latest)
+    guard (c.hour ?? 0) * 60 + (c.minute ?? 0) != m, let t = cal.date(byAdding: .minute, value: m, to: cal.startOfDay(for: Date())) else { return }
+    // the aligned time must still fall on the same kind of morning
+    guard Self.wakeKey(GooseBLEClient.nextFutureAlarmDate(from: t)) == Self.wakeKey(next) else { return }
+    latest = t
+    defaults.set(latest, forKey: Self.latestKey)
+  }
+
+  private static func wakeKey(_ morning: Date) -> String {
+    Calendar.current.isDateInWeekend(morning) ? "smartWake.wake.weekend" : "smartWake.wake.weekday"
+  }
+
+  /// remembers the picker's time for the kind of morning it applies to (next occurrence)
+  private func rememberWakeChoice() {
+    let c = Calendar.current.dateComponents([.hour, .minute], from: latest)
+    defaults.set((c.hour ?? 7) * 60 + (c.minute ?? 0), forKey: Self.wakeKey(GooseBLEClient.nextFutureAlarmDate(from: latest)))
+  }
+
   /// DISABLE_ALARM clears every strap alarm: while a session is armed and its deadline is still
   /// ahead, the deadline alarm must be sent again.
   private func strapAlarmsWereDisabled() {
@@ -274,7 +301,8 @@ final class SmartWakeController: ObservableObject {
 
   // MARK: plan
 
-  func refreshPlan() {
+  func refreshPlan(userChanged: Bool = false) {
+    if userChanged { rememberWakeChoice() } else { alignWakeWithDayType() }
     defaults.set(latest, forKey: Self.latestKey)
     let args: [String: Any] = ["database_path": HealthDataStore.defaultDatabasePath(), "latest_wake": Int(deadline.timeIntervalSince1970), "utc_offset_seconds": TimeZone.current.secondsFromGMT(), "max_advance_min": session.map { $0.maxAdvanceMin ?? 30 } ?? effectiveMaxAdvance]
     queue.async { [weak self] in
@@ -288,6 +316,7 @@ final class SmartWakeController: ObservableObject {
   func arm() {
     guard let ble else { return }
     defaults.set(latest, forKey: Self.latestKey)
+    rememberWakeChoice()
     let end = deadline
     let now = Date()
     let s = Session(id: "sw-\(Int(now.timeIntervalSince1970))", startTs: Int(now.timeIntervalSince1970), windowEnd: Int(end.timeIntervalSince1970), maxAdvanceMin: effectiveMaxAdvance)
@@ -631,7 +660,7 @@ struct AlarmView: View {
     }
     .formeScreen()
     .onAppear { controller.refreshPlan() }
-    .onChange(of: controller.latest) { _, _ in controller.refreshPlan() }
+    .onChange(of: controller.latest) { _, _ in controller.refreshPlan(userChanged: true) }
     .onChange(of: controller.mode) { _, _ in controller.refreshPlan() }
     .onChange(of: controller.maxAdvanceMin) { _, _ in controller.refreshPlan() }
     .refreshable { controller.refreshPlan() }

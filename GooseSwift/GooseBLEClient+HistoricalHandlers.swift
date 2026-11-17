@@ -100,6 +100,10 @@ extension GooseBLEClient {
         continue
       }
 
+      if payload[2] == 153 {
+        let code = Int(payload[4])
+        Task { @MainActor in NightOpticsController.shared.acknowledged(result: code) }
+      }
       lastPhysiologyCommandSummary = "\(commandName) seq \(payload[3]) \(result)"
       physiologyCaptureStatus = lastPhysiologyCommandSummary
       record(

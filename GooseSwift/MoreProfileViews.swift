@@ -227,6 +227,8 @@ struct MoreProfileView: View {
     .onAppear {
       hydrateDateOfBirth()
       hydrateMeasurementsIfNeeded()
+      // a weighing newer than the profile (InBody CSV, Santé) updates the weight shown here
+      BodyCompStore.shared.refresh()
     }
     .onChange(of: dateOfBirth) { _, newValue in
       dateOfBirthString = MoreProfileDate.dateOnlyString(MoreProfileDate.clamp(newValue))

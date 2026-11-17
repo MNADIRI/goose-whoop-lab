@@ -26,7 +26,7 @@ use crate::{optical, training, whoop5_store};
 use crate::{protocol::parse_r18_history_fields, GooseError, GooseResult};
 
 pub const RESULTS_SCHEMA: &str = "whoop-lab.results.v2";
-const ALGORITHM_VERSION: &str = "13"; // 13: awake rest windows at 45 mg / 85 % (Hildebrand sedentary); 12: unknown epochs + coverage, shared RR QC for stages, no CPC relabelling, contiguous resting HR, no SpO2 screening score, context-aware cache; 11: Banister seeded, 28-day calibration; 10: composite sleep score, awake resting vitals, strain %
+const ALGORITHM_VERSION: &str = "16"; // 16: PPG respiration needs 3 agreeing bursts, band-edge peaks rejected; 15: PPG pulse-wave template, PPG respiration (night + rest), RSA respiration series; 14: resting energy from measured fat-free mass (body composition), bmr model in day.energy; 13: awake rest windows at 45 mg / 85 % (Hildebrand sedentary); 12: unknown epochs + coverage, shared RR QC for stages, no CPC relabelling, contiguous resting HR, no SpO2 screening score, context-aware cache; 11: Banister seeded, 28-day calibration; 10: composite sleep score, awake resting vitals, strain %
 const DAY: i64 = 86_400;
 const EPOCH: i64 = 30;
 /// Awake rest windows: sedentary dynamic-acceleration cut-point and share of seconds below it.
@@ -316,9 +316,11 @@ fn respiratory_rate(samples: &[Sample]) -> Value {
         x[(s.ts - t0) as usize] = mean(&vals).unwrap_or(f64::NAN);
     }
     let mut estimates = Vec::new();
+    let mut series: Vec<Value> = Vec::new();
     let mut w0 = 0;
     while w0 + 120 < n {
         let w = &x[w0..w0 + 120];
+        let win_start = t0 + w0 as i64;
         w0 += 60;
         let known: Vec<(usize, f64)> = w.iter().copied().enumerate().filter(|(_, v)| v.is_finite()).collect();
         if (known.len() as f64) < 0.8 * 120.0 {
@@ -342,6 +344,7 @@ fn respiratory_rate(samples: &[Sample]) -> Value {
             continue;
         }
         estimates.push(k as f64 / 120.0 * 60.0);
+        series.push(json!([win_start + 60, round(k as f64 / 120.0 * 60.0, 1)]));
     }
     if estimates.len() < 5 {
         return Value::Null;
@@ -350,6 +353,7 @@ fn respiratory_rate(samples: &[Sample]) -> Value {
         "rpm": round(median(&estimates).unwrap(), 1),
         "rpm_iqr": [round(percentile(&estimates, 25.0).unwrap(), 1), round(percentile(&estimates, 75.0).unwrap(), 1)],
         "windows": estimates.len(),
+        "series": series,
     })
 }
 
@@ -732,6 +736,17 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
     let hr_by_ts: std::collections::HashMap<i64, f64> = night.iter().map(|x| (x.ts, x.hr)).collect();
     let night_optical: Vec<crate::whoop5_records::R26Record> = optical_windows.iter().filter(|w| w.ts >= s[sp.bed].ts && w.ts <= s[sp.wake].ts).cloned().collect();
     let optical = optical::summarize(&night_optical, &|t| hr_by_ts.get(&t).copied());
+    let sleep_optical: Vec<crate::whoop5_records::R26Record> = night_optical.iter().filter(|w| w.ts >= s[sp.onset].ts).cloned().collect();
+    let pulse_wave = crate::ppg::pulse_template(&sleep_optical, &|t| hr_by_ts.get(&t).copied());
+    let mut respiration = respiration;
+    let ppg_resp = crate::ppg::respiration(&sleep_optical, &|t| hr_by_ts.get(&t).copied());
+    if respiration.is_object() {
+        let agree = match (respiration["rpm"].as_f64(), ppg_resp["rpm"].as_f64()) { (Some(a), Some(b)) => json!(round(b - a, 1)), _ => Value::Null };
+        respiration["ppg"] = ppg_resp;
+        respiration["ppg_minus_rsa_rpm"] = agree;
+    } else if ppg_resp["rpm"].is_number() {
+        respiration = json!({"rpm": ppg_resp["rpm"], "source": "ppg", "ppg": ppg_resp});
+    }
     let code: String = stages.iter().map(|x| match *x { "wake" => 'W', "rem" => 'R', "deep" => 'D', "light" => 'L', _ => 'U' }).collect();
     let rr_count: usize = night.iter().map(|x| x.rr.len()).sum();
     let mut out = json!({
@@ -779,6 +794,7 @@ fn analyze_night(s: &[Sample], history: &[Value], optical_windows: &[crate::whoo
             "stages_status": "EXPERIMENTAL; not validated against PSG",
         },
         "optical": optical,
+        "pulse_wave": pulse_wave,
         "stages_rule_v1_min": {"wake": rule_counts[0], "light": rule_counts[1], "deep": rule_counts[2], "rem": rule_counts[3]},
         "hrv_spectral": {"night": hi::spectral_summary(&spec), "deep": by_stage("deep"), "light": by_stage("light"), "rem": by_stage("rem")},
         "cpc": hi::cpc_summary(&cpc_w),
@@ -1003,7 +1019,7 @@ fn cadence(s: &[Sample], extras: &std::collections::HashMap<i64, Extra>) -> Valu
     })
 }
 
-fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, resting_hr: Option<f64>, extras: &std::collections::HashMap<i64, Extra>) -> Value {
+fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, resting_hr: Option<f64>, extras: &std::collections::HashMap<i64, Extra>, body: Option<&crate::body_comp::EnergyAnchor>) -> Value {
     let covered_h = s.len() as f64 / 3600.0;
     if s.len() < 600 {
         return json!({ "coverage_h": round(covered_h, 1) });
@@ -1030,12 +1046,17 @@ fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, restin
     let rhr = resting_hr.unwrap_or_else(|| percentile(&hrs, 5.0).unwrap_or(60.0));
     let reserve = (hrmax - rhr).max(1.0);
     let mvpa = s.iter().filter(|x| (x.hr - rhr) / reserve >= 0.4).count() as f64 / 60.0;
-    // energy: resting = Mifflin-St Jeor prorated over the elapsed part of the day; active = Keytel
-    // (HR > resting + 20) minus the resting share of those minutes.
-    let w = profile.weight_kg.unwrap_or(70.0);
+    // energy: resting = BMR prorated over the elapsed part of the day; active = Keytel (HR >
+    // resting + 20) minus the resting share of those minutes. BMR = Katch-McArdle on the fat-free
+    // mass of the latest body-composition measurement taken before the end of this day (<= 120 days
+    // old), else Mifflin-St Jeor on the profile. Weight follows the same measurement.
+    let w = body.map(|b| b.weight_kg).or(profile.weight_kg).unwrap_or(70.0);
     let h = profile.height_cm.unwrap_or(175.0);
     let male = profile.sex.as_deref() != Some("female");
-    let bmr = 10.0 * w + 6.25 * h - 5.0 * age + if male { 5.0 } else { -161.0 };
+    let (bmr, bmr_model) = match body {
+        Some(b) => (crate::body_comp::katch_mcardle(b.ffm_kg), "katch_mcardle_bia"),
+        None => (10.0 * w + 6.25 * h - 5.0 * age + if male { 5.0 } else { -161.0 }, "mifflin_st_jeor"),
+    };
     // Day starts at midnight, unless the strap was not worn before (first data > 3 h after midnight,
     // e.g. the first day): then the resting share starts with the data.
     let span_start = if s[0].ts - day_start > 3 * 3600 { s[0].ts } else { day_start };
@@ -1074,7 +1095,8 @@ fn analyze_day(s: &[Sample], day_start: i64, now: i64, profile: &Profile, restin
         "strain_pct": round(100.0 * (1.0 - (-trimp / 250.0).exp()), 0),
         "hrmax_used": hrmax.round(),
         "energy": {"resting_kcal": resting_kcal.round(), "active_kcal": active_kcal.round(), "total_kcal": (resting_kcal + active_kcal).round(),
-                   "profile_defaults_used": profile.weight_kg.is_none() || profile.age.is_none()},
+                   "bmr_kcal": bmr.round(), "bmr_model": bmr_model, "body_comp_id": body.map(|b| b.id.clone()), "weight_kg_used": round(w, 1),
+                   "profile_defaults_used": (body.is_none() && profile.weight_kg.is_none()) || profile.age.is_none()},
         "hr_mean": round(mean(&hrs).unwrap_or(0.0), 1),
         "hr_min": hrs.iter().copied().fold(f64::INFINITY, f64::min),
         "hr_max": hr_max_obs,
@@ -1203,12 +1225,15 @@ fn provenance() -> Value {
         "night.respiration": p("R18 R-R", "RSA: 1 Hz tachogram, 120 s Hann periodogram, 0.13-0.45 Hz peak", "breaths/min", "INFERRED"),
         "night.skin_temp_c": p("R18 skin temperature (raw/100)", "night median; skin, not core", "degC", "DECODED_UNVALIDATED"),
         "night.recovery": p("night HRV, resting HR, respiration, efficiency", "NOOP RecoveryScorer port (winsorised EWMA baselines, logistic)", "0-100", "EXPERIMENTAL"),
+        "night.pulse_wave": p("R26 still bursts of the sleep period", "200 Hz band-limited reconstruction, beats aligned on the maximal upstroke slope, median template; rise time, width, b/a, diastolic wave", "ms / ratio", "EXPERIMENTAL"),
+        "night.respiration.ppg": p("R26 still bursts", "beat amplitude / baseline / interval modulations, 9-30 rpm, 2 of 3 agreeing", "breaths/min", "EXPERIMENTAL"),
+        "day.respiration_rest": p("R26 still bursts after waking", "same as night.respiration.ppg", "breaths/min", "EXPERIMENTAL"),
         "night.optical": p("R26 compact optical windows", "burst reconstruction, 0.5-4 Hz band-pass, ACF pulse rate checked against R18 HR", "bpm / ADC code", "EXPERIMENTAL"),
         "day.steps": p("R18 step counter", "sum of positive increments < 300/s", "steps", "DECODED_UNVALIDATED"),
         "day.edwards_trimp": p("R18 HR", "Edwards zones on %HRmax (Tanaka)", "a.u.", "EXPERIMENTAL"),
         "day.training": p("R18 HR + dynamic accel", "Karvonen %HRR, Edwards/Banister TRIMP, NOOP workout detector", "a.u.", "EXPERIMENTAL"),
         "day.stress": p("R18 HR, activity, dynamic accel", "HR elevation at rest vs 40 % HR reserve, 5-min buckets", "0-100", "EXPERIMENTAL"),
-        "day.energy": p("R18 HR + profile", "Mifflin-St Jeor resting + Keytel 2005 active", "kcal", "EXPERIMENTAL"),
+        "day.energy": p("R18 HR + profile + body composition", "Katch-McArdle on measured fat-free mass (latest prior measurement <= 120 d) else Mifflin-St Jeor resting + Keytel 2005 active", "kcal", "EXPERIMENTAL"),
         "load": p("daily Edwards TRIMP", "7 d acute, 28 d chronic, ACWR after 21 d, Foster monotony", "a.u.", "EXPERIMENTAL"),
         "night.quality_mask": p("R18 cardiac_flags bits 0/4/6", "R-R of seconds flagged as moving are dropped before HRV", "", "EXPERIMENTAL"),
         "night.firmware_resting_hr": p("R18 rr_adjacent high byte", "median / p10 during sleep, compared with ours", "bpm", "DECODED_UNVALIDATED"),
@@ -1285,7 +1310,10 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?;
-        let reuse = cached.as_ref().is_some_and(|(c, l, v, _)| *c == cnt && *l == last_ts && v == &cache_version) && day_start < today_start;
+        // a new body-composition measurement before the end of this day changes its energy
+        let body = crate::body_comp::energy_anchor(&conn, d1)?;
+        let day_version = match &body { Some(b) => format!("{cache_version}:bc{}", b.ts), None => cache_version.clone() };
+        let reuse = cached.as_ref().is_some_and(|(c, l, v, _)| *c == cnt && *l == last_ts && v == &day_version) && day_start < today_start;
         let result: Value = if let (true, Some((_, _, _, j))) = (reuse, &cached) {
             serde_json::from_str(j).unwrap_or(Value::Null)
         } else {
@@ -1300,15 +1328,18 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
             let night = analyze_night(&night_samples, &nights_hist, &optical_windows, &spo2_values, &extras);
             let day_samples = load_samples(&conn, d0, d1)?;
             let rhr = night["resting_hr_bpm"].as_f64();
-            let mut day = analyze_day(&day_samples, d0, now, &options.profile, rhr, &extras);
+            let mut day = analyze_day(&day_samples, d0, now, &options.profile, rhr, &extras, body.as_ref());
             if day.is_object() {
                 let after = night["wake_time"].as_i64().unwrap_or(d0);
                 day["rest_vitals"] = day_rest_vitals(&day_samples, after, &extras);
+                let day_optical = whoop5_store::load_r26(&conn, after.max(d0), d1)?;
+                let hr_day: std::collections::HashMap<i64, f64> = day_samples.iter().map(|x| (x.ts, x.hr)).collect();
+                day["respiration_rest"] = crate::ppg::respiration(&day_optical, &|t| hr_day.get(&t).copied());
             }
             let value = json!({ "date": key, "night": night, "day": day });
             conn.execute(
                 "INSERT OR REPLACE INTO whoop_lab_days (date_key, input_count, input_last_ts, algorithm_version, result_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![key, cnt, last_ts, cache_version, value.to_string()],
+                params![key, cnt, last_ts, day_version, value.to_string()],
             )?;
             value
         };
@@ -1375,6 +1406,7 @@ pub fn analyze(options: &AnalyzeOptions) -> GooseResult<Value> {
         "sleep_regularity": regularity,
         "circadian": circadian,
         "layer_b_ingest": serde_json::to_value(&layer_b).unwrap_or(Value::Null),
+        "optical_audit": crate::ppg::audit_db(&conn).unwrap_or(Value::Null),
         "provenance": provenance(),
         "device": {"records": total, "first": first, "last": last,
                    "coverage_pct": round(100.0 * total as f64 / ((last - first + 1) as f64).max(1.0), 1)},

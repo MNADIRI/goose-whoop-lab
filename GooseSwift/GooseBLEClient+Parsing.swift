@@ -36,6 +36,7 @@ extension GooseBLEClient {
     )
     lastBatteryLevelSample = (normalizedLevel, capturedAt)
     persistBatterySample(percent: normalizedLevel, capturedAt: capturedAt)
+    Task { @MainActor in NightOpticsController.shared.battery(percent: normalizedLevel, at: capturedAt) }
     record(
       source: "ble.metadata",
       title: sourceTitle,

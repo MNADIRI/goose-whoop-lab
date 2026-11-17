@@ -334,14 +334,12 @@ struct FormeReviewCard: View {
         }
       }
       .buttonStyle(.plain)
-      ScrollView(.horizontal, showsIndicators: false) {
-        HStack(spacing: 8) {
-          chip("Oui, \(k.title.lowercased())", filled: true) { sport.annotate("session", session.id, "confirm") }
-          ForEach(SportKind.allCases.filter { $0 != k }) { o in chip(o.title) { sport.annotate("session", session.id, "type", o.rawValue) } }
-          chip("Pas une séance") { sport.annotate("session", session.id, "reject") }
-        }
+      // chips wrap onto several lines: they always stay inside the card
+      ChipFlow(spacing: 8) {
+        chip("Oui, \(k.title.lowercased())", filled: true) { sport.annotate("session", session.id, "confirm") }
+        ForEach(SportKind.allCases.filter { $0 != k }) { o in chip(o.title) { sport.annotate("session", session.id, "type", o.rawValue) } }
+        chip("Pas une séance") { sport.annotate("session", session.id, "reject") }
       }
-      .scrollClipDisabled()
     }
     .contextMenu { Button("Supprimer la séance", systemImage: "trash", role: .destructive) { sport.delete(session.id) } }
   }
@@ -354,5 +352,44 @@ struct FormeReviewCard: View {
         .background(filled ? AnyShapeStyle(Forme.ink) : AnyShapeStyle(Forme.sunken), in: Capsule())
     }
     .buttonStyle(.plain)
+  }
+}
+
+/// Left-aligned flow layout: children keep their size and wrap to the next line at the edge.
+struct ChipFlow: Layout {
+  var spacing: CGFloat = 8
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let rows = rows(width: proposal.width ?? .infinity, subviews)
+    let h = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(rows.count - 1, 0))
+    return CGSize(width: proposal.width ?? rows.map(\.width).max() ?? 0, height: h)
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    var y = bounds.minY
+    for row in rows(width: bounds.width, subviews) {
+      var x = bounds.minX
+      for i in row.items {
+        let size = subviews[i].sizeThatFits(.unspecified)
+        subviews[i].place(at: CGPoint(x: x, y: y + (row.height - size.height) / 2), proposal: ProposedViewSize(size))
+        x += size.width + spacing
+      }
+      y += row.height + spacing
+    }
+  }
+
+  private func rows(width: CGFloat, _ subviews: Subviews) -> [(items: [Int], width: CGFloat, height: CGFloat)] {
+    var out: [(items: [Int], width: CGFloat, height: CGFloat)] = []
+    for (i, v) in subviews.enumerated() {
+      let size = v.sizeThatFits(.unspecified)
+      if let last = out.last, last.width + spacing + size.width <= width {
+        out[out.count - 1].items.append(i)
+        out[out.count - 1].width += spacing + size.width
+        out[out.count - 1].height = max(last.height, size.height)
+      } else {
+        out.append(([i], size.width, size.height))
+      }
+    }
+    return out
   }
 }

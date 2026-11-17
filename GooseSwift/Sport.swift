@@ -215,6 +215,11 @@ final class SportController: ObservableObject {
   private let queue = DispatchQueue(label: "sport.engine", qos: .utility)
   nonisolated(unsafe) private var pendingLive: [Int: (hr: Double?, rr: [Double])] = [:]
   nonisolated(unsafe) private var pendingIMU: [(Double, String)] = []
+  /// arrival of the latest live IMU frame (stream watchdog)
+  nonisolated(unsafe) private var lastIMUAt = Date.distantPast
+  /// a stream command is waiting for the strap (whenFreeForCommands gives up after 120 s)
+  private var streamsQueuedAt: Date?
+  private var lastStreamKick = Date.distantPast
   nonisolated private let lock = NSLock()
   private var timer: Timer?
   private var running = false
@@ -237,6 +242,7 @@ final class SportController: ObservableObject {
   /// the last run stopped). Labels the user gave outside the app are applied once.
   private static let seedKey = "sport.seed.v1"
   private func backfill() {
+    lastBackfill = Date()
     let seeded = UserDefaults.standard.bool(forKey: Self.seedKey)
     // 11 Nov 2026 tennis match (confirmed by the user)
     let labels: [[String: Any]] = seeded ? [] : [["ts": 1_794_398_400, "type": "tennis"]]
@@ -260,13 +266,22 @@ final class SportController: ObservableObject {
   nonisolated private func collectIMU(hex: String, at date: Date) {
     lock.lock()
     pendingIMU.append((date.timeIntervalSince1970, hex))
+    lastIMUAt = Date()
     lock.unlock()
   }
 
   func historicalSyncProgressed() {
     guard ble?.isHistoricalSyncing == false else { return }
     tick(force: true)
+    // history that arrived after a gap (strap out of range, phone off, app killed) is replayed by
+    // the retrospective detector, not only at launch; it resumes where the last run stopped and
+    // never goes past the newest synced second
+    if Date().timeIntervalSince(lastBackfill) >= 20 * 60, state == "idle" {
+      backfill()
+    }
   }
+
+  private var lastBackfill = Date.distantPast
 
   private var paused: Bool { !enabled || smartWake?.session != nil }
 
@@ -335,6 +350,22 @@ final class SportController: ObservableObject {
     if r["tap_cancel_open"] as? Bool == true {
       DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.update() }
     }
+    watchStreams()
+  }
+
+  /// The strap sometimes stops the live IMU stream (reconnection, history sync) while the app still
+  /// believes it is on: 15 Nov, a whole tennis watch got 0 s of IMU; 17 Nov, 60 % of the tap window
+  /// had none. Without a frame for 20 s, the stream request is sent again (at most every 30 s).
+  private func watchStreams() {
+    guard capturing, let ble, ble.connectionState == "ready" else { return }
+    lock.lock()
+    let last = lastIMUAt
+    lock.unlock()
+    let now = Date()
+    guard now.timeIntervalSince(last) > 20, now.timeIntervalSince(lastStreamKick) > 30 else { return }
+    lastStreamKick = now
+    ble.record(source: "sport", title: "streams.kick", body: "no IMU for \(Int(now.timeIntervalSince(last))) s")
+    sendStreams()
   }
 
   /// Auto-detected session started: three strong vibrations (two 100 % buzzes each, 0.5 s apart).
@@ -357,14 +388,30 @@ final class SportController: ObservableObject {
     guard let ble else { return }
     // the smart wake owns the streams while it is armed
     if !on, smartWake?.session != nil { capturing = false; streamsOwned = false; return }
-    typealias K = GooseBLEClient.SensorStreamCommandKind
-    let cmds: [K] = on
-      ? [K(commandNumber: 3, payload: [1], name: "TOGGLE_REALTIME_HR_ON"), K(commandNumber: 106, payload: K.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")]
-      : [K(commandNumber: 106, payload: K.revisionBoolean(false), name: "TOGGLE_IMU_MODE_OFF"), K(commandNumber: 3, payload: [0], name: "TOGGLE_REALTIME_HR_OFF")]
     capturing = on
     streamsOwned = on
-    ble.whenFreeForCommands(timeout: 120) { $0.writeSensorStreamCommands(cmds, requestedStatus: "Sport", updatePhysiologyStatus: false) }
+    if on { lastStreamKick = Date() }
     ble.record(source: "sport", title: on ? "streams.on" : "streams.off", body: "state=\(state)")
+    sendStreams()
+  }
+
+  /// One pending stream command at a time, built when the strap is free from the state wanted at
+  /// that moment: an "off" queued behind a history sync can no longer land after the next "on"
+  /// (15 Nov 19:10, watch restarted 5 s after a drop: streams left off for the whole watch).
+  private func sendStreams() {
+    guard let ble else { return }
+    if let q = streamsQueuedAt, Date().timeIntervalSince(q) < 125 { return }
+    streamsQueuedAt = Date()
+    ble.whenFreeForCommands(timeout: 120) { [weak self] ble in
+      guard let self else { return }
+      self.streamsQueuedAt = nil
+      if !self.capturing, self.smartWake?.session != nil { return }
+      typealias K = GooseBLEClient.SensorStreamCommandKind
+      let cmds: [K] = self.capturing
+        ? [K(commandNumber: 3, payload: [1], name: "TOGGLE_REALTIME_HR_ON"), K(commandNumber: 106, payload: K.revisionBoolean(true), name: "TOGGLE_IMU_MODE_ON")]
+        : [K(commandNumber: 106, payload: K.revisionBoolean(false), name: "TOGGLE_IMU_MODE_OFF"), K(commandNumber: 3, payload: [0], name: "TOGGLE_REALTIME_HR_OFF")]
+      ble.writeSensorStreamCommands(cmds, requestedStatus: "Sport", updatePhysiologyStatus: false)
+    }
   }
 
   // MARK: user actions

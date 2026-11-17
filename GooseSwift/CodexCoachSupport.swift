@@ -15,6 +15,7 @@ enum CodexLocalToolContext {
         "get_activities": getActivities(healthStore: healthStore, appModel: appModel),
         "get_capture_sessions": getCaptureSessions(appModel: appModel),
         "get_raw_session_data": getRawSessionData(appModel: appModel),
+        "get_body_composition": BodyCompStore.shared.coachPayload,
       ],
     ]
   }

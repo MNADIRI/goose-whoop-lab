@@ -6,6 +6,8 @@ struct FormeIndicatorsView: View {
   @EnvironmentObject private var model: GooseAppModel
   @EnvironmentObject private var router: AppRouter
   @ObservedObject var labResults: WhoopLabResultsStore
+  @ObservedObject private var bodyComp = BodyCompStore.shared
+  @ObservedObject private var weekly = WeeklySummaryStore.shared
   let isRoot: Bool
 
   var body: some View {
@@ -15,18 +17,25 @@ struct FormeIndicatorsView: View {
       if let day {
         signals(day).padding(.top, 24)
         HStack(spacing: 12) {
-          MetricTile(label: "Fatigue", value: FF.num(day.fatigue), unit: "/100", note: day.fatigue.map { $0 < 40 ? "Basse · pas de surentraînement" : ($0 < 65 ? "Modérée" : "Élevée") } ?? "Après 5 nuits", noteColor: (day.fatigue ?? 0) < 40 && day.fatigue != nil ? Forme.posInk : Forme.muted)
+          MetricTile(label: "Fatigue", value: FF.num(day.fatigue), unit: "/100", note: day.fatigue.map { $0 < 40 ? "Basse · pas de surentraînement" : ($0 < 65 ? "Modérée" : "Élevée") } ?? day.fatiguePending, noteColor: (day.fatigue ?? 0) < 40 && day.fatigue != nil ? Forme.posInk : Forme.muted)
           MetricTile(label: "VO₂max", value: day.vo2max.map { "≈ \(FF.num($0))" } ?? "—", unit: "ml/kg/min")
         }
         .padding(.top, 12)
         circadian(day)
         form(day)
       }
+      FormeWeeklyCard(store: weekly)
+      FormeBodyCompCard(store: bodyComp)
       device(day)
       technical
     }
-    .refreshable { labResults.refresh(force: true) }
+    .refreshable { labResults.refresh(force: true); bodyComp.refresh(); weekly.refresh() }
     .formeScreen()
+    .onAppear {
+      bodyComp.refresh()
+      // a new measurement changes the resting energy of the days after it
+      bodyComp.onMeasurementsChanged = { [weak labResults] in labResults?.refresh(force: true) }
+    }
   }
 
   private func signals(_ day: FormeDay) -> some View {
@@ -191,6 +200,8 @@ struct FormeIndicatorsView: View {
     VStack(spacing: 0) {
       SectionTitle(title: "Pour aller plus loin", subtitle: "Historique, méthodes et réglages")
       FrostCard(radius: 36, padding: 8, spacing: 0) {
+        link("Respiration et pouls", "Fréquence respiratoire, onde de pouls, SpO₂, capteurs optiques", "waveform.path.ecg", FormeRoute.optical)
+        FormeDivider().padding(.horizontal, 12)
         link("Tendances", "Toutes tes nuits et journées", "chart.xyaxis.line", FormeRoute.trends)
         FormeDivider().padding(.horizontal, 12)
         link("Méthodes et sources", "Comment chaque valeur est calculée", "function", FormeRoute.methods)
@@ -318,12 +329,24 @@ struct FormeMethodsView: View {
     ]),
     ("Journée", [
       ("Effort", "TRIMP d'Edwards sur zones de FC max (Tanaka), en % de la capacité du jour : 100 × (1 − e^(−TRIMP/250)). 50 % ≈ 1 h soutenue. Charge : 7 j contre 28 j."),
-      ("Calories", "Actives : Keytel 2005 au-dessus du repos ; totales : + métabolisme de base (Mifflin-St Jeor)."),
+      ("Calories", "Actives : Keytel 2005 au-dessus du repos, moins la part de repos de ces minutes ; totales : + métabolisme de base. Base : Katch-McArdle (370 + 21,6 × masse maigre) avec la dernière mesure de composition prise avant le jour (120 j au plus), sinon Mifflin-St Jeor sur ton profil."),
       ("Stress", "Pouls au-dessus du repos, éveillé et immobile, rapporté à la réserve cardiaque."),
       ("Pas", "Compteur du bracelet : il compte au poignet, le téléphone compte dans la poche."),
       ("Mesures du jour", "Pouls, VFC et respiration sur des fenêtres de 5 min éveillé et au calme (85 % du temps sous le seuil sédentaire du poignet) ; comparées à tes autres journées, pas à la nuit."),
-      ("Séances", "Détection sur le pouls et la signature du mouvement, puis type et exercices reconnus par l'IMU. Au départ automatique, 3 vibrations ; un triple tap sur le bracelet (3 pics brefs à 0,2–0,8 s d'écart, isolés) dans les 10 min annule la séance."),
+      ("Séances", "Détection sur le pouls et la signature du mouvement, puis type et exercices reconnus par l'IMU. Sans IMU, 7 minutes sur 10 avec un mouvement du poignet ≥ 0,5 g et 30 % de la réserve cardiaque suffisent (sports de raquette, jeux). Un mouvement périodique pendant la marche ou la course (plus de 70 pas/min) ne compte pas comme une série. Au départ automatique, 3 vibrations ; un triple tap sur le bracelet (3 pics brefs à 0,2–0,8 s d'écart, isolés) dans les 10 min annule la séance. Le flux IMU est relancé s'il se tait plus de 20 s."),
+      ("Respiration", "La nuit, deux mesures indépendantes : la variabilité du rythme cardiaque (arythmie respiratoire, fenêtres de 2 min) et l'onde de pouls (amplitude, ligne de base et intervalle des battements pendant les salves optiques immobiles, 9 à 30 resp/min, au moins 2 des 3 concordantes). En journée, la seconde méthode sur les salves immobiles. L'onde de Mayer (≈ 6 resp/min, régulation de la pression) est exclue."),
+      ("Onde de pouls", "Les salves optiques du sommeil (25 Hz) sont reconstruites à 200 Hz, les battements alignés sur leur montée la plus rapide puis moyennés (médiane) : montée systolique, onde diastolique, indice de réflexion, rapport b/a. Suivi relatif d'une nuit à l'autre ; ce n'est pas une pression artérielle."),
+      ("Capteurs optiques", "Audit des trames complètes : 5 créneaux de 2 photodiodes, convertisseur 19 bits (gamme 16/32 µA), compensation du niveau par pas de 10 nA, courant des LED par pas de 10 µA. Photocourant absolu, lumière renvoyée par mA et pulsatilité de chaque canal : LED 1 et 4 vertes (canal de pouls), LED 2 infrarouge probable (contact et SpO₂), LED 3 rouge probable (SpO₂ seulement, jamais transmise), lumière ambiante. Sans paire rouge + infrarouge transmise, pas de saturation continue."),
+      ("Semaine", "Samedi → vendredi, comparée à la semaine précédente : séances par type (hors séances écartées), dépense totale et active des jours portés au moins 12 h, pas, sommeil moyen par nuit, récupération, VFC et pouls de repos moyens. Notification le vendredi à 19 h avec les données de la dernière mise à jour."),
       ("Sauna", "Trois thermomètres dans le bracelet : la peau, et deux capteurs internes. Au sauna, le capteur côté extérieur dépasse 38 °C et passe au-dessus de la peau (la chaleur vient de l'air), pendant au moins 5 min, le pouls monte d'au moins 20 bpm au-dessus du repos, et aucune recharge n'a lieu. Entrée et sortie : montée ou chute de plus de 1 °C par minute. Un bain chaud ou un hammam donnent la même signature."),
+    ]),
+    ("Composition corporelle", [
+      ("Mesures", "Export CSV InBody (toutes les colonnes gardées, « - » = absent) ou pesées Santé. Une même pesée importée deux fois, ou vue à la fois en CSV et dans Santé, ne compte qu'une fois."),
+      ("Indices", "Masse maigre = poids − masse grasse (≠ muscle squelettique ≠ masse maigre molle). FFMI et FMI = masse / taille² (taille du profil, sinon déduite de l'IMC de l'appareil)."),
+      ("Erreur de mesure", "Écart minimal détectable à 95 % entre deux mesures : 1,96 × √2 × erreur type (graisse 0,6 kg, muscle 0,35 kg, masse maigre 0,5 kg, poids 0,5 kg). En dessous, l'écart est affiché « ≈ »."),
+      ("Recomposition", "Droite de tendance sur au moins 3 mesures et 28 jours ; une évolution n'est retenue que si elle dépasse sa marge à 95 %. Une variation de masse maigre qui suit surtout l'eau (73 % de la masse maigre) est signalée."),
+      ("Asymétrie", "Écart droite/gauche durable : plus de 5 % du même côté sur au moins 3 mesures."),
+      ("Contexte bracelet", "Sommeil, VFC, pouls de repos, effort et séances sur les 7, 28, 56 et 84 jours avant chaque mesure, jamais après. Rien n'est interpolé entre deux mesures, et la récupération du jour ne l'utilise pas."),
     ]),
   ]
 

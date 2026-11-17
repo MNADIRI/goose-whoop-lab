@@ -1260,6 +1260,15 @@ fn imu_window(imu: &Imu, from: f64) -> Imu {
 ///   strength    >= 2 periodic sets in the last 10 minutes (IMU);
 ///   sustained   >= 8 of the last 10 minutes at >= 50 % heart-rate reserve (other sports, and
 ///               days without IMU): daily-life bursts do not last that long.
+/// above this step rate (~70 steps/min) a periodic arm movement is walking or running, not a set
+const MAX_SET_STEPS_PER_S: f64 = 1.2;
+/// "mouvement soutenu": R18 dynamic acceleration and heart-rate reserve, minutes out of the last 10.
+/// History 9-17 Nov: fires on the 11 and 15 Nov tennis and a 13 Nov active hour only (walks, gym,
+/// sauna, daily life: never).
+const PLAY_DYN_G: f64 = 0.5;
+const PLAY_HRR: f64 = 0.3;
+const PLAY_MIN: usize = 7;
+
 pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, steps: &BTreeMap<i64, f64>, now: i64) -> Value {
     let last = |k: usize| -> Vec<&Minute> { mins.iter().rev().take(k).collect() };
     let run_min = last(5).iter().filter(|m| m.steps >= 140.0 || m.run_frac > 0.5).count();
@@ -1269,10 +1278,14 @@ pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, steps: &BTreeMap<i64, 
     let imu_s = w10.len() as f64 / IMU_FS;
     let strokes5 = strokes(&w5).len();
     // strength: named movements only (an unnamed periodic burst is usually walking or fidgeting),
-    // and the heart has to work (13 Nov: 3 "sets" of walking at HR 88 opened a session)
-    let sets10 = sets_and_reps_with(&w10, steps, &|_| None).iter().filter(|s| s.periodic && s.reps >= 6 && movement_family(s).is_some()).count();
+    // and the heart has to work (13 Nov: 3 "sets" of walking at HR 88 opened a session); nobody
+    // lifts while stepping: 17 Nov, a 3-minute run (2.2 steps/s) gave 3 "pull-up" sets of arm swing
+    let sets10 = sets_and_reps_with(&w10, steps, &|_| None).iter().filter(|s| s.periodic && s.reps >= 6 && s.spm < MAX_SET_STEPS_PER_S && movement_family(s).is_some()).count();
     let hrr10: Vec<f64> = last(10).iter().filter_map(|m| m.hr.map(|h| p.hrr(h))).collect();
     let load = percentile(&hrr10, 75.0).unwrap_or(0.0);
+    // racket and field sports when the live IMU is missing (15 Nov tennis: no IMU frame for 40 min):
+    // R18 wrist motion of play (0.7-1.1 g, walking 0.2-0.35 g) with the heart working, most minutes
+    let play = last(10).iter().filter(|m| m.n >= 30 && m.dyn_mean.unwrap_or(0.0) >= PLAY_DYN_G && m.hr.map(|h| p.hrr(h)).unwrap_or(0.0) >= PLAY_HRR).count();
     let kind = if run_min >= 3 {
         Some("course")
     } else if strokes5 >= 3 {
@@ -1281,10 +1294,12 @@ pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, steps: &BTreeMap<i64, 
         Some("musculation")
     } else if sustained >= 8 {
         Some("effort soutenu")
+    } else if play >= PLAY_MIN {
+        Some("mouvement soutenu")
     } else {
         None
     };
-    json!({"confirmed": kind.is_some(), "by": kind, "run_minutes": run_min, "strokes_5min": strokes5, "sets_10min": sets10, "hrr_p75_10min": round(load, 2), "sustained_minutes": sustained, "imu_s_10min": round(imu_s, 0)})
+    json!({"confirmed": kind.is_some(), "by": kind, "run_minutes": run_min, "strokes_5min": strokes5, "play_minutes": play, "sets_10min": sets10, "hrr_p75_10min": round(load, 2), "sustained_minutes": sustained, "imu_s_10min": round(imu_s, 0)})
 }
 
 // ------------------------------------------------------------------ online engine
@@ -1797,8 +1812,15 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
     let now = args.now_unix.unwrap_or_else(now_s);
     let saved = state_get(&conn, "engine")?;
     let done_until = state_get(&conn, "backfill")?.and_then(|v| v["done_until"].as_i64()).unwrap_or(0);
-    let to = now - 3600;
+    // only history the phone already holds: after a strap / phone gap the missing hours arrive by a
+    // later sync and must still be replayed then (done_until never passes the latest R18 second)
+    let has_r18: bool = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whoop5_r18'", [], |_| Ok(true)).optional()?.unwrap_or(false);
+    let synced_until: i64 = if has_r18 { conn.query_row("SELECT COALESCE(MAX(ts), 0) FROM whoop5_r18 WHERE ts <= ?1", [now + 300], |r| r.get(0))? } else { now };
+    let to = (now - 3600).min(synced_until - 30 * 60);
     let from = done_until.max(now - args.days.unwrap_or(14) * 86_400);
+    if to <= from {
+        return Ok(json!({"from": from, "to": to, "windows": 0, "replayed": 0, "labelled": 0, "sessions": [], "saunas": [], "waiting_for_history": true}));
+    }
     let p = profile(&conn, to, args.age)?;
     let mut windows: Vec<(i64, i64)> = Vec::new();
     let mut day = from;
@@ -1820,7 +1842,14 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
         let (a, b) = ((a - 20 * 60).max(from), (b + 40 * 60).min(to));
         let c = Connection::open(&args.database_path)?;
         let overlaps: i64 = c.query_row("SELECT COUNT(*) FROM sport_sessions WHERE start_ts <= ?2 AND COALESCE(end_ts, start_ts) >= ?1", params![a, b], |r| r.get(0))?;
-        if overlaps > 0 {
+        // a session the user removed (button or triple tap) is never re-created by the replay
+        // (17 Nov: the triple-tapped 10:17 bout came back as a discarded session after a relaunch)
+        let removed: i64 = c.query_row(
+            "SELECT COUNT(*) FROM sport_annotations WHERE target = 'session' AND field = 'deleted' AND CAST(substr(target_id, instr(target_id, '-') + 1) AS INTEGER) BETWEEN ?1 AND ?2",
+            params![a - 3600, b],
+            |r| r.get(0),
+        )?;
+        if overlaps > 0 || removed > 0 {
             continue;
         }
         state_set(&c, "engine", &json!({"state": "idle"}))?;
@@ -2293,6 +2322,23 @@ mod tests {
             let z = if times.iter().any(|x| (t - x).abs() < 0.005) { peak } else { 1.0 };
             ([0.0, 0.0, z], [0.0; 3])
         }, secs)
+    }
+
+    #[test]
+    fn sustained_play_without_imu_confirms_but_walking_does_not() {
+        // 15 Nov tennis, R18 only: wrist motion ~0.9 g, HR ~115 (HRR 0.47 with rest 52 / max 187)
+        let p = Profile { rest: 52.0, hrmax: 187.0 };
+        let mk = |dyn_g: f64, hr: f64| -> Vec<Minute> {
+            (0..10)
+                .map(|k| Minute { t: 1_794_769_200 + k * 60, n: 60, hr: Some(hr), steps: 100.0, cad_spm: None, dyn_mean: Some(dyn_g), dyn_p90: None, grav_var: 0.0, run_frac: 0.0, walk_frac: 0.8, sleep_frac: 0.0, imu_dyn: None })
+                .collect()
+        };
+        let now = 1_794_769_800;
+        let sig = signature(&mk(0.9, 115.0), &p, &Imu::default(), &BTreeMap::new(), now);
+        assert_eq!(sig["by"], "mouvement soutenu", "{sig}");
+        // brisk walk (0.3 g) at the same heart rate, and play at a resting heart rate: nothing
+        assert_eq!(signature(&mk(0.3, 115.0), &p, &Imu::default(), &BTreeMap::new(), now)["confirmed"], false);
+        assert_eq!(signature(&mk(0.9, 80.0), &p, &Imu::default(), &BTreeMap::new(), now)["confirmed"], false);
     }
 
     #[test]

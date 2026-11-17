@@ -2479,6 +2479,38 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(|args| crate::sport::delete_session(&args))
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "body_comp.import_csv" => request_args::<crate::body_comp::ImportCsvArgs>(&request)
+            .and_then(|args| crate::body_comp::import_csv(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "body_comp.import_healthkit" => request_args::<crate::body_comp::ImportHealthKitArgs>(&request)
+            .and_then(|args| crate::body_comp::import_healthkit(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "night_optics.plan" => request_args::<crate::night_optics::PlanArgs>(&request)
+            .and_then(|args| crate::night_optics::plan(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "night_optics.report" => request_args::<crate::night_optics::ReportArgs>(&request)
+            .and_then(|args| crate::night_optics::report(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "weekly.summary" => request_args::<crate::weekly::SummaryArgs>(&request)
+            .and_then(|args| crate::weekly::summary(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "body_comp.summary" => request_args::<crate::body_comp::SummaryArgs>(&request)
+            .and_then(|args| crate::body_comp::summary(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "body_comp.set_excluded" => request_args::<crate::body_comp::ExcludeArgs>(&request)
+            .and_then(|args| crate::body_comp::set_excluded(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "body_comp.delete" => request_args::<crate::body_comp::DeleteArgs>(&request)
+            .and_then(|args| crate::body_comp::delete(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "sport.backfill" => request_args::<crate::sport::BackfillArgs>(&request)
             .and_then(|args| crate::sport::backfill(&args))
             .map(|value| bridge_ok(&request.request_id, value))

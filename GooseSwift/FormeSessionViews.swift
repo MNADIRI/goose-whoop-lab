@@ -84,8 +84,17 @@ struct FormeSessionView: View {
         Spacer()
         VeilPill(text: statusWord(s), ink: Forme.Family.effort.pillInk)
       }
-      DotNumber(value: st.map { FF.num($0) }, size: 80, unit: st == nil ? nil : "%", unitSize: 26).padding(.top, 20)
-      Text("\(FF.clock(s.start)) – \(FF.clock(s.end)) · \(FF.dur(s.durationMin))").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426)).padding(.top, 12)
+      if kind == .sauna {
+        // in a sauna the time spent in the heat is what matters: it takes the effort's place
+        let d = saunaDuration(s.durationMin)
+        DotNumber(value: d?.value, size: 80, unit: d?.unit, unitSize: 26).padding(.top, 20)
+          .accessibilityLabel("Durée \(FF.dur(s.durationMin))")
+        Text("\(FF.clock(s.start)) – \(FF.clock(s.end))\(st.map { " · effort \(FF.num($0)) %" } ?? "")")
+          .font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426)).padding(.top, 12)
+      } else {
+        DotNumber(value: st.map { FF.num($0) }, size: 80, unit: st == nil ? nil : "%", unitSize: 26).padding(.top, 20)
+        Text("\(FF.clock(s.start)) – \(FF.clock(s.end)) · \(FF.dur(s.durationMin))").font(Forme.sans(15, .regular, relativeTo: .body)).foregroundStyle(Forme.hex(0x1c2426)).padding(.top, 12)
+      }
       Spacer(minLength: 12)
       VeilPanel {
         HStack(spacing: 8) {
@@ -116,6 +125,13 @@ struct FormeSessionView: View {
         }
       }
     }
+  }
+
+  /// "14" min, or "1:05" h past an hour
+  private func saunaDuration(_ m: Double?) -> (value: String, unit: String)? {
+    guard let m, m.isFinite, m > 0 else { return nil }
+    let t = Int(m.rounded())
+    return t >= 60 ? ("\(t / 60):\(String(format: "%02d", t % 60))", "h") : ("\(t)", "min")
   }
 
   private func pace(_ v: Double?) -> String {
