@@ -353,6 +353,13 @@ pub struct Decision {
 /// Versioned decision parameters (heuristic choices, not validated on Goose users; see
 /// docs/SMART_WAKE.md). Exposed in every engine response so a log can be re-read with its policy.
 pub const POLICY_VERSION: &str = "duration-first.v1";
+
+/// Tonight's bedtime always covers the need: wake − (need + usual latency). When that is much
+/// earlier than the habitual bedtime, the plan says so (advice to wind down earlier) but never
+/// moves the bedtime: 17 Nov, a bedtime held at 1 h before the habit (23:08 for 9 h 22 of need and
+/// a 07:05 alarm) contradicted the need shown beside it. Single rule for the app and the widget.
+pub const EARLY_BED_NOTE_MIN: f64 = 60.0;
+
 /// Waking now must beat waiting by at least this expected-cost margin.
 pub const MIN_BENEFIT: f64 = 0.003;
 /// Favourable state (P(light) + P(wake)) required on each of the last `PERSIST_EPOCHS` epochs.
@@ -1232,13 +1239,35 @@ pub fn plan(args: &PlanArgs) -> GooseResult<Value> {
     let recommended = (base + activity_add + debt_add + deep_add).clamp(420.0, 600.0).round();
     let lat: Vec<f64> = nights.iter().filter_map(|n| n["latency_min"].as_f64()).collect();
     let latency = median(&lat).unwrap_or(15.0).clamp(5.0, 45.0).round();
-    let bedtime = args.latest_wake - ((recommended + latency) * 60.0) as i64;
+    let ideal_bedtime = args.latest_wake - ((recommended + latency) * 60.0) as i64;
     // circadian check: habitual bedtime (median of past bed times, local clock)
     let off = args.utc_offset_seconds;
     let clock = |t: i64| ((t + off).rem_euclid(86_400) + 43_200) % 86_400; // noon-shifted seconds
     let beds: Vec<f64> = nights.iter().filter_map(|n| n["bed_time"].as_i64()).map(|t| clock(t) as f64).collect();
     let habitual_bed = (beds.len() >= 3).then(|| median(&beds).unwrap());
-    let early_by_min = habitual_bed.map(|h| (h - clock(bedtime) as f64) / 60.0);
+    let early_by_min = habitual_bed.map(|h| (h - clock(ideal_bedtime) as f64) / 60.0);
+    let bedtime = ideal_bedtime;
+    let habitual_hhmm = habitual_bed.map(|h| {
+        let m = ((h as i64 - 43_200).rem_euclid(86_400)) / 60;
+        format!("{:02}:{:02}", m / 60, m % 60)
+    });
+    let hhmm = |t: i64| {
+        let m = (t + off).rem_euclid(86_400) / 60;
+        format!("{:02}:{:02}", m / 60, m % 60)
+    };
+    let dur = |m: f64| {
+        let m = m.round() as i64;
+        if m >= 60 { format!("{} h {:02}", m / 60, m % 60) } else { format!("{m} min") }
+    };
+    let early = early_by_min.filter(|e| *e > EARLY_BED_NOTE_MIN);
+    let circadian_note = early.map(|e| {
+        format!(
+            "C'est {} plus tôt que ton coucher habituel ({}) : décroche dès {}, lumière basse et sans écran, pour t'endormir plus tôt que d'habitude.",
+            dur(e),
+            habitual_hhmm.clone().unwrap_or_default(),
+            hhmm(bedtime - 15 * 60)
+        )
+    });
     // expected wake if the plan is followed: the automatic window opens at onset + need
     let onset = bedtime + (latency * 60.0) as i64;
     // same window rule as the live engine: never before latest - max anticipation, no forced opening
@@ -1256,10 +1285,13 @@ pub fn plan(args: &PlanArgs) -> GooseResult<Value> {
             "deep_min": deep_add.round(), "last_deep_min": last_deep, "deep_reference_min": round(deep_ref, 0),
         },
         "latency_min": latency,
+        "latest_wake": args.latest_wake,
         "bedtime": bedtime,
         "lights_out_advice": bedtime - 15 * 60,
+        "earlier_than_usual_min": early.map(|v| v.round()),
+        "habitual_bedtime": habitual_hhmm,
         "habitual_bedtime_offset_min": early_by_min.map(|v| v.round()),
-        "circadian_note": early_by_min.filter(|v| *v > 90.0).map(|_| "Plus de 1 h 30 avant ton coucher habituel : l'endormissement risque d'être difficile, avance progressivement."),
+        "circadian_note": circadian_note,
         "expected_wake": {"window_start": win_start, "window_end": args.latest_wake, "most_likely": (win_start + args.latest_wake) / 2},
         "if_bed_now": {"sleep_possible_min": now_sleep.round(), "deficit_min": (recommended - now_sleep).max(0.0).round(), "window_start": now_win},
         "nights_used": nights.len(),
@@ -1956,4 +1988,5 @@ mod latency_real {
         assert_eq!(complete_asleep_min(&partial), None);
         assert_eq!(complete_asleep_min(&json!({"asleep_min": 450.0, "sleep_duration_status": "COMPLETE"})), Some(450.0));
     }
+
 }

@@ -48,6 +48,29 @@ extension GooseAppModel {
 
   @discardableResult
   func handleDebugCommandDeepLink(_ url: URL) -> Bool {
+    // development: gooseswift://debug-stats?hours=24 -> Documents/GooseSwift/db-stats.json
+    if ["gooseswift", "goose"].contains(url.scheme?.lowercased() ?? ""), url.host == "debug-stats" {
+      let hours = Int(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "hours" }?.value ?? "") ?? 24
+      let out = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("GooseSwift/db-stats.json").path
+      let args: [String: Any] = ["database_path": HealthDataStore.defaultDatabasePath(), "out_path": out, "hours": hours]
+      DispatchQueue.global(qos: .utility).async { [ble] in
+        let r = try? GooseRustBridge().request(method: "debug.db_stats", args: args)
+        DispatchQueue.main.async { ble.record(source: "ui", title: "debug.db_stats", body: r == nil ? "failed" : "ok") }
+      }
+      return true
+    }
+    // development: gooseswift://debug-export?hours=6 -> Documents/GooseSwift/slice.sqlite
+    if ["gooseswift", "goose"].contains(url.scheme?.lowercased() ?? ""), url.host == "debug-export" {
+      let hours = Double(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "hours" }?.value ?? "") ?? 6
+      let now = Int(Date().timeIntervalSince1970)
+      let out = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("GooseSwift/slice.sqlite").path
+      let args: [String: Any] = ["database_path": HealthDataStore.defaultDatabasePath(), "out_path": out, "from": now - Int(hours * 3600), "to": now]
+      DispatchQueue.global(qos: .utility).async { [ble] in
+        let r = try? GooseRustBridge().request(method: "debug.export_slice", args: args)
+        DispatchQueue.main.async { ble.record(source: "ui", title: "debug.export_slice", body: "\(r?["bytes"] ?? "failed")") }
+      }
+      return true
+    }
     guard ["gooseswift", "goose"].contains(url.scheme?.lowercased() ?? ""),
           url.host == "debug-command" else {
       return false

@@ -83,7 +83,9 @@ pub fn plan_from(starts: &[i64], now: i64, off: i64) -> Value {
     if let (true, Some(l)) = (night_mode, last) {
         let p: Vec<f64> = gaps.iter().rev().take(6).filter(|g| (NIGHT_GAP.0..=NIGHT_GAP.1).contains(*g)).map(|g| *g as f64).collect();
         let period = median(&p).unwrap_or(1161.0).round() as i64;
-        for k in 1..=4 {
+        // k = 0: the last synced burst still owns its "between" window half a period later (17 Nov:
+        // starting at k = 1 dropped every between window as soon as its burst was synced)
+        for k in 0..=4 {
             let b = l + k * period;
             let idx = (b as f64 / period as f64).round() as i64;
             let (kind, start) = if idx % 2 == 0 { ("aligned", b - LEAD_S) } else { ("between", b + period / 2 - WINDOW_S / 2) };
@@ -334,6 +336,15 @@ mod tests {
         let a = next.iter().find(|w| w["kind"] == "aligned").unwrap();
         let b = a["burst_ts"].as_i64().unwrap();
         assert!(a["start"].as_i64().unwrap() <= b - 30 && a["end"].as_i64().unwrap() >= b + 40 + 30);
+        // the between window of the burst just synced is still offered
+        let p_after = plan_from(&starts, l + 300, off);
+        let between_now = p_after["next"].as_array().unwrap().iter().any(|w| w["kind"] == "between" && w["burst_ts"].as_i64().unwrap() <= l + 1200);
+        let aligned_now = p_after["next"].as_array().unwrap().iter().any(|w| w["kind"] == "aligned");
+        assert!(between_now || aligned_now);
+        let lb = if (l as f64 / 1162.0).round() as i64 % 2 == 1 { l } else { l + 1162 };
+        let starts_b: Vec<i64> = starts.iter().map(|t| t + lb - l).collect();
+        let pb = plan_from(&starts_b, lb + 300, off);
+        assert!(pb["next"].as_array().unwrap().iter().any(|w| w["kind"] == "between" && w["start"].as_i64().unwrap() < lb + 1162), "{pb}");
         // stable kind across calls
         let p2 = plan_from(&starts, now + 120, off);
         let a2 = p2["next"].as_array().unwrap().iter().find(|w| w["burst_ts"] == a["burst_ts"]).unwrap();

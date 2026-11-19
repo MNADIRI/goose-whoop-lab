@@ -52,6 +52,8 @@ pub mod imu;
 pub mod optical;
 pub mod ppg;
 pub mod night_optics;
+pub mod debug_export;
+pub mod db_maintenance;
 pub mod smart_wake;
 pub mod sport;
 pub mod training;

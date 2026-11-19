@@ -425,6 +425,10 @@ extension GooseBLEClient {
     if source == "ble.perf" {
       return true
     }
+    // low-volume engines whose decisions must be checkable after the fact (a few lines an hour)
+    if ["sport", "night_optics", "db.maintenance", "smart_wake"].contains(source) {
+      return true
+    }
     if source == "ble.high_frequency_sync" {
       return true
     }
@@ -514,6 +518,10 @@ extension GooseBLEClient {
 
   func shouldPersistDiagnosticLog(_ message: GooseMessage) -> Bool {
     if message.source == "ble.perf" {
+      return true
+    }
+    // engines whose decisions must be checkable in the file afterwards (a few lines an hour)
+    if ["sport", "night_optics", "db.maintenance", "smart_wake"].contains(message.source) {
       return true
     }
     if message.source == "ble.high_frequency_sync" {

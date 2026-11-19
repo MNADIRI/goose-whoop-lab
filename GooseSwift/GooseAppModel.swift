@@ -319,6 +319,11 @@ final class GooseAppModel: ObservableObject {
     healthWidget.attach(labResults: labResults, smartWake: smartWake, sport: sport, ble: ble)
     WeeklySummaryStore.shared.attach(labResults: labResults)
     NightOpticsController.shared.attach(ble: ble)
+    DatabaseMaintenance.shared.attach(ble: ble, sport: sport, smartWake: smartWake)
+    // launched by iOS in the background (Bluetooth restore): no scene phase change will say so
+    AppForegroundState.set(background: UIApplication.shared.applicationState == .background)
+    NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { _ in AppForegroundState.set(background: true) }
+    NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil) { _ in AppForegroundState.set(background: false) }
     // body composition summary at launch: profile weight from the latest weighing
     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { BodyCompStore.shared.refresh() }
     whoopDataSignalPipeline = WhoopDataSignalPipeline(

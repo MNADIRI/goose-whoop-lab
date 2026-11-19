@@ -261,6 +261,10 @@ final class GooseBLEClient: NSObject, ObservableObject {
   var connectWatchdogWorkItem: DispatchWorkItem?
   var pendingConnectionReason: String?
   var pendingAutomaticHistoricalSyncReason: String?
+  /// automatic history syncs wait until then (database VACUUM while charging)
+  var syncHoldUntil: Date?
+  /// seconds a sync has waited for the WHOOP notification subscriptions
+  var syncNotifyWaitCount = 0
   var clientHelloSentForCurrentConnection = false
   var readySyncWorkItem: DispatchWorkItem?
   var syncClearWorkItem: DispatchWorkItem?

@@ -2487,6 +2487,18 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(|args| crate::body_comp::import_healthkit(&args))
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "db.maintain" => request_args::<crate::db_maintenance::MaintainArgs>(&request)
+            .and_then(|args| crate::db_maintenance::maintain(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "debug.db_stats" => request_args::<crate::debug_export::StatsArgs>(&request)
+            .and_then(|args| crate::debug_export::stats(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "debug.export_slice" => request_args::<crate::debug_export::SliceArgs>(&request)
+            .and_then(|args| crate::debug_export::export_slice(&args))
+            .map(|value| bridge_ok(&request.request_id, value))
+            .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
         "night_optics.plan" => request_args::<crate::night_optics::PlanArgs>(&request)
             .and_then(|args| crate::night_optics::plan(&args))
             .map(|value| bridge_ok(&request.request_id, value))

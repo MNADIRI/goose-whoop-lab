@@ -35,10 +35,25 @@ Replay 10–12 Nov (R18 only): 24 watch episodes, 23 dropped, 1 session = the te
 
 State machine: `idle → watch` (any minute > 0.35 in the last 3) · `watch → active` (≥ 3 active of 6 **and** a sport
 signature; start backdated to the first active minute, gaps ≤ 2 min, minus pre-buffer) · `watch → idle` after 8 quiet
-minutes or 20 min without signature (logged with the signature values as a negative example) · `active → ending`
+minutes or 20 min without signature, or 8 min with nothing promising (heart-rate reserve < 0.3 and no stroke, set,
+running, play or sustained minute), followed by a 15 min cool-down that only a clear effort (minute > 0.7) overrides
+(logged with the signature values as a negative example) · `active → ending`
 after 6 min quiet (rests between sets / games) · `→ ended` after 10 min quiet (end = last active minute + post-buffer) ·
 sessions shorter than 8 min are discarded (stairs, a sprint to the bus). Manual start/stop overrides everything and is a
 label.
+
+**Catch-up (`sport.backfill`)** replays history the live engine did not see (app stopped, strap out of range), up to
+10 min before the newest synced second, never into what the live engine follows. A session still open at the end of the
+synced history is dropped and its window replayed once the rest has arrived; sessions left open by an earlier replay are
+cleaned up the same way (17 Nov: the app was killed by iOS at 19:24, the 19:35 gym session sat "active" and invisible).
+
+**Type without IMU (R18 only)** — labelled sessions, active minutes: tennis ≈ 100 steps/min, firmware "walk" ~90 %,
+0.6 g; strength 45–55 steps/min, "walk"/"still" half and half, gravity path 13–21; walks 90–100 steps/min, low path.
+`rules_v1` uses these (the 15 Nov gym, typed tennis by the former rule, is now strength).
+
+**Sauna** (`sport/heat.rs`): outer sensor ≥ 37.5 °C and at or above the skin (≥ 35.5 °C) for ≥ 5 min, heart rate ≥ rest +
+20 bpm, no charging. The former +1 °C inversion missed the milder 17 Nov sauna (0.6–0.9 °C). A sport session running into
+a sauna is cut at its entry and re-analysed.
 
 ## 3. Analysis (`sport.analyze`, at the end of a session and after a type correction)
 

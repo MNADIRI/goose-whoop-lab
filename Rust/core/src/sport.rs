@@ -935,20 +935,28 @@ pub fn rules_v1(f: &BTreeMap<&str, f64>) -> Vec<f64> {
     let g = |k: &str| f.get(k).copied().unwrap_or(0.0);
     let imu = g("imu_cov") >= 0.3;
     let run = 3.0 * clamp01((g("steps_pm") - 100.0) / 50.0) + 2.0 * g("run_frac") + 1.0 * clamp01((g("cad_spm") - 140.0) / 30.0) - if imu { 1.5 * clamp01(g("strokes_pm") / 3.0) } else { 0.0 };
+    // Without IMU (R18 only), from the labelled sessions, active minutes:
+    //   tennis 11 Nov      steps 99/min, firmware "walk" 88 %, dyn 0.63 g, gravity path 31
+    //   strength 12/15/17  steps 47-55/min, walk 45-54 % (walk <-> still), dyn 0.23-0.42 g, path 13-21
+    //   walks (rejected)   steps 90-101/min, walk 83-95 %, path 6-11
+    // The former strength rule wanted < 45 steps/min: the 15 Nov gym came out as tennis (corrected
+    // by the user) and the 17 Nov one could not be strength at all.
     let tennis = if imu {
         3.0 * clamp01(g("strokes_pm") / 3.0) + 1.0 * clamp01((g("steps_pm") - 15.0) / 30.0) * clamp01((110.0 - g("steps_pm")) / 30.0) - 1.0 * g("periodic_frac")
     } else {
-        // without IMU a brisk walk has the same steps: require the intensity of a match
-        (1.5 * clamp01((g("steps_pm") - 20.0) / 30.0) * clamp01((130.0 - g("steps_pm")) / 30.0) + 1.0 * clamp01((g("dyn_cv") - 0.4) / 0.6) + 1.0 * clamp01((g("dyn_mean") - 0.3) / 0.3))
+        // a match keeps moving: walking cadence most of the time, wrist motion of play
+        (1.5 * clamp01((g("steps_pm") - 60.0) / 30.0) * clamp01((150.0 - g("steps_pm")) / 30.0) + 1.0 * clamp01((g("dyn_mean") - 0.4) / 0.3) + 1.0 * clamp01((g("walk_frac") - 0.6) / 0.25))
             * clamp01((g("hrr_mean") - 0.3) / 0.25)
     };
     let strength = if imu {
         2.0 * clamp01(g("sets_per_10min") / 2.5) + 1.5 * g("periodic_frac") + 1.0 * clamp01((25.0 - g("steps_pm")) / 25.0) - 1.0 * clamp01(g("strokes_pm") / 3.0)
     } else {
-        // sets are done standing: few steps; a walk alternates too, so steps and intensity gate it
-        (1.5 * clamp01((25.0 - g("steps_pm")) / 25.0) + 1.0 * clamp01(g("active_alt") / 0.4) + 0.7 * clamp01((g("grav_var") - 4.0) / 8.0))
-            * clamp01((45.0 - g("steps_pm")) / 20.0)
-            * clamp01((g("hrr_mean") - 0.25) / 0.2)
+        // sets standing, rests walking between stations: half the minutes "walk", half "still",
+        // few steps, the wrist turning (gravity path), the heart working
+        let mixed = clamp01(1.0 - (g("walk_frac") - 0.5).abs() / 0.3);
+        (1.5 * clamp01((80.0 - g("steps_pm")) / 30.0) + 1.0 * clamp01((g("grav_var") - 8.0) / 8.0) + 1.0 * mixed)
+            * clamp01((85.0 - g("steps_pm")) / 15.0)
+            * clamp01((g("hrr_mean") - 0.3) / 0.15)
     };
     // a walk (firmware "walk" most of the time, moderate heart rate) is "autre"
     let other = 1.2 + 1.5 * clamp01((g("walk_frac") - 0.4) / 0.3) * clamp01((0.5 - g("hrr_mean")) / 0.15);
@@ -1269,6 +1277,17 @@ const PLAY_DYN_G: f64 = 0.5;
 const PLAY_HRR: f64 = 0.3;
 const PLAY_MIN: usize = 7;
 
+/// a watch with nothing promising ends after this (s); a cool-down follows a dropped watch
+const WATCH_EARLY_DROP_S: i64 = 8 * 60;
+const WATCH_COOLDOWN_S: i64 = 15 * 60;
+
+/// some sign of a sport in the watch's signature: the heart working, or any stroke, set, running,
+/// play or sustained minute
+fn promising(sig: &Value) -> bool {
+    let n = |k: &str| sig[k].as_f64().unwrap_or(0.0);
+    n("hrr_p75_10min") >= 0.3 || n("strokes_5min") > 0.0 || n("sets_10min") > 0.0 || n("run_minutes") > 0.0 || n("play_minutes") > 0.0 || n("sustained_minutes") > 0.0
+}
+
 pub fn signature(mins: &[Minute], p: &Profile, imu: &Imu, steps: &BTreeMap<i64, f64>, now: i64) -> Value {
     let last = |k: usize| -> Vec<&Minute> { mins.iter().rev().take(k).collect() };
     let run_min = last(5).iter().filter(|m| m.steps >= 140.0 || m.run_frac > 0.5).count();
@@ -1422,7 +1441,9 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
         match state.as_str() {
             "idle" => {
                 // speculative capture on the first sign (HR reserve or sustained motion)
-                if now >= st["cooldown_until"].as_i64().unwrap_or(0) && recent(3).iter().any(|v| *v > 0.35) && data_until > now - 15 * 60 {
+                // after a dropped watch, only a clear effort reopens one within 15 min
+                let cooled = now >= st["cooldown_until"].as_i64().unwrap_or(0) || recent(3).iter().any(|v| *v > 0.7);
+                if cooled && recent(3).iter().any(|v| *v > 0.35) && data_until > now - 15 * 60 {
                     next = "watch".into();
                     st["watch_since"] = json!(now);
                     event = Some("watch");
@@ -1460,9 +1481,13 @@ pub fn update(args: &UpdateArgs) -> GooseResult<Value> {
                     st["tap_until"] = json!(now + TAP_CANCEL_WINDOW_S);
                     next = "active".into();
                     event = Some("start");
-                } else if quiet_watch || now - st["watch_since"].as_i64().unwrap_or(now) > 20 * 60 {
-                    // daily-life bursts (stairs, running to the kitchen): no sport signature
+                } else if quiet_watch || now - st["watch_since"].as_i64().unwrap_or(now) > 20 * 60 || (now - st["watch_since"].as_i64().unwrap_or(now) >= WATCH_EARLY_DROP_S && !promising(&sig)) {
+                    // daily-life bursts (stairs, running to the kitchen): no sport signature. 12-17 Nov:
+                    // 7-14 watches a day, 2-7 h of live IMU, all dropped at 20 min with a heart-rate
+                    // reserve of 0.04-0.3 (walks): nothing promising after 8 min ends the watch, and a
+                    // 15 min cool-down follows
                     if !args.replay { conn.execute("UPDATE sport_acquisition SET reason = ?1 WHERE end_ts IS NULL", [format!("watch_dropped {sig}")])?; }
+                    st["cooldown_until"] = json!(now + WATCH_COOLDOWN_S);
                     next = "idle".into();
                     event = Some("watch_dropped");
                 }
@@ -1816,7 +1841,29 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
     // later sync and must still be replayed then (done_until never passes the latest R18 second)
     let has_r18: bool = conn.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whoop5_r18'", [], |_| Ok(true)).optional()?.unwrap_or(false);
     let synced_until: i64 = if has_r18 { conn.query_row("SELECT COALESCE(MAX(ts), 0) FROM whoop5_r18 WHERE ts <= ?1", [now + 300], |r| r.get(0))? } else { now };
-    let to = (now - 3600).min(synced_until - 30 * 60);
+    // replayed up to 10 min before the newest synced second (17 Nov: the app was stopped from 19:24
+    // to 20:30 and the 19:35 session was still unreplayed at 21:00 with the former now - 1 h);
+    // never into what the live engine is following
+    let live_from = saved.as_ref().filter(|v| v["state"].as_str().unwrap_or("idle") != "idle").map(|v| {
+        v["active_start"].as_i64().or(v["watch_since"].as_i64()).unwrap_or(now) - 5 * 60
+    });
+    let to = (synced_until - 10 * 60).min(now - 10 * 60).min(live_from.unwrap_or(i64::MAX));
+    // auto sessions left open by an earlier replay that stopped mid-session (17 Nov 19:35): removed,
+    // and their window replayed again now that the rest of it is synced
+    let live_id = saved.as_ref().and_then(|v| v["session_id"].as_str().map(String::from));
+    let orphans: Vec<(String, i64)> = conn
+        .prepare("SELECT id, start_ts FROM sport_sessions WHERE status = 'active' AND source = 'auto' AND end_ts IS NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(id, _)| Some(id) != live_id.as_ref())
+        .collect();
+    let mut done_until = done_until;
+    for (id, start) in &orphans {
+        conn.execute("DELETE FROM sport_segments WHERE session_id = ?1", [id])?;
+        conn.execute("DELETE FROM sport_sessions WHERE id = ?1", [id])?;
+        done_until = done_until.min(start - 20 * 60);
+    }
     let from = done_until.max(now - args.days.unwrap_or(14) * 86_400);
     if to <= from {
         return Ok(json!({"from": from, "to": to, "windows": 0, "replayed": 0, "labelled": 0, "sessions": [], "saunas": [], "waiting_for_history": true}));
@@ -1838,6 +1885,7 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
     }
     drop(conn);
     let mut replayed = 0;
+    let mut held: Option<i64> = None;
     for (a, b) in &windows {
         let (a, b) = ((a - 20 * 60).max(from), (b + 40 * 60).min(to));
         let c = Connection::open(&args.database_path)?;
@@ -1870,12 +1918,22 @@ pub fn backfill(args: &BackfillArgs) -> GooseResult<Value> {
             let r = update(&UpdateArgs { database_path: args.database_path.clone(), now_unix: Some(t), live: vec![], imu: vec![], age: args.age, capturing: false, paused: false, history_lag_s: Some(20), replay: true })?;
             state = r["state"].as_str().unwrap_or("idle").to_string();
         }
+        if state != "idle" {
+            // still going at the end of the synced history: dropped, replayed whole by a later run
+            let c = Connection::open(&args.database_path)?;
+            let open: Vec<String> = c.prepare("SELECT id FROM sport_sessions WHERE status = 'active' AND source = 'auto' AND start_ts >= ?1")?.query_map([a], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            for id in &open {
+                c.execute("DELETE FROM sport_segments WHERE session_id = ?1", [id])?;
+                c.execute("DELETE FROM sport_sessions WHERE id = ?1", [id])?;
+            }
+            held = Some(held.map_or(a, |h: i64| h.min(a)));
+        }
         replayed += 1;
     }
     let conn = Connection::open(&args.database_path)?;
     state_set(&conn, "engine", &saved.unwrap_or_else(|| json!({"state": "idle"})))?;
     let saunas = heat::sync(&conn, from, to, p.rest, now)?;
-    state_set(&conn, "backfill", &json!({"done_until": to, "at": now}))?;
+    state_set(&conn, "backfill", &json!({"done_until": held.map_or(to, |h| h.min(to)), "at": now}))?;
     let mut labelled = 0;
     for l in &args.labels {
         let id: Option<String> = conn
@@ -2275,12 +2333,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn real_replay_watch_time() {
+        let Ok(src) = std::env::var("GOOSE_SPORT_DB") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("r.sqlite");
+        std::fs::copy(&src, &db).unwrap();
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("DELETE FROM sport_sessions; DELETE FROM sport_annotations;").unwrap();
+        drop(c);
+        // 10 Nov 00:00 -> 17 Nov 20:00 local
+        let r = replay(&ReplayArgs { database_path: db.to_string_lossy().into(), from_ts: 1_794_265_200, to_ts: 1_794_942_000, age: None }).unwrap();
+        let tl = r["timeline"].as_array().unwrap();
+        let watch = tl.iter().filter(|x| x[1] == "watch").count();
+        let watches = r["events"].as_array().unwrap().iter().filter(|e| e["event"] == "watch").count();
+        println!("watch minutes {watch}, watches {watches}");
+        for s in r["sessions"].as_array().unwrap() {
+            println!("session {}", s["id"]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_backfill_17_nov() {
+        // GOOSE_SPORT_DB: copy of whoop5_r18 up to 17 Nov 20:00 + sport_* tables (deleted on use)
+        let Ok(src) = std::env::var("GOOSE_SPORT_DB") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.sqlite");
+        std::fs::copy(&src, &db).unwrap();
+        let path = db.to_string_lossy().to_string();
+        // 20:58: history synced to 20:00; the 19:35 session left open by the 20:58 run of the old code
+        let r = backfill(&BackfillArgs { database_path: path.clone(), days: Some(1), now_unix: Some(1_794_945_498), age: None, labels: vec![] }).unwrap();
+        println!("{}", serde_json::to_string(&json!({"from": r["from"], "to": r["to"], "windows": r["windows"], "replayed": r["replayed"]})).unwrap());
+        let c = Connection::open(&db).unwrap();
+        let rows: Vec<(String, String)> = c.prepare("SELECT id, status FROM sport_sessions WHERE start_ts > 1794900000").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+        println!("sessions after: {rows:?} backfill state {:?}", state_get(&c, "backfill").unwrap());
+        // the gym bout itself, closed at 19:58
+        c.execute("INSERT INTO sport_sessions (id, start_ts, end_ts, status, source, engine_version, label_status, created_at, updated_at) VALUES ('t', 1794940560, 1794941880, 'ended', 'auto', 'x', 'pending', 0, 0)", []).unwrap();
+        let a = analyze_session(&c, "t", None).unwrap();
+        println!("{} {}", a["predicted_type"], a["probs"]);
+        for (id, from, to) in [("sp-1794741480", 1794741480, 1794745026), ("sp-1794498960", 1794498960, 1794498960 + 51 * 60), ("sp-1794394500", 1794394500, 1794394500 + 98 * 60)] {
+            let _ = (from, to);
+            if let Ok(a) = analyze_session(&c, id, None) {
+                println!("{id} {} {}", a["predicted_type"], a["probs"]);
+            }
+        }
+    }
+
+    #[test]
     fn rules_tell_running_tennis_strength_apart() {
         let base = |pairs: &[(&'static str, f64)]| -> BTreeMap<&'static str, f64> { pairs.iter().copied().collect() };
         let arg = |p: Vec<f64>| p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
         assert_eq!(CLASSES[arg(rules_v1(&base(&[("steps_pm", 165.0), ("run_frac", 0.9), ("cad_spm", 168.0), ("imu_cov", 0.9)])))], "course");
         assert_eq!(CLASSES[arg(rules_v1(&base(&[("steps_pm", 45.0), ("strokes_pm", 5.0), ("imu_cov", 0.9)])))], "tennis");
         assert_eq!(CLASSES[arg(rules_v1(&base(&[("steps_pm", 5.0), ("sets_per_10min", 2.5), ("periodic_frac", 0.8), ("imu_cov", 0.9)])))], "musculation");
+        // without IMU: the labelled sessions of 11-17 Nov (R18 active minutes)
+        let r18 = |hrr: f64, steps: f64, dyn_: f64, gv: f64, walk: f64| CLASSES[arg(rules_v1(&base(&[("hrr_mean", hrr), ("steps_pm", steps), ("dyn_mean", dyn_), ("grav_var", gv), ("walk_frac", walk), ("imu_cov", 0.0)])))];
+        assert_eq!(r18(0.67, 99.1, 0.63, 31.3, 0.88), "tennis"); // 11 Nov
+        assert_eq!(r18(0.57, 46.6, 0.23, 12.6, 0.45), "musculation"); // 12 Nov
+        assert_eq!(r18(0.44, 46.9, 0.30, 15.5, 0.47), "musculation"); // 15 Nov, was tennis
+        assert_eq!(r18(0.66, 55.1, 0.42, 20.5, 0.54), "musculation"); // 17 Nov
+        assert_eq!(r18(0.37, 101.0, 0.42, 5.5, 0.95), "autre"); // 14 Nov, rejected walk
+        assert_eq!(r18(0.34, 89.7, 0.40, 11.4, 0.83), "autre"); // 13 Nov, rejected
     }
 
     #[test]

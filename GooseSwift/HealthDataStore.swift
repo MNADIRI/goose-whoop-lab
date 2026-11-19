@@ -59,6 +59,8 @@ final class HealthDataStore: ObservableObject {
   static let restingHeartRateEstimateUpdatedAtDefaultsKey = "goose.swift.restingHeartRateEstimateUpdatedAt"
   static let restingHeartRateEstimateSourceDefaultsKey = "goose.swift.restingHeartRateEstimateSource"
 
+  private var lastHeartRateTimelineRefreshAt = Date.distantPast
+
   init() {
     algorithmDefinitions = []
     referenceDefinitions = []
@@ -71,7 +73,11 @@ final class HealthDataStore: ObservableObject {
       queue: .main
     ) { [weak self] _ in
       Task { @MainActor in
-        self?.refreshHeartRateTimeline()
+        // once a minute, on screen only (it re-scanned the day's samples every 2 s)
+        guard let self, !AppForegroundState.isBackground,
+              Date().timeIntervalSince(self.lastHeartRateTimelineRefreshAt) >= 60 else { return }
+        self.lastHeartRateTimelineRefreshAt = Date()
+        self.refreshHeartRateTimeline()
       }
     }
   }
@@ -258,7 +264,7 @@ final class HealthDataStore: ObservableObject {
         self.packetInputIsRunning = false
         switch result {
         case .success(let reports):
-          self.packetInputReports = reports
+          self.packetInputReports.merge(reports) { _, new in new }
           self.lastPacketInputRunAt = Date()
           self.packetInputsDirty = false
           self.packetInputStatus = "Bridge packet-derived inputs extracted"

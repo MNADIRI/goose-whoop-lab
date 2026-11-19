@@ -156,6 +156,8 @@ struct ParsedNotificationFrameDispatch {
 struct NotificationParseContext {
   let deviceType: String
   let healthCaptureActive: Bool
+  /// a debug physiology capture keeps the live IMU frames in the generic parse and the capture layer
+  var keepLiveIMU: Bool = false
   let overnightGuardActive: Bool
   let respiratoryPacketWatchActive: Bool
   let fallbackHeartRate: Int?

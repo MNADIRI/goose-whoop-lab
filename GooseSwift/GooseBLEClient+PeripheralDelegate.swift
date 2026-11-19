@@ -339,6 +339,10 @@ extension GooseBLEClient: CBPeripheralDelegate {
     } else {
       let state = characteristic.isNotifying ? "subscribed" : "unsubscribed"
       record(source: "ble", title: "notify.state", body: "\(characteristic.uuid.uuidString) \(state)")
+      // a sync held until the subscriptions are back starts now
+      if pendingAutomaticHistoricalSyncReason != nil, whoopNotificationsReady {
+        scheduleAutomaticHistoricalSyncIfNeeded()
+      }
     }
   }
 }

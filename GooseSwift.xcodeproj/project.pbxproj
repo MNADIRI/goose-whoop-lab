@@ -55,6 +55,7 @@
 			D1000000000000000BC00003 /* WeeklySummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000BC00003 /* WeeklySummary.swift */; };
 			D1000000000000000BC00004 /* FormeOpticalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000BC00004 /* FormeOpticalView.swift */; };
 			D1000000000000000BC00005 /* NightOptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000BC00005 /* NightOptics.swift */; };
+			D1000000000000000BC00006 /* DatabaseMaintenance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000BC00006 /* DatabaseMaintenance.swift */; };
 			D1000000000000000BC00001 /* BodyComposition.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2000000000000000BC00001 /* BodyComposition.swift */; };
 			D10000000000000000F11600 /* FormeIndicatorsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11600 /* FormeIndicatorsView.swift */; };
 			D10000000000000000F11700 /* FormeSessionViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000F11700 /* FormeSessionViews.swift */; };
@@ -212,6 +213,7 @@
 			D2000000000000000BC00003 /* WeeklySummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WeeklySummary.swift; sourceTree = "<group>"; };
 			D2000000000000000BC00004 /* FormeOpticalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeOpticalView.swift; sourceTree = "<group>"; };
 			D2000000000000000BC00005 /* NightOptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightOptics.swift; sourceTree = "<group>"; };
+			D2000000000000000BC00006 /* DatabaseMaintenance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseMaintenance.swift; sourceTree = "<group>"; };
 			D2000000000000000BC00001 /* BodyComposition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BodyComposition.swift; sourceTree = "<group>"; };
 			D20000000000000000F11600 /* FormeIndicatorsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeIndicatorsView.swift; sourceTree = "<group>"; };
 			D20000000000000000F11700 /* FormeSessionViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormeSessionViews.swift; sourceTree = "<group>"; };
@@ -410,6 +412,7 @@
 				D2000000000000000BC00003 /* WeeklySummary.swift */,
 				D2000000000000000BC00004 /* FormeOpticalView.swift */,
 				D2000000000000000BC00005 /* NightOptics.swift */,
+				D2000000000000000BC00006 /* DatabaseMaintenance.swift */,
 				D2000000000000000BC00001 /* BodyComposition.swift */,
 				D20000000000000000F11600 /* FormeIndicatorsView.swift */,
 				D20000000000000000F11700 /* FormeSessionViews.swift */,
@@ -731,6 +734,7 @@
 				D1000000000000000BC00003 /* WeeklySummary.swift in Sources */,
 				D1000000000000000BC00004 /* FormeOpticalView.swift in Sources */,
 				D1000000000000000BC00005 /* NightOptics.swift in Sources */,
+				D1000000000000000BC00006 /* DatabaseMaintenance.swift in Sources */,
 				D1000000000000000BC00001 /* BodyComposition.swift in Sources */,
 				D10000000000000000F11600 /* FormeIndicatorsView.swift in Sources */,
 				D10000000000000000F11700 /* FormeSessionViews.swift in Sources */,

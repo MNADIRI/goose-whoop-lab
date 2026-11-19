@@ -10,9 +10,13 @@
 
 use super::*;
 
-/// a minute is "hot" when the outer sensor is above this and above the skin by INVERSION_C
-const HOT_AUX_C: f64 = 38.0;
-const INVERSION_C: f64 = 1.0;
+/// a minute is "hot" when the outer sensor is above this, at or above the skin (worn normally it is
+/// 2-5 degC below), and the skin itself is hot. 17 Nov: a milder 10-minute sauna peaked at aux 1
+/// 40.2 / skin 39.4 degC, an inversion of 0.6-0.9 degC, missed by the former +1 degC above 38 degC;
+/// over 9-17 Nov this adds no other block (13 Nov charging stays out: resting heart rate)
+const HOT_AUX_C: f64 = 37.5;
+const INVERSION_C: f64 = 0.0;
+const HOT_SKIN_C: f64 = 35.5;
 /// entry / exit: the outer sensor moves faster than this (degC per minute)
 const RAMP_C_PER_MIN: f64 = 1.0;
 const MIN_HOT_MIN: usize = 5;
@@ -38,7 +42,7 @@ pub struct TempMinute {
 
 impl TempMinute {
     fn hot(&self) -> bool {
-        matches!((self.aux1, self.skin), (Some(a), Some(s)) if a >= HOT_AUX_C && a >= s + INVERSION_C && s >= 34.0)
+        matches!((self.aux1, self.skin), (Some(a), Some(s)) if a >= HOT_AUX_C && a >= s + INVERSION_C && s >= HOT_SKIN_C)
     }
 }
 
@@ -138,7 +142,7 @@ pub fn detect(mins: &[TempMinute], rest_hr: f64, charging: &[i64]) -> Vec<Sauna>
                 "profile": {"rest_hr": round(rest_hr, 0)},
                 "hr_series": inside.iter().filter_map(|m| m.hr.map(|h| json!([m.t, round(h, 0)]))).collect::<Vec<_>>(),
                 "temp_series": inside.iter().map(|m| json!([m.t, m.skin.map(|v| round(v, 2)), m.aux1.map(|v| round(v, 1))])).collect::<Vec<_>>(),
-                "method": "R18 outer sensor >= 38 degC and >= skin + 1 degC for >= 5 min, heart rate >= rest + 20 bpm, no charging",
+                "method": "R18 outer sensor >= 37.5 degC and >= skin (>= 35.5 degC) for >= 5 min, heart rate >= rest + 20 bpm, no charging",
             }),
         });
     }
@@ -177,10 +181,18 @@ pub fn sync(conn: &Connection, from: i64, to: i64, rest_hr: f64, now: i64) -> Go
         if known > 0 {
             continue;
         }
+        let cut: Vec<String> = conn
+            .prepare("SELECT id FROM sport_sessions WHERE source = 'auto' AND start_ts < ?1 AND COALESCE(end_ts, ?2) > ?1 AND status = 'ended'")?
+            .query_map(params![s.start, now], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
         conn.execute(
             "UPDATE sport_sessions SET end_ts = ?1, updated_at = ?2 WHERE source = 'auto' AND start_ts < ?1 AND COALESCE(end_ts, ?2) > ?1 AND status = 'ended'",
             params![s.start, now],
         )?;
+        // the session's figures (duration, heart rate, type) without the sauna and the way home
+        for id in &cut {
+            let _ = super::analyze_session(conn, id, None);
+        }
         conn.execute(
             "INSERT OR IGNORE INTO sport_sessions (id, start_ts, end_ts, status, source, predicted_type, probs_json, confidence, summary_json, engine_version, model_version, label_status, analyzed_at, created_at, updated_at)
              VALUES (?1, ?2, ?3, 'ended', ?4, 'sauna', ?5, ?6, ?7, ?8, 'heat-1', 'pending', ?9, ?9, ?9)",
@@ -245,6 +257,23 @@ mod tests {
         assert_eq!(s[0].summary["heat"]["skin_max_c"], 40.8);
         assert_eq!(s[0].summary["heat"]["outer_max_c"], 45.4);
         assert_eq!(s[0].summary["duration_min"], 14.0);
+    }
+
+    #[test]
+    fn detects_the_milder_17_nov_sauna() {
+        // 17 Nov 20:00-20:13 (skin, aux 1, aux 2, HR): the outer sensor only 0.6-0.9 degC above the skin
+        let rows: [(f64, f64, f64, f64); 14] = [
+            (31.6, 26.8, 29.0, 118.0), (32.7, 28.7, 29.9, 100.0), (34.0, 31.5, 32.0, 100.0), (35.4, 34.3, 34.2, 106.0),
+            (36.6, 36.2, 35.7, 115.0), (37.7, 37.9, 37.0, 118.0), (38.2, 38.8, 38.0, 118.0), (38.9, 39.5, 38.6, 121.0),
+            (39.2, 39.9, 39.0, 122.0), (39.4, 40.2, 39.3, 119.0), (38.5, 39.4, 38.9, 137.0), (36.7, 36.5, 36.6, 127.0),
+            (35.9, 34.8, 35.1, 119.0), (35.6, 33.9, 34.4, 116.0),
+        ];
+        let t0 = 1_794_945_600;
+        let mins: Vec<TempMinute> = rows.iter().enumerate().map(|(i, r)| m(t0 + 60 * i as i64, r.0, r.1, r.2, r.3)).collect();
+        let s = detect(&mins, 78.0, &[]);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].summary["heat"]["hot_minutes"], 6);
+        assert!((9.0..=12.0).contains(&s[0].summary["duration_min"].as_f64().unwrap()), "{:?}", s[0].summary["duration_min"]);
     }
 
     #[test]

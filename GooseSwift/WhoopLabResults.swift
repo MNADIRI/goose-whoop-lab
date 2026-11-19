@@ -330,11 +330,20 @@ func labDayLabel(_ date: String, style: Date.FormatStyle = .dateTime.weekday(.wi
   return parsed.formatted(style).capitalized
 }
 
+/// "yyyy-MM-dd" -> local midnight. Called many times per render of the Forme screens: a new
+/// DateFormatter per call was 25 % of the Aujourd'hui screen's CPU (17 Nov profile); cached.
+private let labDateCache = NSCache<NSString, NSDate>()
+
 func labDate(_ key: String) -> Date? {
-  let f = DateFormatter()
-  f.locale = Locale(identifier: "en_US_POSIX")
-  f.dateFormat = "yyyy-MM-dd"
-  return f.date(from: key)
+  if let d = labDateCache.object(forKey: key as NSString) { return d as Date }
+  let p = key.split(separator: "-", omittingEmptySubsequences: false)
+  guard p.count == 3, p[0].count == 4, let y = Int(p[0]), let m = Int(p[1]), let d = Int(p[2]),
+        (1...12).contains(m), (1...31).contains(d) else { return nil }
+  var cal = Calendar(identifier: .gregorian)
+  cal.timeZone = .current
+  guard let date = cal.date(from: DateComponents(year: y, month: m, day: d)) else { return nil }
+  labDateCache.setObject(date as NSDate, forKey: key as NSString)
+  return date
 }
 
 // MARK: - Building blocks

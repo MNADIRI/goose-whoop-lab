@@ -40,7 +40,8 @@ extension GooseAppModel {
     let event = result.event
     if result.droppedBytes > 0 {
       ble.record(
-        level: .warn,
+        // FD4B0007 carries unframed diagnostic chunks (hourly, ~300 B): not health data
+        level: event.characteristicUUID.hasPrefix("FD4B0007") ? .debug : .warn,
         source: "rust",
         title: "notification.frame.reassembly.dropped",
         body: "\(event.characteristicUUID) dropped=\(result.droppedBytes) buffered=\(result.bufferedBytes)"
@@ -99,7 +100,8 @@ extension GooseAppModel {
     let event = result.event
     if result.droppedBytes > 0 {
       ble.record(
-        level: .warn,
+        // FD4B0007 carries unframed diagnostic chunks (hourly, ~300 B): not health data
+        level: event.characteristicUUID.hasPrefix("FD4B0007") ? .debug : .warn,
         source: "rust",
         title: "notification.frame.reassembly.dropped",
         body: "\(event.characteristicUUID) dropped=\(result.droppedBytes) buffered=\(result.bufferedBytes)"
@@ -129,7 +131,8 @@ extension GooseAppModel {
     let event = result.event
     if result.droppedBytes > 0 {
       ble.record(
-        level: .warn,
+        // FD4B0007 carries unframed diagnostic chunks (hourly, ~300 B): not health data
+        level: event.characteristicUUID.hasPrefix("FD4B0007") ? .debug : .warn,
         source: "rust",
         title: "notification.frame.reassembly.dropped",
         body: "\(event.characteristicUUID) dropped=\(result.droppedBytes) buffered=\(result.bufferedBytes)"
@@ -164,6 +167,15 @@ extension GooseAppModel {
 
   /// whoop-lab: packet type sits at byte 8 of a V5 frame (hex chars 16..<18).
   /// 47 = historical data (R18/R20/R21/R26…), 52 = historical IMU stream.
+  /// payload type 0x2b (realtime raw) with layout 0x15 (R21 IMU)
+  static func isLiveIMUFrameHex(_ hex: String) -> Bool {
+    guard hex.count >= 20 else {
+      return false
+    }
+    let start = hex.index(hex.startIndex, offsetBy: 16)
+    return hex[start..<hex.index(start, offsetBy: 4)].lowercased() == "2b15"
+  }
+
   static func isHistoricalFrameHex(_ hex: String) -> Bool {
     guard hex.count >= 18 else {
       return false
@@ -177,9 +189,16 @@ extension GooseAppModel {
     let captureActive = activeHealthPacketCapture != nil || activeActivityPersistence != nil
     // whoop-lab: history arrives in bursts; the walk-mode 0.1 s throttle would drop most of it,
     // so historical frames bypass both the capture-session gate and the throttle.
+    // whoop-lab: live IMU frames (packet 43, layout R21, 1.2 kB/s) are kept compactly by the sport
+    // and Smart Wake engines (sport_imu, smart_wake_imu); copying them into the capture layer as hex +
+    // JSON cost 175 MB a day and a JSON parse per frame. Only a debug physiology capture keeps them.
+    let keepLiveIMU = activeHealthPacketCapture?.mode == .physiology
     let framesToWrite = frames.filter { frame in
       if Self.isHistoricalFrameHex(frame.hex) {
         return true
+      }
+      if !keepLiveIMU, Self.isLiveIMUFrameHex(frame.hex) {
+        return false
       }
       return captureActive && shouldWriteCapturedFrame(at: event.capturedAt)
     }
@@ -389,6 +408,10 @@ extension GooseAppModel {
         context.ble.sportIMUSink?(frame.hex, event.capturedAt)
       }
     }
+    // whoop-lab: the live IMU frames went to the engines above; the generic parse (Rust decode to
+    // JSON, packet counters of the debug screens) only for a debug physiology capture
+    let frames = context.keepLiveIMU ? frames : frames.filter { !Self.isLiveIMUFrameHex($0.hex) }
+    guard !frames.isEmpty else { return }
     let parser = notificationFrameParser
     let deviceType = context.deviceType
     let healthCaptureActive = context.healthCaptureActive
@@ -531,6 +554,7 @@ extension GooseAppModel {
     NotificationParseContext(
       deviceType: event.rustDeviceType,
       healthCaptureActive: activeHealthPacketCapture != nil,
+      keepLiveIMU: activeHealthPacketCapture?.mode == .physiology,
       overnightGuardActive: overnightGuardActive,
       respiratoryPacketWatchActive: respiratoryPacketWatchActive,
       fallbackHeartRate: recentLiveHeartRate(around: event.capturedAt),

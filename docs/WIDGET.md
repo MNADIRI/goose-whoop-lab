@@ -74,8 +74,11 @@ valeur de la veille n'est reprise. Après 24 h sans actualisation, le widget dem
 
 `coucher = réveil − (besoin de ce soir + délai d'endormissement habituel)`, avec le besoin et le délai de
 `smart_wake.plan` (le besoin contient déjà une part plafonnée de la dette : pas de rattrapage complet en une nuit).
-Régularité : le coucher n'avance pas de plus d'**1 h** par rapport au coucher habituel ; le manque est affiché
-(« 1 h 15 de moins que le besoin ») au lieu d'un horaire irréaliste. Décrocher = coucher − 15 min, comme dans l'app.
+Le coucher **couvre toujours le besoin**. S'il tombe plus d'1 h avant le coucher habituel, c'est un conseil
+(« 2 h 15 plus tôt que d'habitude », « décroche dès 21:10 »), jamais un décalage : le 17 nov., un coucher limité à 1 h
+avant l'habitude (23:08 pour 9 h 22 de besoin et un réveil à 07:05) contredisait le besoin affiché. Décrocher = coucher
+− 15 min. Une seule règle, dans `smart_wake.plan` (`bedtime`, `lights_out_advice`, `earlier_than_usual_min`) ; le
+widget la lit telle quelle, et un plan calculé pour une autre heure de réveil est recalculé pour l'alarme.
 Le réveil vient toujours de la configuration Smart Wake.
 
 ## 5. Tests (`cargo test --release --lib daily_context`)
@@ -88,7 +91,7 @@ Le réveil vient toujours de la configuration Smart Wake.
 | Bluetooth coupé | FC ancienne jamais « en direct » ; passage live → « à HH:MM » → périmée dans la timeline ; FC absente expliquée |
 | Séance intense | « Course · 35 min », message « la FC élevée vient de l'effort, pas du stress » ; stress = repos immobile |
 | FC élevée hors effort | stress 81, 45 min de stress élevé au repos |
-| Horaires irréguliers | coucher limité à 1 h avant l'habitude, soir décalé en conséquence |
+| Horaires irréguliers | coucher qui couvre le besoin, conseil « X plus tôt que d'habitude, décroche dès … » |
 | Smart Wake modifié | réveil et coucher suivent le réglage, jamais modifié ; « réveil non programmé » si désarmé |
 | Passage de nuit | nuit sur endormissement, réveil nocturne court et coupure Bluetooth sans effet, matin sur réveil confirmé, sieste ≠ nuit, matin suivant « en attente » |
 | Instantané périmé | carte marquée « non actualisée » après 6 h, aucune valeur live ; nuit incomplète affichée en borne inférieure |

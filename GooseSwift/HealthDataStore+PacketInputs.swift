@@ -33,7 +33,9 @@ extension HealthDataStore {
   }
 
   nonisolated static func packetInputBridgeReports(databasePath: String) -> Result<[String: [String: Any]], Error> {
-    let bridge = GooseRustBridge()
+    // whoop-lab: a run started on screen and still going once the app is in the background got it
+    // killed by iOS (cpu_resource_fatal, 19 Nov 09:18, step_counter_ingest): every step checks first
+    let bridge = ForegroundOnlyBridge()
     let runStartedAt = Date()
     let featureWindowStart = whoopLabFeatureWindowStart(now: runStartedAt)
     let baseArgs: [String: Any] = [
@@ -63,20 +65,9 @@ extension HealthDataStore {
         ]
       )
       reports["motion"] = try bridge.request(method: "metrics.motion_features", args: baseArgs)
-      reports["step_discovery"] = try bridge.request(
-        method: "metrics.step_packet_discovery",
-        args: baseArgs.merging(["max_candidate_fields": 100]) { _, new in new }
-      )
-      // whoop-lab: R18 yields two step fields per second (count + activity), so 1,000 fields covered
-      // only ~8 minutes. Ingest incrementally with room for 48 h of records.
-      reports["step_counter_ingest"] = try bridge.request(
-        method: "metrics.step_counter_ingest",
-        args: baseArgs.merging([
-          "start": Self.whoopLabStepIngestStart(now: runStartedAt),
-          "max_candidate_fields": 400_000,
-        ]) { _, new in new }
-      )
-      UserDefaults.standard.set(runStartedAt, forKey: Self.whoopLabStepIngestCursorKey)
+      // whoop-lab: the legacy step-field discovery and counter ingest re-scan the decoded frames (one
+      // run took more than the 48 s of CPU iOS allows in the background, 19 Nov) for step metrics no
+      // current screen shows (steps come from R18, whoop_lab.analyze): no longer run here.
       reports["heart_rate"] = try bridge.request(method: "metrics.heart_rate_features", args: baseArgs)
       reports["vital_event"] = try bridge.request(method: "metrics.vital_event_features", args: baseArgs)
       reports["hrv"] = try bridge.request(
@@ -486,5 +477,30 @@ extension HealthDataStore {
     default:
       return nil
     }
+  }
+}
+
+/// Rust bridge that refuses to start a request once the app is in the background (the work is
+/// marked dirty and redone at the next foreground).
+struct ForegroundOnlyBridge {
+  struct Backgrounded: Error {}
+  private let bridge = GooseRustBridge()
+
+  func request(method: String, args: [String: Any] = [:]) throws -> [String: Any] {
+    if AppForegroundState.isBackground { throw Backgrounded() }
+    return try bridge.request(method: method, args: args)
+  }
+}
+
+/// Thread-safe "app in the background" flag, kept by the scene phase.
+enum AppForegroundState {
+  private static let lock = NSLock()
+  nonisolated(unsafe) private static var background = false
+  static var isBackground: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return background
+  }
+  static func set(background value: Bool) {
+    lock.lock(); background = value; lock.unlock()
   }
 }

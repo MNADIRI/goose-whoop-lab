@@ -15,6 +15,10 @@ extension GooseBLEClient {
       record(level: .debug, source: "ble.sync", title: "historical_sync.skipped", body: "already syncing trigger=\(trigger)")
       return
     }
+    if automatic, let hold = syncHoldUntil, hold > Date() {
+      record(level: .debug, source: "ble.sync", title: "historical_sync.held", body: "database maintenance trigger=\(trigger)")
+      return
+    }
     guard activePeripheral != nil, commandCharacteristic != nil else {
       failHistoricalSync("Historical sync needs an active WHOOP command characteristic. Current connection state: \(connectionState).")
       return
@@ -23,6 +27,20 @@ extension GooseBLEClient {
       failHistoricalSync("Historical sync can only start from the ready state. Current connection state: \(connectionState).")
       return
     }
+    // any trigger (restore, periodic, screen): the strap's answers go nowhere until the WHOOP
+    // notifications are subscribed again after a relaunch (19 Nov 07:46 / 08:13: GET_DATA_RANGE
+    // timeouts then a failed sync) — wait for them, 15 s at most
+    if !whoopNotificationsReady, syncNotifyWaitCount < 15 {
+      syncNotifyWaitCount += 1
+      if syncNotifyWaitCount == 1 {
+        record(level: .debug, source: "ble.sync", title: "historical_sync.waiting_notifications", body: trigger)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+        self?.beginHistoricalSync(trigger: trigger, automatic: automatic, firstCommandOverride: firstCommandOverride, rangeOnly: rangeOnly, acknowledgeHistoricalDataResult: acknowledgeHistoricalDataResult)
+      }
+      return
+    }
+    syncNotifyWaitCount = 0
     guard supportsV5HistoricalSync else {
       let characteristic = commandCharacteristic?.uuid.uuidString ?? "missing"
       failHistoricalSync("Historical sync currently supports the Goose V5 fd4b command characteristic. Active command characteristic: \(characteristic).")

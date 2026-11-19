@@ -93,6 +93,7 @@ struct AppShellView: View {
     }
     .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
       healthStore.refreshPacketInputsIfNeeded()
+      healthStore.refreshHeartRateTimeline()
       model.labResults.refresh(force: true)
     }
   }

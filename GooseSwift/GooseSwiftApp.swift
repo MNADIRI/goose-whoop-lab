@@ -10,6 +10,7 @@ struct GooseSwiftApp: App {
   init() {
     GooseTheme.configureAppearance()
     Forme.registerFonts()
+    DatabaseMaintenance.register()
   }
 
   var body: some Scene {
@@ -29,6 +30,7 @@ struct GooseSwiftApp: App {
           }
         }
         .onChange(of: scenePhase) { _, phase in
+          AppForegroundState.set(background: phase == .background)
           switch phase {
           case .active:
             model.handleAppLifecycleChange("active")

@@ -983,6 +983,7 @@ extension GooseBLEClient {
     }
 
     readySyncWorkItem?.cancel()
+    let scheduledAt = Date()
     let workItem = DispatchWorkItem { [weak self] in
       guard let self else {
         return
@@ -990,12 +991,32 @@ extension GooseBLEClient {
       guard self.pendingAutomaticHistoricalSyncReason == reason else {
         return
       }
+      // After a relaunch by iOS the subscriptions come back seconds after "ready": a GET_DATA_RANGE
+      // sent before them is answered into the void (17 Nov: 3 timeouts, then 20 / 60 / 180 s of
+      // back-off, several minutes without sync at each relaunch). Wait for them (15 s at most);
+      // didUpdateNotificationStateFor re-schedules as soon as the last one is on.
+      if !self.whoopNotificationsReady, Date().timeIntervalSince(scheduledAt) < 15 {
+        self.record(level: .debug, source: "ble.sync", title: "historical_sync.waiting_notifications", body: reason)
+        return
+      }
       self.pendingAutomaticHistoricalSyncReason = nil
       self.beginHistoricalSync(trigger: reason, automatic: true)
     }
     readySyncWorkItem = workItem
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: workItem)
+    // fallback when a subscription callback never comes
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15.5) { [weak self, weak workItem] in
+      guard let self, let workItem, !workItem.isCancelled, self.pendingAutomaticHistoricalSyncReason == reason else { return }
+      workItem.perform()
+    }
     record(source: "ble.sync", title: "historical_sync.scheduled", body: reason)
+  }
+
+  /// every WHOOP notify characteristic of the active peripheral is subscribed
+  var whoopNotificationsReady: Bool {
+    guard let peripheral = activePeripheral else { return false }
+    let chars = (peripheral.services ?? []).flatMap { $0.characteristics ?? [] }.filter { notificationCharacteristicIDs.contains($0.uuid) }
+    return !chars.isEmpty && chars.allSatisfy(\.isNotifying)
   }
 
 }

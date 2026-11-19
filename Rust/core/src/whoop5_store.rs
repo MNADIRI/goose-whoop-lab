@@ -127,14 +127,14 @@ pub fn ingest(conn: &Connection) -> GooseResult<IngestStats> {
         .optional()?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    // decoder changed: Layer B is re-derived from the immutable Layer A
+    // decoder changed: Layer B is re-derived from what Layer A still holds. Layer A keeps 48 h only
+    // (db_maintenance): older typed rows have no frame left to re-derive from and are kept as they are.
     let stored_version: Option<String> = conn.query_row("SELECT value FROM whoop5_state WHERE key = 'decoder_version'", [], |r| r.get(0)).optional()?;
     let cursor = if stored_version.as_deref().is_some_and(|v| v != DECODER_VERSION) {
-        conn.execute_batch(
-            "DELETE FROM whoop5_r18; DELETE FROM whoop5_r26; DELETE FROM whoop5_r20_slot; DELETE FROM whoop5_r21;
-             DELETE FROM whoop5_live_hr; DELETE FROM whoop5_events; DELETE FROM whoop5_metadata; DELETE FROM whoop5_console;
-             DELETE FROM whoop5_unknown; DELETE FROM whoop5_state;",
-        )?;
+        for t in ["whoop5_r18", "whoop5_r26", "whoop5_r20_slot", "whoop5_r21", "whoop5_live_hr", "whoop5_events", "whoop5_metadata", "whoop5_console", "whoop5_unknown"] {
+            conn.execute(&format!("DELETE FROM {t} WHERE frame_id IN (SELECT frame_id FROM decoded_frames)"), [])?;
+        }
+        conn.execute("DELETE FROM whoop5_state", [])?;
         0
     } else {
         cursor

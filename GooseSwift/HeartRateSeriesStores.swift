@@ -63,7 +63,11 @@ final class HeartRateSeriesStore {
 
   private static let retention: TimeInterval = 7 * 24 * 60 * 60
   private static let maxSamples = 100_000
-  private static let persistDelay: TimeInterval = 1.0
+  /// The whole series is re-encoded on each write (up to 100k points): every second at 1 Hz live
+  /// heart rate this took 56 % of the app's CPU and got it killed in the background
+  /// (cpu_resource_fatal, 17 Nov 19:24, the gym session never seen live). Written every 5 min and
+  /// when the app leaves the foreground or ends; the samples are in the database anyway.
+  private static let persistDelay: TimeInterval = 300
   private static let updateNotificationInterval: TimeInterval = 2.0
 
   private let url: URL
@@ -82,6 +86,21 @@ final class HeartRateSeriesStore {
     self.url = url
     self.samples = Self.loadSamples(from: url)
     prune(relativeTo: Date())
+    for name in [UIApplication.didEnterBackgroundNotification, UIApplication.willTerminateNotification] {
+      NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.flush() }
+    }
+  }
+
+  /// writes now what is waiting
+  func flush() {
+    stateLock.lock()
+    guard let item = pendingWrite else { stateLock.unlock(); return }
+    item.cancel()
+    pendingWrite = nil
+    let payload = HeartRateSeriesFile(version: 1, samples: samples)
+    stateLock.unlock()
+    let url = self.url
+    writeQueue.async { Self.persist(payload: payload, to: url) }
   }
 
   func append(bpm: Int, source: String, capturedAt: Date) -> Bool {
@@ -376,7 +395,11 @@ final class HRVSeriesStore {
 
   private static let retention: TimeInterval = 14 * 24 * 60 * 60
   private static let maxSamples = 20_000
-  private static let persistDelay: TimeInterval = 1.0
+  /// The whole series is re-encoded on each write (up to 100k points): every second at 1 Hz live
+  /// heart rate this took 56 % of the app's CPU and got it killed in the background
+  /// (cpu_resource_fatal, 17 Nov 19:24, the gym session never seen live). Written every 5 min and
+  /// when the app leaves the foreground or ends; the samples are in the database anyway.
+  private static let persistDelay: TimeInterval = 300
   private static let updateNotificationInterval: TimeInterval = 2.0
 
   private let url: URL
@@ -394,6 +417,20 @@ final class HRVSeriesStore {
       schedulePersist()
     }
     prune(relativeTo: Date())
+    for name in [UIApplication.didEnterBackgroundNotification, UIApplication.willTerminateNotification] {
+      NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.flush() }
+    }
+  }
+
+  func flush() {
+    stateLock.lock()
+    guard let item = pendingWrite else { stateLock.unlock(); return }
+    item.cancel()
+    pendingWrite = nil
+    let payload = HRVSeriesFile(version: 1, samples: samples)
+    stateLock.unlock()
+    let url = self.url
+    writeQueue.async { Self.persist(payload: payload, to: url) }
   }
 
   func append(rmssdMS: Double, rrIntervalCount: Int, source: String, capturedAt: Date) -> Bool {
@@ -575,7 +612,9 @@ final class HeartRateSamplePipeline {
   init(
     heartRateStore: HeartRateSeriesStore = .shared,
     hrvStore: HRVSeriesStore = .shared,
-    timelinePublishInterval: TimeInterval = 1
+    // hourly ranges over up to 100k points: once a minute is plenty for an hourly chart (every
+    // second, it redrew the Today screen in the background too: 19 Nov profile)
+    timelinePublishInterval: TimeInterval = 60
   ) {
     self.heartRateStore = heartRateStore
     self.hrvStore = hrvStore
@@ -596,7 +635,8 @@ final class HeartRateSamplePipeline {
       }
 
       let now = Date()
-      guard now.timeIntervalSince(self.lastTimelinePublishedAt) >= self.timelinePublishInterval else {
+      guard !AppForegroundState.isBackground,
+            now.timeIntervalSince(self.lastTimelinePublishedAt) >= self.timelinePublishInterval else {
         return
       }
       self.publishHeartRateTimeline(for: now, force: true)

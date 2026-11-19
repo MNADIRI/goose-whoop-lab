@@ -55,8 +55,6 @@ pub struct Settings {
     pub day_metric_valid_s: i64,
     /// the whole snapshot is flagged as not refreshed after this
     pub snapshot_stale_s: i64,
-    /// how much earlier than the habitual bedtime the planner may move bedtime
-    pub max_bedtime_advance_min: i64,
     /// expected awakening for the timeline when no alarm is set (local minutes)
     pub expected_wake_fallback: i64,
 }
@@ -75,7 +73,6 @@ impl Default for Settings {
             hr_recent_s: 15 * 60,
             day_metric_valid_s: 2 * 3600,
             snapshot_stale_s: 6 * 3600,
-            max_bedtime_advance_min: 60,
             expected_wake_fallback: 7 * 60,
         }
     }
@@ -339,19 +336,15 @@ pub struct Schedule {
     pub latency_min: Option<f64>,
     pub bedtime: Option<i64>,
     pub wind_down: Option<i64>,
-    /// minutes of the need that the regularity limit leaves uncovered
-    pub shortfall_min: f64,
+    /// bedtime this much earlier than the habitual one (> 60 min): advice to wind down earlier
+    pub earlier_than_usual_min: Option<f64>,
     pub debt_7d_min: Option<f64>,
     pub debt_payback_min: Option<f64>,
-    pub limited_by_regularity: bool,
 }
 
-/// Bedtime = wake − (tonight's need + usual latency), from `smart_wake.plan` (the need already
-/// contains a capped share of the 7-night debt: no full catch-up in one night). Regularity: the
-/// body rarely falls asleep much earlier than usual, so bedtime moves at most
-/// `max_bedtime_advance_min` before the habitual bedtime; the rest is reported as a shortfall
-/// instead of an unrealistic bedtime. The alarm itself is never changed.
-pub fn plan_schedule(sw: &SmartWakeInput, plan: Option<&Value>, settings: &Settings) -> Schedule {
+/// Bedtime and wind-down come from `smart_wake.plan`: wake − (need + latency), which always covers
+/// the need; the widget and the app's plan show the same times. The alarm is never changed.
+pub fn plan_schedule(sw: &SmartWakeInput, plan: Option<&Value>) -> Schedule {
     let wake = sw.deadline;
     let num_of = |v: &Value| v.as_f64();
     let need = plan.and_then(|p| num_of(&p["recommended_sleep_min"]));
@@ -361,24 +354,19 @@ pub fn plan_schedule(sw: &SmartWakeInput, plan: Option<&Value>, settings: &Setti
     let early_by = plan.and_then(|p| num_of(&p["habitual_bedtime_offset_min"]));
     let mut s = Schedule {
         wake, alarm_armed: sw.armed, window_start: None, need_min: need, latency_min: latency, bedtime: None, wind_down: None,
-        shortfall_min: 0.0, debt_7d_min: debt, debt_payback_min: payback, limited_by_regularity: false,
+        earlier_than_usual_min: early_by.filter(|e| *e > crate::smart_wake::EARLY_BED_NOTE_MIN), debt_7d_min: debt, debt_payback_min: payback,
     };
     if sw.armed && sw.max_advance_min > 0 {
         s.window_start = wake.map(|w| w - sw.max_advance_min.clamp(0, 60) * 60);
     }
-    if let (Some(w), Some(n)) = (wake, need) {
-        let ideal = w - ((n + latency.unwrap_or(15.0)) * 60.0) as i64;
-        let mut bed = ideal;
-        if let Some(e) = early_by {
-            let cap = settings.max_bedtime_advance_min as f64;
-            if e > cap {
-                bed = ideal + ((e - cap) * 60.0) as i64;
-                s.shortfall_min = (e - cap).round();
-                s.limited_by_regularity = true;
-            }
-        }
+    // the plan's own bedtime (same numbers as the app); from its parts for a plan without it
+    let planned = plan.filter(|p| p["latest_wake"].as_i64() == wake).and_then(|p| Some((p["bedtime"].as_i64()?, p["lights_out_advice"].as_i64()?)));
+    if let Some((bed, lights)) = planned {
         s.bedtime = Some(bed);
-        // same "décrocher" lead as the app's plan (15 min before bedtime)
+        s.wind_down = Some(lights);
+    } else if let (Some(w), Some(n)) = (wake, need) {
+        let bed = w - ((n + latency.unwrap_or(15.0)) * 60.0) as i64;
+        s.bedtime = Some(bed);
         s.wind_down = Some(bed - 15 * 60);
     }
     s
@@ -799,9 +787,9 @@ fn schedule_metrics(i: &Inputs) -> Vec<Metric> {
         }
     };
     out.push(t("wind_down", "Décrocher", sc.wind_down, SRC_PLAN, "coucher − 15 min", "besoin de sommeil ou heure de réveil inconnus"));
-    let mut bed = t("bedtime", "Au lit", sc.bedtime, SRC_PLAN, "réveil − (besoin + latence), limité par la régularité", "besoin de sommeil ou heure de réveil inconnus");
-    if sc.limited_by_regularity {
-        bed.detail = Some(format!("{} de moins que le besoin", dur(sc.shortfall_min)));
+    let mut bed = t("bedtime", "Au lit", sc.bedtime, SRC_PLAN, "réveil − (besoin + latence) : couvre le besoin", "besoin de sommeil ou heure de réveil inconnus");
+    if let Some(e) = sc.earlier_than_usual_min {
+        bed.detail = Some(format!("{} plus tôt que d'habitude", dur(e)));
     }
     out.push(bed);
     let mut wake = Metric::new("wake", "Réveil", "heure", SRC_SW, "réglage de l'alarme (lecture seule)");
@@ -945,8 +933,10 @@ fn insight(context: Context, primary: &[Metric], secondary: &[Metric], i: &Input
             if !sc.alarm_armed && sc.wake.is_some() {
                 return ins("alarm_off", format!("Réveil non programmé : active-le pour {} dans l'app.", clock(sc.wake.unwrap(), i.off)), vec!["wake"]);
             }
-            if sc.limited_by_regularity {
-                return ins("regularity", format!("Coucher limité à 1 h avant ton heure habituelle : il manquera environ {}.", dur(sc.shortfall_min)), vec!["bedtime"]);
+            if let (Some(e), Some(w)) = (sc.earlier_than_usual_min, sc.wind_down) {
+                if i.now < w {
+                    return ins("early_bed", format!("Coucher {} plus tôt que d'habitude pour couvrir ton besoin : décroche dès {}.", dur(e), clock(w, i.off)), vec!["bedtime", "wind_down"]);
+                }
             }
             if let (Some(b), Some(n)) = (sc.bedtime, sc.need_min) {
                 if i.now > b {
@@ -1118,7 +1108,9 @@ pub fn snapshot(args: &SnapshotArgs) -> GooseResult<Value> {
         _ => None,
     };
     // plan for the actual alarm (read-only): computed here when the app did not pass one
-    let plan_owned: Option<Value> = match (&args.plan, &conn, args.smart_wake.deadline) {
+    // a plan made for another wake time is recomputed for the alarm when the database is there
+    let app_plan = args.plan.as_ref().filter(|p| conn.is_none() || p["latest_wake"].is_null() || p["latest_wake"].as_i64() == args.smart_wake.deadline);
+    let plan_owned: Option<Value> = match (app_plan, &conn, args.smart_wake.deadline) {
         (Some(p), _, _) => Some(p.clone()),
         (None, Some(_), Some(w)) => crate::smart_wake::plan(&crate::smart_wake::PlanArgs {
             database_path: args.database_path.clone().unwrap_or_default(), latest_wake: w, utc_offset_seconds: off, now_unix: Some(now),
@@ -1142,7 +1134,7 @@ pub fn snapshot(args: &SnapshotArgs) -> GooseResult<Value> {
         (Some(l), None) => Some(l.clone()),
         (None, d) => d,
     };
-    let sched = plan_schedule(&args.smart_wake, plan_owned.as_ref(), s);
+    let sched = plan_schedule(&args.smart_wake, plan_owned.as_ref());
     let i = Inputs { now, off, a: Analysis::new(&args.analysis), sw: &args.smart_wake, plan: plan_owned.as_ref(), live_hr, activity: args.activity.as_ref(), sched, s };
     let decision = decide_context(now, off, &i.a, i.sw, &sleep, &i.sched, args.previous.as_ref(), s);
     let transitions = planned_transitions(&i, &decision);
@@ -1395,22 +1387,36 @@ mod tests {
     }
 
     #[test]
-    fn irregular_schedule_limits_bedtime_advance() {
-        // habitual bedtime 01:00 but the plan would want 22:45 (135 min earlier)
+    fn early_bedtime_still_covers_the_need() {
+        // habitual bedtime 01:00 but the need asks for 22:45 (135 min earlier): the bedtime covers
+        // the need, the gap is advice only
         let a = analysis(night(400.0, Some(60.0), 0.0, 0.0, "COMPLETE"), Some(55.0), day(5.0, 5000, None, 0.0));
-        // wind-down 23:45 would start the evening at 22:45; it starts at 20:00 at the latest
         let r = run(&args(local(19, 30), a.clone(), sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
         assert_eq!(r["context"], "daytime");
         assert_eq!(r["transitions"][0]["at"], local(20, 0));
-        let r = run(&args(local(20, 14), a.clone(), sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
-        assert_eq!(r["context"], "evening");
-        let r = run(&args(local(23, 0), a, sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
+        let r = run(&args(local(22, 0), a, sw(tomorrow_7h(), 30), plan(480.0, 120.0, 30.0, 135.0)));
         let e0 = &r["entries"][0];
         assert_eq!(r["context"], "evening");
-        // bedtime only 60 min before the habit: 00:00, 75 min short of the need
-        assert_eq!(metric(e0, "bedtime")["display"], "00:00");
-        assert_eq!(metric(e0, "bedtime")["detail"], "1 h 15 de moins que le besoin");
-        assert_eq!(e0["card"]["insight"]["id"], "regularity");
+        assert_eq!(metric(e0, "bedtime")["display"], "22:45");
+        assert_eq!(metric(e0, "wind_down")["display"], "22:30");
+        assert_eq!(metric(e0, "bedtime")["detail"], "2 h 15 plus tôt que d'habitude");
+        assert_eq!(e0["card"]["insight"]["id"], "early_bed");
+    }
+
+    #[test]
+    fn widget_bedtime_is_the_plan_bedtime() {
+        // 17 Nov: alarm 07:05, need 9 h 22 + 15 min latency -> 21:25, wind-down 21:10, in the app and the widget
+        let w = tomorrow_7h();
+        let mut p = plan(562.0, 240.0, 60.0, 163.0);
+        let bed = w - 577 * 60;
+        p["latest_wake"] = json!(w);
+        p["bedtime"] = json!(bed);
+        p["lights_out_advice"] = json!(bed - 15 * 60);
+        let sc = plan_schedule(&sw(w, 30), Some(&p));
+        assert_eq!((sc.bedtime, sc.wind_down, sc.earlier_than_usual_min), (Some(bed), Some(bed - 900), Some(163.0)));
+        // a plan made for another wake time: recomputed from its parts, still covering the need
+        let sc = plan_schedule(&sw(w + 1800, 30), Some(&p));
+        assert_eq!(sc.bedtime, Some(w + 1800 - 577 * 60));
     }
 
     #[test]
