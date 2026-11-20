@@ -48,6 +48,14 @@ extension GooseAppModel {
 
   @discardableResult
   func handleDebugCommandDeepLink(_ url: URL) -> Bool {
+    // development: gooseswift://night-optics-test?seconds=70&mode=A -> one optical window now
+    if ["gooseswift", "goose"].contains(url.scheme?.lowercased() ?? ""), url.host == "night-optics-test" {
+      let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+      let seconds = Int(q.first { $0.name == "seconds" }?.value ?? "") ?? 70
+      let mode = q.first { $0.name == "mode" }?.value == "B" ? "B" : "A"
+      NightOpticsController.shared.testWindow(seconds: min(max(seconds, 20), 180), mode: mode)
+      return true
+    }
     // development: gooseswift://debug-stats?hours=24 -> Documents/GooseSwift/db-stats.json
     if ["gooseswift", "goose"].contains(url.scheme?.lowercased() ?? ""), url.host == "debug-stats" {
       let hours = Int(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "hours" }?.value ?? "") ?? 24

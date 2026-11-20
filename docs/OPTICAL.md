@@ -169,3 +169,49 @@ Validation encore nécessaire :
 - **SpO₂** : comparer une nuit à un oxymètre de doigt, et vérifier si la valeur WHOOP officielle de la même nuit correspond.
 - **Cadence** : compter des pas à cadence connue.
 - **FC de repos du firmware** : la comparer à notre estimation sur plusieurs nuits.
+
+## Activation pattern of the optical sensors (9–19 Nov)
+
+| What | When | Content | Retrieved |
+|---|---|---|---|
+| Green heart rate (LED 1 + LED 4) | always | R18 HR each second, R18 bytes 107–109 (level, amplitude) | yes, every sync |
+| Infrared contact (LED 2 at 2 mA) | always | wrist bits, R20 block 4 when recorded | yes |
+| Green bursts (R26) | 40 s every 1 161 s at night, 1 240 s by day | 25 Hz raw green, block 0 slot A | yes |
+| Strap SpO₂ (red LED 3 + infrared LED 2, photodiode 1) | **30 s every 1 200 s**, the first 20 min after its sleep onset (23:01 → 23:21:18; 23:10 → 23:30:19), only in band state "sleep", until waking | R18 byte 82: % (33 of 47 windows), else status codes 2/8/32/128/160… | the value yes; the red / infrared samples never |
+| Full frame (R20, 5 slots × 2 photodiodes) | only on command | 2 140 B/s | when recorded |
+
+The SpO₂ schedule is locked to the sleep onset, not to the green bursts: offsets from −544 to +540 s.
+
+**Night 1 (17 Nov)** recorded no frame, for two reasons:
+- **Timing:** its windows followed the green bursts, so none overlapped a SpO₂ window.
+- **Commands:** `TOGGLE_PERSISTENT_R20` (153) was sent alone. The strap logged "Enable Persistent Optical data
+  save" but wrote nothing. On 10 Nov, frames came with `ENABLE_OPTICAL_DATA` (107) sent too.
+
+Effects on the strap: none.
+- The green bursts kept their night period.
+- Its SpO₂ kept coming (median 99 %).
+- Burst AGC codes vary every night anyway.
+- Battery: 0.43 %/h with windows vs 0.38 %/h without, within the 1 % resolution.
+
+**Windows from 19 Nov (`night-optics-2`):**
+- **SpO₂ windows:** 80 s around each predicted SpO₂ window (20 s before → 30 s after, the strap clock running ~9 s
+  behind the phone). The first of the night is predicted from the sleep onset (± 60 s).
+- **Control windows:** a 60 s window every third cycle, halfway between two SpO₂ windows.
+- **Commands:**
+  - mode A: 107 + 153;
+  - mode B: + `TOGGLE_OPTICAL_MODE` (108, live), used automatically once two synced mode-A windows bring no frame.
+- **Ingest:** live optical frames are now ingested into `whoop5_r20_slot`.
+- **Replay on 17–19 Nov:** 47 of 47 SpO₂ windows fully covered, about 39 min of recording per night.
+
+**Report, per window:**
+- red / infrared presence and pulsatility;
+- the strap's SpO₂ for the same seconds;
+- the red / infrared ratio of ratios.
+
+From 3 windows with both, it also fits a personal calibration line (ratio → strap SpO₂, residual error). That's
+the condition for computing our own SpO₂ from the raw signal, and for knowing its error against the strap.
+
+**Day test, 19 Nov 10:29 (mode A, 70 s):** 72 s of full frames came back through the history sync.
+- **Sampled:** green, ambient and infrared contact.
+- **Empty:** the red / infrared slots, as expected by day, since the strap only uses them for its night SpO₂.
+- **Conclusion:** ENABLE_OPTICAL_DATA + the record flag is the working combination.

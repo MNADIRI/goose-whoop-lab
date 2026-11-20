@@ -144,7 +144,7 @@ pub fn ingest(conn: &Connection) -> GooseResult<IngestStats> {
     {
         let mut st = tx.prepare(
             "SELECT rowid, frame_id, payload_hex, header_crc_valid, payload_crc_valid FROM decoded_frames
-             WHERE rowid > ?1 AND packet_type IN (40, 47, 48, 49, 50) ORDER BY rowid LIMIT 200000",
+             WHERE rowid > ?1 AND packet_type IN (40, 43, 47, 48, 49, 50) ORDER BY rowid LIMIT 200000",
         )?;
         let rows = st.query_map([cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?, r.get::<_, bool>(4)?)))?;
         for row in rows {
@@ -156,6 +156,10 @@ pub fn ingest(conn: &Connection) -> GooseResult<IngestStats> {
                 continue;
             }
             let Ok(pl) = hex::decode(hex_payload.trim()) else { continue };
+            // live optical frames (night windows in live mode) are kept; live IMU is already in sport_imu
+            if pl.first() == Some(&rec::PACKET_REALTIME_RAW) && pl.get(1) != Some(&rec::LAYOUT_R20) {
+                continue;
+            }
             let Some(record) = rec::decode_payload(&pl) else { continue };
             let (table, n) = insert(&tx, &frame_id, &record)?;
             if table == "whoop5_unknown" {

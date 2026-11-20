@@ -3,10 +3,11 @@ import Foundation
 import SwiftUI
 
 /// Night optical windows (Rust/core/src/night_optics.rs), a 4-night test agreed by the user on
-/// 17 Nov: on nights 1 and 3, persistent R20 (cmd 153, a critical strap state change) is switched
-/// on for 150 s once per R26 burst period while the strap is in its night configuration,
-/// alternating between a window around the burst and one between two bursts; nights 2 and 4 are
-/// the battery reference. Frames reach the phone with the normal history sync.
+/// 17 Nov (cmd 153) and 19 Nov (with ENABLE_OPTICAL_DATA 107 / live optical mode 108): on nights
+/// 1 and 3, the full optical frame is recorded for 70 s around each of the strap's own SpO2
+/// measurements (30 s every 20 min during its sleep), plus a control window every third cycle;
+/// nights 2 and 4 are the battery reference. Frames reach the phone with the normal history sync
+/// (and live in mode B).
 ///
 /// Safety: the end of the open window is persisted; every tick (and every launch) sends OFF once
 /// it has passed, until the strap acknowledges it. Optical frames arriving long after the last
@@ -23,6 +24,8 @@ final class NightOpticsController: ObservableObject {
     var on_at: Int?
     var off_at: Int?
     var on_result: Int?
+    /// "A": ENABLE_OPTICAL_DATA + persistent R20; "B": + live optical mode
+    var mode: String?
   }
 
   struct Battery: Codable {
@@ -53,6 +56,8 @@ final class NightOpticsController: ObservableObject {
   /// OFF sent without an answer: after 5, the window is closed anyway (the frame check above
   /// sends a new OFF if the strap kept recording)
   private var offAttempts = 0
+  /// mode of a test window
+  private var modeOverride: String?
 
   private enum Key {
     static let windows = "nightOptics.windows"
@@ -60,6 +65,13 @@ final class NightOpticsController: ObservableObject {
     static let nights = "nightOptics.nights"
     static let onUntil = "nightOptics.r20OnUntil"
     static let since = "nightOptics.since"
+    static let mode = "nightOptics.mode"
+  }
+
+  /// A until the report shows that mode-A windows bring no frame, then B (live optical mode too)
+  private var mode: String {
+    get { defaults.string(forKey: Key.mode) ?? "A" }
+    set { defaults.set(newValue, forKey: Key.mode) }
   }
 
   /// end of the window the strap is recording (persisted: an OFF is owed until acknowledged)
@@ -78,7 +90,8 @@ final class NightOpticsController: ObservableObject {
       defaults.set(Int(Date().timeIntervalSince1970), forKey: Key.since)
       save()
     }
-    Timer.publish(every: 30, tolerance: 5, on: .main, in: .common).autoconnect().sink { [weak self] _ in self?.tick() }.store(in: &bag)
+    // 10 s: a window opens 20 s before the strap's 30 s SpO2 measurement
+    Timer.publish(every: 10, tolerance: 2, on: .main, in: .common).autoconnect().sink { [weak self] _ in self?.tick() }.store(in: &bag)
     Timer.publish(every: 20 * 60, tolerance: 60, on: .main, in: .common).autoconnect().sink { [weak self] _ in self?.refreshReport() }.store(in: &bag)
     tick()
     refreshReport()
@@ -99,7 +112,7 @@ final class NightOpticsController: ObservableObject {
       return
     }
     let night = nights.first { $0.night == Self.nightKey(now) }
-    let planEvery: TimeInterval = night?.on == true ? 120 : 600
+    let planEvery: TimeInterval = night?.on == true ? 60 : 600
     if Date().timeIntervalSince(lastPlanAt) > planEvery { plan() }
     // frames still arriving well after the last OFF: the strap kept recording
     let lastOff = windows.compactMap(\.off_at).max() ?? (defaults.object(forKey: Key.since) as? Int ?? now)
@@ -110,10 +123,11 @@ final class NightOpticsController: ObservableObject {
       return
     }
     guard night?.on == true, onUntil == nil, pending == nil else { return }
-    guard let w = next.first(where: { ($0["start"] as? Int ?? 0) - 20 <= now && now < ($0["start"] as? Int ?? 0) + 60 }),
+    // open on time: up to 20 s late still covers the strap's measurement (it starts 20 s in)
+    guard let w = next.first(where: { ($0["start"] as? Int ?? 0) - 10 <= now && now < ($0["start"] as? Int ?? 0) + 20 }),
           let start = w["start"] as? Int, let end = w["end"] as? Int, let kind = w["kind"] as? String,
-          end - now >= 60, !windows.contains(where: { $0.start == start }) else { return }
-    windows.append(Window(night: Self.nightKey(now), kind: kind, start: start, end: end))
+          end - now >= 30, !windows.contains(where: { $0.start == start }) else { return }
+    windows.append(Window(night: Self.nightKey(now), kind: kind, start: start, end: end, mode: mode))
     onUntil = end
     save()
     send(on: true)
@@ -125,16 +139,36 @@ final class NightOpticsController: ObservableObject {
     ble.whenFreeForCommands(timeout: 20) { [weak self] ble in
       guard let self else { return }
       typealias K = GooseBLEClient.SensorStreamCommandKind
-      let k = K(commandNumber: 153, payload: K.revisionBoolean(on), name: on ? "TOGGLE_PERSISTENT_R20_ON" : "TOGGLE_PERSISTENT_R20_OFF")
+      // the record flag alone records nothing (17 Nov): the optical feed (107) goes with it, and the
+      // live optical mode (108) in mode B; OFF closes all three, recording flag first
+      let live = (self.modeOverride ?? self.mode) == "B"
+      let cmds: [K] = on
+        ? [K(commandNumber: 107, payload: K.revisionBoolean(true), name: "ENABLE_OPTICAL_DATA_ON")]
+          + (live ? [K(commandNumber: 108, payload: K.revisionBoolean(true), name: "TOGGLE_OPTICAL_MODE_ON")] : [])
+          + [K(commandNumber: 153, payload: K.revisionBoolean(true), name: "TOGGLE_PERSISTENT_R20_ON")]
+        : [K(commandNumber: 153, payload: K.revisionBoolean(false), name: "TOGGLE_PERSISTENT_R20_OFF"),
+           K(commandNumber: 108, payload: K.revisionBoolean(false), name: "TOGGLE_OPTICAL_MODE_OFF"),
+           K(commandNumber: 107, payload: K.revisionBoolean(false), name: "ENABLE_OPTICAL_DATA_OFF")]
       self.pending = (on, Date())
       if on, let i = self.windows.indices.last, self.windows[i].on_at == nil {
         self.windows[i].on_at = Int(Date().timeIntervalSince1970)
         self.save()
       }
       if !on { self.offAttempts += 1 }
-      ble.writeSensorStreamCommands([k], requestedStatus: "Fenêtre optique", updatePhysiologyStatus: false)
-      ble.record(source: "night_optics", title: on ? "r20.on" : "r20.off", body: "until=\(self.onUntil ?? 0)")
+      ble.writeSensorStreamCommands(cmds, requestedStatus: "Fenêtre optique", updatePhysiologyStatus: false)
+      ble.record(source: "night_optics", title: on ? "r20.on" : "r20.off", body: "mode=\(self.mode) until=\(self.onUntil ?? 0)")
     }
+  }
+
+  /// development: one window now, through the same commands and safety as the night ones
+  func testWindow(seconds: Int, mode testMode: String) {
+    guard onUntil == nil, pending == nil else { return }
+    let now = Int(Date().timeIntervalSince1970)
+    modeOverride = testMode
+    windows.append(Window(night: Self.nightKey(now), kind: "test", start: now, end: now + seconds, mode: testMode))
+    onUntil = now + seconds
+    save()
+    send(on: true)
   }
 
   /// strap answer to cmd 153 (GooseBLEClient+HistoricalHandlers)
@@ -156,7 +190,10 @@ final class NightOpticsController: ObservableObject {
     if let i = windows.indices.last, windows[i].on_at != nil, windows[i].off_at == nil { windows[i].off_at = now }
     onUntil = nil
     offAttempts = 0
+    modeOverride = nil
     save()
+    // the window's frames come with the next syncs: report (and escalation) a few minutes later
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8 * 60) { [weak self] in self?.refreshReport() }
   }
 
   private func plan() {
@@ -199,6 +236,10 @@ final class NightOpticsController: ObservableObject {
       Task { @MainActor in
         guard let self, let r else { return }
         self.report = r
+        if r["escalate"] as? Bool == true, self.mode == "A" {
+          self.mode = "B"
+          self.ble?.record(source: "night_optics", title: "mode.escalated", body: "A brought no frame: live optical mode added")
+        }
       }
     }
   }
@@ -257,7 +298,7 @@ struct FormeNightOpticsCard: View {
   var body: some View {
     let r = J(store.report)
     if !store.nights.isEmpty {
-      SectionTitle(title: "Fenêtres optiques de nuit", subtitle: "150 s par cycle de 19 min pendant le sommeil, une nuit sur deux, pour la paire rouge + infrarouge")
+      SectionTitle(title: "Fenêtres optiques de nuit", subtitle: "70 s autour de chaque mesure SpO₂ du bracelet (30 s toutes les 20 min), une nuit sur deux, pour la paire rouge + infrarouge")
       FrostCard(radius: 32, padding: 18, spacing: 8) {
         let byNight = Dictionary(r["nights"].arr.compactMap { n in n["night"].s.map { ($0, n) } }, uniquingKeysWith: { a, _ in a })
         ForEach(store.nights, id: \.night) { n in
@@ -282,6 +323,8 @@ struct FormeNightOpticsCard: View {
       parts.append("\(x["windows"].i ?? 0) fenêtres · \((x["r20_seconds"].i ?? 0) / 60) min enregistrées")
       if (x["r20_seconds"].i ?? 0) > 0 {
         parts.append((x["spo2_seconds"].i ?? 0) > 0 ? "rouge + infrarouge présents" : "rouge + infrarouge absents")
+      } else if (x["windows"].i ?? 0) > 0 {
+        parts.append("aucune trame reçue")
       }
     }
     if let h = x["battery_hours"].d { parts.append("batterie sur \(FF.num(h, 1)) h") }
