@@ -6983,6 +6983,12 @@ fn value_contains_official_whoop_label_marker(value: &Value) -> bool {
 
 fn is_official_whoop_label_token(value: &str) -> bool {
     let normalized = normalized_marker(value);
+    // the policy statement itself ("official WHOOP values are validation labels, not inputs") is
+    // what a local metric records to show it did not use them; it starts with `official_whoop_`
+    // and was refused as if it were a WHOOP value
+    if normalized == crate::validation_labels::OFFICIAL_WHOOP_LABEL_POLICY {
+        return false;
+    }
     matches!(
         normalized.as_str(),
         "whoop"

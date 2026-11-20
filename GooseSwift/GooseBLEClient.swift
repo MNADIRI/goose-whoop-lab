@@ -6,8 +6,15 @@ import OSLog
 final class GooseBLEClient: NSObject, ObservableObject {
   /// Live HR / R-R tap for the smart-wake engine (called from the realtime vitals path).
   var liveSampleSink: ((Date, Int?, [Double], String) -> Void)?
-  var silentSyncRetryCount = 0
-  var silentSyncRetryWindowStart = Date.distantPast
+  /// failed history syncs in a row (reset by a completed one): drives the recovery ladder
+  var syncFailureStreak = 0
+  var syncRecoverySteps: [String] = []
+  var syncFailureStreakStartedAt: Date?
+  /// periodic syncs (5 min, sport, smart wake) wait until then while a recovery is spacing attempts
+  var syncBackoffUntil: Date?
+  var syncRecoveryWorkItem: DispatchWorkItem?
+  /// u32 words of the last valid GET_DATA_RANGE body (offset 1): [?, read, newest, acked, ack tag, ...]
+  var lastHistoricalRangeWords: [UInt32] = []
   /// Every reassembled frame (hex, arrival time); used by diagnostics such as the motion probe.
   var rawFrameSink: ((String, Date) -> Void)?
   /// Live IMU frames (packet 43, R21 layout, TOGGLE_IMU_MODE) for the smart-wake engine.
@@ -874,6 +881,15 @@ final class GooseBLEClient: NSObject, ObservableObject {
 
   var canSyncHistorical: Bool {
     canSendHello && !isHistoricalSyncing && supportsV5HistoricalSync
+  }
+
+  /// For the periodic callers: not during a recovery back-off, and never right behind another sync
+  /// (20 Nov 23:42: a sport sync 4 s after HistoryComplete was the last one to answer).
+  var canStartPeriodicSync: Bool {
+    let now = Date()
+    if let until = syncBackoffUntil, until > now { return false }
+    if let last = lastHistoricalSyncCompletedAt, now.timeIntervalSince(last) < 15 { return false }
+    return canSyncHistorical
   }
 
   var canWriteHighFrequencyHistorySync: Bool {

@@ -481,7 +481,7 @@ final class SmartWakeController: ObservableObject {
     // ramp is playing (alarm writes are blocked during a sync)
     // before the live phase the engine relies on R18: keep it at most ~5 min old
     let interval: TimeInterval = engineState == "stimulating" ? 45 : nearWindow ? 120 : 300
-    if let ble, ble.canSyncHistorical, !ramp.isPlaying, now.timeIntervalSince(lastSyncRequest) >= interval {
+    if let ble, ble.canStartPeriodicSync, !ramp.isPlaying, now.timeIntervalSince(lastSyncRequest) >= interval {
       lastSyncRequest = now
       ble.syncHistoricalPackets()
     }

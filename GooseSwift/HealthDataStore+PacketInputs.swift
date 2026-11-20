@@ -68,7 +68,8 @@ extension HealthDataStore {
       // whoop-lab: the legacy step-field discovery and counter ingest re-scan the decoded frames (one
       // run took more than the 48 s of CPU iOS allows in the background, 19 Nov) for step metrics no
       // current screen shows (steps come from R18, whoop_lab.analyze): no longer run here.
-      reports["heart_rate"] = try bridge.request(method: "metrics.heart_rate_features", args: baseArgs)
+      // the heart-rate feature report (one entry per sample, +316 MB of peak memory, 20 Nov) is
+      // read by no screen: no longer run here
       reports["vital_event"] = try bridge.request(method: "metrics.vital_event_features", args: baseArgs)
       reports["hrv"] = try bridge.request(
         method: "metrics.hrv_features",
@@ -146,10 +147,31 @@ extension HealthDataStore {
         method: "metrics.daily_recovery_metrics",
         args: dailyRecoveryMetricListArgs(databasePath: databasePath)
       )
+      var summary = timingSummary(bridge.timings.entries, since: runStartedAt)
+      summary["peak"] = bridge.timings.peakRise.filter { $0.1 >= 20 }.map { "\($0.0)=+\(Int($0.1))MB" }.joined(separator: " ")
+        + " peak=\(Int(ForegroundOnlyBridge.peakFootprintMB()))MB"
+      reports["_timings"] = summary
+      releaseWindowCache()
       return .success(reports)
     } catch {
+      releaseWindowCache()
+      var failure: [String: Any] = timingSummary(bridge.timings.entries, since: runStartedAt)
+      failure["error"] = String(describing: error)
+      lastPacketInputFailureTimings = failure
       return .failure(error)
     }
+  }
+
+  nonisolated(unsafe) static var lastPacketInputFailureTimings: [String: Any]?
+
+  /// the decoded-frame window shared by the reports (Rust, 60 s cache) is dropped once the run ends
+  nonisolated static func releaseWindowCache() {
+    _ = try? GooseRustBridge().request(method: "cache.clear")
+  }
+
+  nonisolated static func timingSummary(_ entries: [(String, Double)], since: Date) -> [String: Any] {
+    let slowest = entries.sorted { $0.1 > $1.1 }.prefix(4).map { "\($0.0)=\(String(format: "%.2f", $0.1))s" }
+    return ["total_s": Date().timeIntervalSince(since), "requests": entries.count, "slowest": slowest.joined(separator: " ")]
   }
 
   nonisolated static func restingHeartRateDailyRollupArgs(
@@ -485,9 +507,37 @@ extension HealthDataStore {
 struct ForegroundOnlyBridge {
   struct Backgrounded: Error {}
   private let bridge = GooseRustBridge()
+  /// per-request wall time (method, seconds), for the run summary in the log
+  final class Timings: @unchecked Sendable {
+    var entries: [(String, Double)] = []
+    /// how much each request raised the process's peak memory footprint (MB)
+    var peakRise: [(String, Double)] = []
+  }
+  let timings = Timings()
 
+  static func peakFootprintMB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+      $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+    }
+    return kr == KERN_SUCCESS ? Double(info.ledger_phys_footprint_peak) / 1_048_576 : 0
+  }
+
+  /// Every request is marked interruptible: its SQLite queries stop once the app is in the
+  /// background (Rust/core/src/interrupt.rs), so a run started on screen cannot keep the CPU busy
+  /// there; the next foreground run redoes it.
   func request(method: String, args: [String: Any] = [:]) throws -> [String: Any] {
     if AppForegroundState.isBackground { throw Backgrounded() }
+    var args = args
+    args["interruptible"] = true
+    args["compact_arrays"] = true
+    let started = Date()
+    let peakBefore = Self.peakFootprintMB()
+    defer {
+      timings.entries.append((method, Date().timeIntervalSince(started)))
+      timings.peakRise.append((method, Self.peakFootprintMB() - peakBefore))
+    }
     return try bridge.request(method: method, args: args)
   }
 }
@@ -501,6 +551,13 @@ enum AppForegroundState {
     return background
   }
   static func set(background value: Bool) {
-    lock.lock(); background = value; lock.unlock()
+    lock.lock()
+    let changed = background != value
+    background = value
+    lock.unlock()
+    // tells the Rust core at once, so interruptible analysis queries stop
+    if changed || value {
+      _ = try? GooseRustBridge().request(method: "app.set_background", args: ["background": value])
+    }
   }
 }

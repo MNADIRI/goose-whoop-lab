@@ -93,6 +93,7 @@
 			D10000000000000000000034 /* GooseBLEClient+VitalsAndLogging.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000034 /* GooseBLEClient+VitalsAndLogging.swift */; };
 			D10000000000000000000035 /* GooseBLEClient+Commands.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000035 /* GooseBLEClient+Commands.swift */; };
 			D10000000000000000000036 /* GooseBLEClient+DebugAndSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000036 /* GooseBLEClient+DebugAndSync.swift */; };
+		D10000000000005EC0FE0000 /* GooseBLEClient+SyncRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000005EC0FE0000 /* GooseBLEClient+SyncRecovery.swift */; };
 			D10000000000000000000047 /* GooseBLEClient+HistoricalCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000047 /* GooseBLEClient+HistoricalCommands.swift */; };
 			D10000000000000000000048 /* GooseBLEClient+HistoricalHandlers.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000048 /* GooseBLEClient+HistoricalHandlers.swift */; };
 			D10000000000000000000037 /* GooseBLEClient+Parsing.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000037 /* GooseBLEClient+Parsing.swift */; };
@@ -251,6 +252,7 @@
 			D20000000000000000000034 /* GooseBLEClient+VitalsAndLogging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+VitalsAndLogging.swift"; sourceTree = "<group>"; };
 			D20000000000000000000035 /* GooseBLEClient+Commands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+Commands.swift"; sourceTree = "<group>"; };
 			D20000000000000000000036 /* GooseBLEClient+DebugAndSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+DebugAndSync.swift"; sourceTree = "<group>"; };
+		D20000000000005EC0FE0000 /* GooseBLEClient+SyncRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+SyncRecovery.swift"; sourceTree = "<group>"; };
 			D20000000000000000000047 /* GooseBLEClient+HistoricalCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+HistoricalCommands.swift"; sourceTree = "<group>"; };
 			D20000000000000000000048 /* GooseBLEClient+HistoricalHandlers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+HistoricalHandlers.swift"; sourceTree = "<group>"; };
 			D20000000000000000000037 /* GooseBLEClient+Parsing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GooseBLEClient+Parsing.swift"; sourceTree = "<group>"; };
@@ -525,6 +527,7 @@
 				D20000000000000000000034 /* GooseBLEClient+VitalsAndLogging.swift */,
 				D20000000000000000000035 /* GooseBLEClient+Commands.swift */,
 				D20000000000000000000036 /* GooseBLEClient+DebugAndSync.swift */,
+				D20000000000005EC0FE0000 /* GooseBLEClient+SyncRecovery.swift */,
 				D20000000000000000000047 /* GooseBLEClient+HistoricalCommands.swift */,
 				D20000000000000000000048 /* GooseBLEClient+HistoricalHandlers.swift */,
 				D20000000000000000000037 /* GooseBLEClient+Parsing.swift */,
@@ -846,6 +849,7 @@
 				D10000000000000000000034 /* GooseBLEClient+VitalsAndLogging.swift in Sources */,
 				D10000000000000000000035 /* GooseBLEClient+Commands.swift in Sources */,
 				D10000000000000000000036 /* GooseBLEClient+DebugAndSync.swift in Sources */,
+				D10000000000005EC0FE0000 /* GooseBLEClient+SyncRecovery.swift in Sources */,
 				D10000000000000000000047 /* GooseBLEClient+HistoricalCommands.swift in Sources */,
 				D10000000000000000000048 /* GooseBLEClient+HistoricalHandlers.swift in Sources */,
 				D10000000000000000000037 /* GooseBLEClient+Parsing.swift in Sources */,

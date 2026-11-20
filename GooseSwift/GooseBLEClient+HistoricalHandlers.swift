@@ -461,6 +461,7 @@ extension GooseBLEClient {
         retryHistoricalRangeOrFail(reason: reason)
         return
       }
+      lastHistoricalRangeWords = Self.historicalRangeWords(payload)
       updateHistoricalRangeDebugStatus("success seq=\(pending.sequence)\(detail)")
       emitHistoricalRangeTelemetry(
         status: "success",
@@ -633,7 +634,7 @@ extension GooseBLEClient {
       : historicalPacketsReceivedThisSync == 0
       ? "No missed packets found"
       : "\(historicalPacketsReceivedThisSync) historical \(historicalPacketsReceivedThisSync == 1 ? "packet" : "packets") captured"
-    silentSyncRetryCount = 0
+    noteSyncRecovered(packets: historicalPacketsReceivedThisSync)
     publishSyncToast(phase: .synced, detail: detail, clearAfter: 2.2)
     notifyHistoricalSyncProgress(status: "synced", detail: detail, terminal: true, failed: false)
     record(source: "ble.sync", title: "historical_sync.completed", body: "reason=\(reason) \(detail)")
@@ -666,25 +667,7 @@ extension GooseBLEClient {
     syncToast = nil
     notifyHistoricalSyncProgress(status: "failed", detail: message, terminal: true, failed: true)
     record(level: .warn, source: "ble.sync", title: "historical_sync.failed", body: message)
-    scheduleSilentSyncRetry()
-  }
-
-  /// 20 s, 1 min, 3 min after a failure; the counter resets once a sync succeeds or after 15 min.
-  func scheduleSilentSyncRetry() {
-    let now = Date()
-    if now.timeIntervalSince(silentSyncRetryWindowStart) > 15 * 60 {
-      silentSyncRetryWindowStart = now
-      silentSyncRetryCount = 0
-    }
-    let delays: [TimeInterval] = [20, 60, 180]
-    guard silentSyncRetryCount < delays.count else { return }
-    let delay = delays[silentSyncRetryCount]
-    silentSyncRetryCount += 1
-    record(source: "ble.sync", title: "historical_sync.retry_scheduled", body: "attempt=\(silentSyncRetryCount) in \(Int(delay))s")
-    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-      guard let self, self.canSyncHistorical else { return }
-      self.syncHistoricalPackets()
-    }
+    scheduleSyncRecovery(after: message)
   }
 
   func notifyHistoricalSyncProgress(status: String, detail: String, terminal: Bool, failed: Bool) {

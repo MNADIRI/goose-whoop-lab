@@ -410,6 +410,15 @@ fn sleep_v1_unexpected_evidence_files(evidence_dir: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|filename| !filename.starts_with('.') && !allowed.contains(filename))
+        // SQLite's own companions of an allowed database (WAL mode: -wal and -shm; rollback
+        // journal: -journal) belong to it
+        .filter(|filename| {
+            !["-wal", "-shm", "-journal"].iter().any(|suffix| {
+                filename
+                    .strip_suffix(suffix)
+                    .is_some_and(|database| allowed.contains(database))
+            })
+        })
         .collect()
 }
 

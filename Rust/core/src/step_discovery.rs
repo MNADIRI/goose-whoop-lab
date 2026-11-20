@@ -187,7 +187,7 @@ pub fn run_step_packet_discovery_for_store(
     end: &str,
     options: StepPacketDiscoveryOptions,
 ) -> GooseResult<StepPacketDiscoveryReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
     run_step_packet_discovery(&decoded_rows, database_path, start, end, options)
 }
 
@@ -305,7 +305,7 @@ pub fn run_step_capture_validation_for_store(
     end: &str,
     options: StepCaptureValidationOptions,
 ) -> GooseResult<StepCaptureValidationReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
     run_step_capture_validation(&decoded_rows, database_path, start, end, options)
 }
 

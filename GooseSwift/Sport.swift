@@ -285,9 +285,18 @@ final class SportController: ObservableObject {
 
   private var paused: Bool { !enabled || smartWake?.session != nil }
 
+  private var lastUpdateAt = Date.distantPast
+
   private func tick(force: Bool = false) {
     guard let ble, ble.connectionState == "ready" || force else { return }
-    if capturing || state != "idle", ble.canSyncHistorical, Date().timeIntervalSince(lastSync) >= syncInterval {
+    // idle in the background: new strap history only comes with a sync (which forces a tick), so
+    // the 30 s timer just stores live heart rate — every 2 min is enough (each run is a transaction:
+    // ~0.14 MB written and a CPU wake every 30 s, about 400 MB a day)
+    if !force, state == "idle", !capturing, AppForegroundState.isBackground,
+       Date().timeIntervalSince(lastUpdateAt) < 120 {
+      return
+    }
+    if capturing || state != "idle", ble.canStartPeriodicSync, Date().timeIntervalSince(lastSync) >= syncInterval {
       lastSync = Date()
       ble.syncHistoricalPackets()
     }
@@ -297,6 +306,7 @@ final class SportController: ObservableObject {
   private func update() {
     guard !running else { return }
     running = true
+    lastUpdateAt = Date()
     lock.lock()
     let live = pendingLive.sorted { $0.key < $1.key }.map { [$0.key, $0.value.hr ?? 0, $0.value.rr] as [Any] }
     pendingLive.removeAll()

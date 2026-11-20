@@ -67,8 +67,12 @@ final class HeartRateSeriesStore {
   /// heart rate this took 56 % of the app's CPU and got it killed in the background
   /// (cpu_resource_fatal, 17 Nov 19:24, the gym session never seen live). Written every 5 min and
   /// when the app leaves the foreground or ends; the samples are in the database anyway.
-  private static let persistDelay: TimeInterval = 300
+  /// 30 min (was 5): the file is ~10 MB, rewritten whole — every 5 min plus every trip to the
+  /// background it was ~3 GB of writes a day (20 Nov).
+  private static let persistDelay: TimeInterval = 1800
+  private static let backgroundFlushMinInterval: TimeInterval = 600
   private static let updateNotificationInterval: TimeInterval = 2.0
+  private var lastPersistAt = Date()
 
   private let url: URL
   private let stateLock = NSLock()
@@ -86,17 +90,19 @@ final class HeartRateSeriesStore {
     self.url = url
     self.samples = Self.loadSamples(from: url)
     prune(relativeTo: Date())
-    for name in [UIApplication.didEnterBackgroundNotification, UIApplication.willTerminateNotification] {
-      NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in self?.flush() }
+    NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { [weak self] _ in
+      self?.flush(minInterval: HeartRateSeriesStore.backgroundFlushMinInterval)
     }
+    NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: nil) { [weak self] _ in self?.flush() }
   }
 
-  /// writes now what is waiting
-  func flush() {
+  /// writes now what is waiting (unless the last write is more recent than `minInterval`)
+  func flush(minInterval: TimeInterval = 0) {
     stateLock.lock()
-    guard let item = pendingWrite else { stateLock.unlock(); return }
+    guard let item = pendingWrite, Date().timeIntervalSince(lastPersistAt) >= minInterval else { stateLock.unlock(); return }
     item.cancel()
     pendingWrite = nil
+    lastPersistAt = Date()
     let payload = HeartRateSeriesFile(version: 1, samples: samples)
     stateLock.unlock()
     let url = self.url
@@ -291,7 +297,13 @@ final class HeartRateSeriesStore {
     guard let data = try? Data(contentsOf: url) else {
       return []
     }
+    // written as seconds since 1970 from 20 Nov (formatting 100k ISO-8601 dates was most of each
+    // write); older files are ISO-8601
     let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .secondsSince1970
+    if let file = try? decoder.decode(HeartRateSeriesFile.self, from: data) {
+      return file.samples.sorted { $0.capturedAt < $1.capturedAt }
+    }
     decoder.dateDecodingStrategy = .iso8601
     if let file = try? decoder.decode(HeartRateSeriesFile.self, from: data) {
       return file.samples.sorted { $0.capturedAt < $1.capturedAt }
@@ -300,15 +312,20 @@ final class HeartRateSeriesStore {
       .sorted { $0.capturedAt < $1.capturedAt } ?? []
   }
 
+  /// Called on every append (1 Hz): it used to scan all samples (allSatisfy) and shift the whole
+  /// array by one element per append once full. Now it only looks at the oldest sample and trims in
+  /// blocks (a minute of retention slack, 1 000 samples over the cap).
   private func prune(relativeTo date: Date) {
     let countBefore = samples.count
     let cutoff = date.addingTimeInterval(-Self.retention)
-    if let firstKept = samples.firstIndex(where: { $0.capturedAt >= cutoff }), firstKept > 0 {
-      samples.removeFirst(firstKept)
-    } else if samples.allSatisfy({ $0.capturedAt < cutoff }) {
-      samples.removeAll()
+    if let first = samples.first, first.capturedAt < cutoff.addingTimeInterval(-60) {
+      if let firstKept = samples.firstIndex(where: { $0.capturedAt >= cutoff }) {
+        samples.removeFirst(firstKept)
+      } else {
+        samples.removeAll()
+      }
     }
-    if samples.count > Self.maxSamples {
+    if samples.count > Self.maxSamples + 1_000 {
       samples.removeFirst(samples.count - Self.maxSamples)
     }
     if samples.count != countBefore {
@@ -327,6 +344,7 @@ final class HeartRateSeriesStore {
       }
       self.stateLock.lock()
       self.pendingWrite = nil
+      self.lastPersistAt = Date()
       let url = self.url
       let payload = HeartRateSeriesFile(version: 1, samples: self.samples)
       self.stateLock.unlock()
@@ -341,7 +359,7 @@ final class HeartRateSeriesStore {
       let directory = url.deletingLastPathComponent()
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
       let encoder = JSONEncoder()
-      encoder.dateEncodingStrategy = .iso8601
+      encoder.dateEncodingStrategy = .secondsSince1970
       let data = try encoder.encode(payload)
       try data.write(to: url, options: .atomic)
     } catch {
@@ -399,7 +417,7 @@ final class HRVSeriesStore {
   /// heart rate this took 56 % of the app's CPU and got it killed in the background
   /// (cpu_resource_fatal, 17 Nov 19:24, the gym session never seen live). Written every 5 min and
   /// when the app leaves the foreground or ends; the samples are in the database anyway.
-  private static let persistDelay: TimeInterval = 300
+  private static let persistDelay: TimeInterval = 1800
   private static let updateNotificationInterval: TimeInterval = 2.0
 
   private let url: URL
@@ -547,10 +565,12 @@ final class HRVSeriesStore {
 
   private func prune(relativeTo date: Date) {
     let cutoff = date.addingTimeInterval(-Self.retention)
-    if let firstKept = samples.firstIndex(where: { $0.capturedAt >= cutoff }), firstKept > 0 {
-      samples.removeFirst(firstKept)
-    } else if samples.allSatisfy({ $0.capturedAt < cutoff }) {
-      samples.removeAll()
+    if let first = samples.first, first.capturedAt < cutoff {
+      if let firstKept = samples.firstIndex(where: { $0.capturedAt >= cutoff }) {
+        samples.removeFirst(firstKept)
+      } else {
+        samples.removeAll()
+      }
     }
     if samples.count > Self.maxSamples {
       samples.removeFirst(samples.count - Self.maxSamples)

@@ -161,6 +161,17 @@ pub struct GooseStore {
     conn: Connection,
 }
 
+type DecodedWindowCache = Option<(String, std::time::Instant, std::sync::Arc<Vec<DecodedFrameRow>>)>;
+static DECODED_WINDOW_CACHE: std::sync::Mutex<DecodedWindowCache> = std::sync::Mutex::new(None);
+
+/// drops the cached decoded-frame window (memory) — on the way to the background
+pub fn clear_decoded_window_cache() {
+    if let Ok(mut cache) = DECODED_WINDOW_CACHE.lock() {
+        *cache = None;
+    }
+    crate::capture_correlation::clear_correlation_cache();
+}
+
 #[derive(Debug, Clone)]
 pub struct RawEvidenceInput<'a> {
     pub evidence_id: &'a str,
@@ -895,14 +906,29 @@ impl GooseStore {
         // versa); WAL lets them run concurrently, and the busy timeout absorbs short write overlaps.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        crate::interrupt::install(&conn);
         let store = Self { conn };
-        store.migrate()?;
+        // The schema is created once per file and process; every bridge call opens the store, and
+        // re-running the whole CREATE IF NOT EXISTS batch for each frame batch was ~5 % of the
+        // app's background CPU (20 Nov). foreign_keys is per connection, so it stays.
+        static MIGRATED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+        let key = path.to_path_buf();
+        let done = MIGRATED.lock().map(|m| m.contains(&key)).unwrap_or(false);
+        if done {
+            store.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        } else {
+            store.migrate()?;
+            if let Ok(mut m) = MIGRATED.lock() {
+                m.push(key);
+            }
+        }
         Ok(store)
     }
 
     pub fn open_read_only(path: &Path) -> GooseResult<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        crate::interrupt::install(&conn);
         Ok(Self { conn })
     }
 
@@ -1425,6 +1451,7 @@ impl GooseStore {
             INSERT OR IGNORE INTO goose_schema_migrations(version) VALUES (13);
             INSERT OR IGNORE INTO goose_schema_migrations(version) VALUES (14);
             PRAGMA user_version = 14;
+
             "#,
         )?;
         self.ensure_raw_evidence_columns()?;
@@ -1433,6 +1460,15 @@ impl GooseStore {
         self.ensure_daily_activity_metric_multi_row_source_kind()?;
         self.ensure_daily_recovery_metric_multi_row_source_kind()?;
         self.ensure_step_counter_sample_columns()?;
+        // windowed reads of decoded frames (metric features) went through a full scan of
+        // decoded_frames and a sort of every row, JSON included, spilled to disk (20 Nov). After
+        // the column fixes above; a store too old or partial for them simply goes without.
+        for sql in [
+            "CREATE INDEX IF NOT EXISTS idx_raw_evidence_captured_at ON raw_evidence(captured_at)",
+            "CREATE INDEX IF NOT EXISTS idx_decoded_frames_evidence ON decoded_frames(evidence_id)",
+        ] {
+            let _ = self.conn.execute_batch(sql);
+        }
         Ok(())
     }
 
@@ -1911,6 +1947,16 @@ impl GooseStore {
     /// `r18` body fields, so step, HRV and temperature extraction also cover older history.
     /// Returns (frames examined, frames updated).
     pub fn reparse_r18_history_frames(&self) -> GooseResult<(usize, usize)> {
+        // one pass is enough: frames ingested since then carry `r18` (the scan read the JSON of
+        // every packet-47 row at each metrics refresh)
+        crate::whoop5_store::ensure_tables(&self.conn)?;
+        let done: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM whoop5_state WHERE key = 'r18_reparse_done'", [], |r| r.get(0))
+            .optional()?;
+        if done.is_some() {
+            return Ok((0, 0));
+        }
         let rows = {
             let mut statement = self.conn.prepare(
                 r#"
@@ -1947,34 +1993,41 @@ impl GooseStore {
                 params![parsed_payload_json, frame_id],
             )?;
         }
+        transaction.execute("INSERT OR REPLACE INTO whoop5_state (key, value) VALUES ('r18_reparse_done', '1')", [])?;
         transaction.commit()?;
         Ok((examined, updated))
     }
 
     /// whoop-lab: decoded R18 records whose device timestamp is in [start_seconds, end_seconds),
     /// ordered by device time, one per timestamp. Returns (unix seconds, frame_id, r18 JSON).
+    /// R18 records (one per second) between two strap timestamps, from the typed table: ts, frame
+    /// id, R-R intervals (ms), skin temperature (centi-degC, plausible range only), band state.
+    /// It used to json_extract every packet-47 row of decoded_frames for each call (no usable index,
+    /// called once per baseline night): 48 s of CPU on 20 Nov, which got the app killed in the
+    /// background. The (ts, record_index) primary key makes this a range read.
     pub fn k18_history_records(
         &self,
         start_seconds: i64,
         end_seconds: i64,
-    ) -> GooseResult<Vec<(i64, String, String)>> {
-        let mut statement = self.conn.prepare(
+    ) -> GooseResult<Vec<(i64, String, Vec<u16>, Option<u16>, String)>> {
+        crate::whoop5_store::ensure_tables(&self.conn)?;
+        let mut statement = self.conn.prepare_cached(
             r#"
-            SELECT CAST(json_extract(parsed_payload_json, '$.timestamp_seconds') AS INTEGER) AS ts,
-                   MIN(frame_id),
-                   json_extract(parsed_payload_json, '$.body_summary.r18')
-            FROM decoded_frames
-            WHERE packet_type = 47
-              AND raw_len = 124
-              AND instr(parsed_payload_json, '"r18"') > 0
-              AND CAST(json_extract(parsed_payload_json, '$.timestamp_seconds') AS INTEGER) >= ?1
-              AND CAST(json_extract(parsed_payload_json, '$.timestamp_seconds') AS INTEGER) < ?2
+            SELECT ts, MIN(frame_id), rr_ms, skin_temp_raw, IFNULL(band_state, '')
+            FROM whoop5_r18
+            WHERE ts >= ?1 AND ts < ?2
             GROUP BY ts
             ORDER BY ts
             "#,
         )?;
         let rows = statement.query_map(params![start_seconds, end_seconds], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            let rr: String = row.get(2)?;
+            let rr = rr.split(',').filter_map(|v| v.trim().parse::<u16>().ok()).collect::<Vec<_>>();
+            let skin = row
+                .get::<_, Option<i64>>(3)?
+                .filter(|raw| (500..=4500).contains(raw))
+                .map(|raw| raw as u16);
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, rr, skin, row.get::<_, String>(4)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(GooseError::from)
     }
@@ -4782,13 +4835,42 @@ impl GooseStore {
         })
     }
 
-    pub fn decoded_frames_between(
+    /// Identifies a capture window and the data in it (newest frame and raw rowids), for caches
+    /// that must not outlive a new frame. None for in-memory stores.
+    pub fn window_cache_key(&self, start: &str, end: &str) -> GooseResult<Option<String>> {
+        match self.conn.path() {
+            Some(path) if !path.is_empty() => {
+                let max_frame: i64 = self.conn.query_row("SELECT IFNULL(MAX(rowid), 0) FROM decoded_frames", [], |r| r.get(0))?;
+                let max_raw: i64 = self.conn.query_row("SELECT IFNULL(MAX(rowid), 0) FROM raw_evidence", [], |r| r.get(0))?;
+                Ok(Some(format!("{path}|{start}|{end}|{max_frame}|{max_raw}")))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Same rows as `decoded_frames_between`, shared with the 60 s window cache (one copy in
+    /// memory however many reports read the window).
+    pub fn decoded_frames_between_shared(
         &self,
         start: &str,
         end: &str,
-    ) -> GooseResult<Vec<DecodedFrameRow>> {
+    ) -> GooseResult<std::sync::Arc<Vec<DecodedFrameRow>>> {
         validate_required("start", start)?;
         validate_required("end", end)?;
+
+        // One metrics refresh asks for the same window ten times or so (motion, heart rate, HRV,
+        // vital events, windows, correlation, rollups...), each a full read and JSON decode; the
+        // result is kept 60 s while no frame is added (cleared when the app goes to the background).
+        let key = self.window_cache_key(start, end)?;
+        if let Some(key) = &key {
+            if let Ok(cache) = DECODED_WINDOW_CACHE.lock() {
+                if let Some((cached_key, at, rows)) = cache.as_ref() {
+                    if cached_key == key && at.elapsed().as_secs() < 60 {
+                        return Ok(rows.clone());
+                    }
+                }
+            }
+        }
 
         let mut statement = self.conn.prepare(
             r#"
@@ -4820,8 +4902,18 @@ impl GooseStore {
         )?;
         let rows = statement.query_map(params![start, end], decoded_frame_from_row)?;
 
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(GooseError::from)
+        let rows = std::sync::Arc::new(rows.collect::<Result<Vec<_>, _>>().map_err(GooseError::from)?);
+        if let Some(key) = key {
+            if let Ok(mut cache) = DECODED_WINDOW_CACHE.lock() {
+                *cache = Some((key, std::time::Instant::now(), rows.clone()));
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn decoded_frames_between(&self, start: &str, end: &str) -> GooseResult<Vec<DecodedFrameRow>> {
+        let rows = self.decoded_frames_between_shared(start, end)?;
+        Ok(std::sync::Arc::try_unwrap(rows).unwrap_or_else(|shared| shared.as_ref().clone()))
     }
 
     pub fn decoded_frame(&self, frame_id: &str) -> GooseResult<Option<DecodedFrameRow>> {
@@ -6536,6 +6628,12 @@ fn value_contains_official_whoop_label_marker(value: &Value) -> bool {
 
 fn is_official_whoop_label_token(value: &str) -> bool {
     let normalized = normalized_marker(value);
+    // the policy statement itself ("official WHOOP values are validation labels, not inputs") is
+    // what a local metric records to show it did not use them; it starts with `official_whoop_`
+    // and was refused as if it were a WHOOP value
+    if normalized == crate::validation_labels::OFFICIAL_WHOOP_LABEL_POLICY {
+        return false;
+    }
     matches!(
         normalized.as_str(),
         "whoop"

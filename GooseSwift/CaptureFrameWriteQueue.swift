@@ -184,7 +184,10 @@ final class CaptureFrameWriteQueue: @unchecked Sendable {
   private let databasePath: String
   private let maxQueuedRows: Int
   private let maxBatchRows: Int
-  private let coalesceDelay: TimeInterval = 0.05
+  /// Frames wait up to 1 s so one transaction carries a batch: at 0.05 s a background history sync
+  /// (~10 packets/s) committed about one frame per transaction, ~28 KB of page writes per 124-byte
+  /// packet (several GB a day, iOS diskwrites_resource report on 20 Nov).
+  private let coalesceDelay: TimeInterval = 1.0
   private let completionCoalesceDelay: TimeInterval = 1
   private var pendingRows: [CapturedFrameWriteRow] = []
   private var latestCompletion: (@MainActor (CaptureFrameWriteResult) -> Void)?

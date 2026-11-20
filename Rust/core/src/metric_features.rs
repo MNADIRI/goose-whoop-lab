@@ -7,7 +7,7 @@ use crate::{
     GooseError, GooseResult,
     capture_correlation::{
         CaptureCorrelationOptions, CaptureCorrelationReport,
-        DEFAULT_MIN_OWNED_CAPTURES_PER_SUMMARY, run_capture_correlation_for_store,
+        DEFAULT_MIN_OWNED_CAPTURES_PER_SUMMARY,
     },
     metrics::{
         AlgorithmRunResult, GOOSE_HRV_V0_ID, GOOSE_HRV_V0_VERSION, HrvInput, HrvOutput,
@@ -397,6 +397,91 @@ pub struct VitalEventFeatureReport {
     pub issues: Vec<String>,
     #[serde(default)]
     pub next_actions: Vec<MetricFeatureNextAction>,
+    /// over every input, also those left out of the lists below
+    #[serde(default)]
+    pub skin_temperature_summary: VitalInputSummary,
+    #[serde(default)]
+    pub respiratory_rate_summary: VitalInputSummary,
+}
+
+/// The input lists keep the latest `VITAL_INPUTS_KEPT` entries and every resolved, verified one:
+/// one entry per R18 second (two lists, ~45k each, a dozen strings apiece) put 860 MB on the
+/// app's peak memory at each refresh (20 Nov). Counts, flags and signals cover all inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VitalInputSummary {
+    pub resolved_metric_input_count: usize,
+    pub value_semantics_verified_count: usize,
+    pub quality_flags: Vec<String>,
+    pub source_signals: Vec<String>,
+}
+
+pub const VITAL_INPUTS_KEPT: usize = 256;
+
+struct VitalInputCollector<T> {
+    seq: usize,
+    count: usize,
+    trusted: usize,
+    resolved: usize,
+    verified: usize,
+    flags: BTreeSet<String>,
+    signals: BTreeSet<String>,
+    recent: std::collections::VecDeque<(usize, T)>,
+    important: Vec<(usize, T)>,
+}
+
+impl<T> Default for VitalInputCollector<T> {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            count: 0,
+            trusted: 0,
+            resolved: 0,
+            verified: 0,
+            flags: BTreeSet::new(),
+            signals: BTreeSet::new(),
+            recent: std::collections::VecDeque::new(),
+            important: Vec::new(),
+        }
+    }
+}
+
+impl<T> VitalInputCollector<T> {
+    #[allow(clippy::too_many_arguments)]
+    fn push(&mut self, item: T, trusted: bool, resolved: bool, verified: bool, flags: &[String], signal: &str) {
+        self.count += 1;
+        self.trusted += usize::from(trusted);
+        self.resolved += usize::from(resolved);
+        self.verified += usize::from(verified);
+        for flag in flags {
+            if !self.flags.contains(flag) {
+                self.flags.insert(flag.clone());
+            }
+        }
+        if !self.signals.contains(signal) {
+            self.signals.insert(signal.to_string());
+        }
+        self.seq += 1;
+        if resolved && verified {
+            self.important.push((self.seq, item));
+        } else {
+            self.recent.push_back((self.seq, item));
+            if self.recent.len() > VITAL_INPUTS_KEPT {
+                self.recent.pop_front();
+            }
+        }
+    }
+
+    fn finish(self) -> (usize, usize, Vec<T>, VitalInputSummary) {
+        let mut items: Vec<(usize, T)> = self.recent.into_iter().chain(self.important).collect();
+        items.sort_by_key(|(seq, _)| *seq);
+        let summary = VitalInputSummary {
+            resolved_metric_input_count: self.resolved,
+            value_semantics_verified_count: self.verified,
+            quality_flags: self.flags.into_iter().collect(),
+            source_signals: self.signals.into_iter().collect(),
+        };
+        (self.count, self.trusted, items.into_iter().map(|(_, item)| item).collect(), summary)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1077,8 +1162,8 @@ pub fn run_motion_feature_report_for_store(
     end: &str,
     options: MotionFeatureOptions,
 ) -> GooseResult<MotionFeatureReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,
@@ -1148,8 +1233,8 @@ pub fn run_heart_rate_feature_report_for_store(
     end: &str,
     options: HeartRateFeatureOptions,
 ) -> GooseResult<HeartRateFeatureReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,
@@ -1218,8 +1303,8 @@ pub fn run_vital_event_feature_report_for_store(
     end: &str,
     options: VitalEventFeatureOptions,
 ) -> GooseResult<VitalEventFeatureReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,
@@ -1574,8 +1659,8 @@ pub fn run_vital_event_feature_report(
     let mut pulse_information_packet_count = 0;
     let mut candidate_frame_count = 0;
     let mut features = Vec::new();
-    let mut skin_temperature_inputs = Vec::new();
-    let mut respiratory_rate_inputs = Vec::new();
+    let mut skin_temperature_inputs: VitalInputCollector<SkinTemperatureFeature> = VitalInputCollector::default();
+    let mut respiratory_rate_inputs: VitalInputCollector<RespiratoryRateFeature> = VitalInputCollector::default();
     for row in decoded_rows {
         let parsed_payload = parsed_payload_from_row(row)?;
         if let Some(ParsedPayload::DataPacket { packet_k, .. }) = &parsed_payload {
@@ -1591,12 +1676,18 @@ pub fn run_vital_event_feature_report(
         }
         if let Some(plan) = skin_temperature_plan_from_payload(&parsed_payload) {
             if let Some(feature) = skin_temperature_feature_from_plan(row, plan, &trusted_frames)? {
-                skin_temperature_inputs.push(feature);
+                let (t, r, v) = (feature.trusted_candidate_evidence, feature.resolved_metric_input, feature.value_semantics_verified);
+                let flags = feature.quality_flags.clone();
+                let signal = feature.source_signal.clone();
+                skin_temperature_inputs.push(feature, t, r, v, &flags, &signal);
             }
         }
         if let Some(plan) = respiratory_rate_plan_from_payload(&parsed_payload) {
             if let Some(feature) = respiratory_rate_feature_from_plan(row, plan, &trusted_frames)? {
-                respiratory_rate_inputs.push(feature);
+                let (t, r, v) = (feature.trusted_candidate_evidence, feature.resolved_metric_input, feature.value_semantics_verified);
+                let flags = feature.quality_flags.clone();
+                let signal = feature.source_signal.clone();
+                respiratory_rate_inputs.push(feature, t, r, v, &flags, &signal);
             }
         }
     }
@@ -1605,14 +1696,10 @@ pub fn run_vital_event_feature_report(
         .iter()
         .filter(|feature| feature.trusted_candidate_evidence)
         .count();
-    let trusted_skin_temperature_input_count = skin_temperature_inputs
-        .iter()
-        .filter(|feature| feature.trusted_candidate_evidence)
-        .count();
-    let trusted_respiratory_rate_input_count = respiratory_rate_inputs
-        .iter()
-        .filter(|feature| feature.trusted_candidate_evidence)
-        .count();
+    let (skin_temperature_input_count, trusted_skin_temperature_input_count, skin_temperature_inputs, skin_temperature_summary) =
+        skin_temperature_inputs.finish();
+    let (respiratory_rate_input_count, trusted_respiratory_rate_input_count, respiratory_rate_inputs, respiratory_rate_summary) =
+        respiratory_rate_inputs.finish();
     let resolved_metric_input_count = features
         .iter()
         .filter(|feature| feature.resolved_metric_input)
@@ -1639,14 +1726,16 @@ pub fn run_vital_event_feature_report(
         trusted_feature_count,
         resolved_metric_input_count,
         features,
-        skin_temperature_input_count: skin_temperature_inputs.len(),
+        skin_temperature_input_count,
         trusted_skin_temperature_input_count,
         skin_temperature_inputs,
-        respiratory_rate_input_count: respiratory_rate_inputs.len(),
+        respiratory_rate_input_count,
         trusted_respiratory_rate_input_count,
         respiratory_rate_inputs,
         issues,
         next_actions,
+        skin_temperature_summary,
+        respiratory_rate_summary,
     })
 }
 
@@ -1657,8 +1746,8 @@ pub fn run_hrv_feature_report_for_store(
     end: &str,
     options: HrvFeatureOptions,
 ) -> GooseResult<HrvFeatureReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,
@@ -1928,8 +2017,8 @@ pub fn run_metric_window_feature_report_for_store(
     end: &str,
     options: MetricWindowFeatureOptions,
 ) -> GooseResult<MetricWindowFeatureReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,
@@ -2012,8 +2101,8 @@ pub fn run_resting_heart_rate_feature_report_for_store(
     end: &str,
     options: RestingHeartRateFeatureOptions,
 ) -> GooseResult<RestingHeartRateFeatureReport> {
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,
@@ -3407,28 +3496,11 @@ fn hrv_widget_discovery(hrv_report: &HrvFeatureReport) -> RecoverySensorWidgetDi
 fn respiratory_rate_widget_discovery(
     vital_event_report: &VitalEventFeatureReport,
 ) -> RecoverySensorWidgetDiscovery {
-    let quality_flags = sorted_feature_flags(
-        vital_event_report
-            .respiratory_rate_inputs
-            .iter()
-            .flat_map(|feature| feature.quality_flags.iter()),
-    );
-    let candidate_source_signals = sorted_feature_flags(
-        vital_event_report
-            .respiratory_rate_inputs
-            .iter()
-            .map(|feature| &feature.source_signal),
-    );
-    let resolved_metric_input_count = vital_event_report
-        .respiratory_rate_inputs
-        .iter()
-        .filter(|feature| feature.resolved_metric_input)
-        .count();
-    let value_semantics_verified_count = vital_event_report
-        .respiratory_rate_inputs
-        .iter()
-        .filter(|feature| feature.value_semantics_verified)
-        .count();
+    let summary = &vital_event_report.respiratory_rate_summary;
+    let quality_flags = summary.quality_flags.clone();
+    let candidate_source_signals = summary.source_signals.clone();
+    let resolved_metric_input_count = summary.resolved_metric_input_count;
+    let value_semantics_verified_count = summary.value_semantics_verified_count;
     let mut blockers = BTreeSet::new();
     if vital_event_report.respiratory_rate_input_count == 0 {
         blockers.insert("no_respiratory_rate_packet_candidate".to_string());
@@ -3510,16 +3582,11 @@ fn temperature_widget_discovery(
         }
         quality_flag_set.extend(feature.quality_flags.iter().cloned());
     }
-    for feature in &vital_event_report.skin_temperature_inputs {
-        source_signal_set.insert(feature.source_signal.clone());
-        if feature.resolved_metric_input {
-            resolved_metric_input_count += 1;
-        }
-        if feature.value_semantics_verified {
-            value_semantics_verified_count += 1;
-        }
-        quality_flag_set.extend(feature.quality_flags.iter().cloned());
-    }
+    let skin = &vital_event_report.skin_temperature_summary;
+    source_signal_set.extend(skin.source_signals.iter().cloned());
+    resolved_metric_input_count += skin.resolved_metric_input_count;
+    value_semantics_verified_count += skin.value_semantics_verified_count;
+    quality_flag_set.extend(skin.quality_flags.iter().cloned());
     let candidate_count =
         vital_event_report.feature_count + vital_event_report.skin_temperature_input_count;
     let trusted_candidate_count = vital_event_report.trusted_feature_count

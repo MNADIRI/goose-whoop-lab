@@ -160,6 +160,17 @@ pub fn run_capture_correlation_for_store(
     end: &str,
     options: CaptureCorrelationOptions,
 ) -> GooseResult<CaptureCorrelationReport> {
+    let report = run_capture_correlation_for_store_shared(store, evidence_scope, start, end, options)?;
+    Ok(std::sync::Arc::try_unwrap(report).unwrap_or_else(|shared| shared.as_ref().clone()))
+}
+
+pub fn run_capture_correlation_for_store_shared(
+    store: &GooseStore,
+    evidence_scope: &str,
+    start: &str,
+    end: &str,
+    options: CaptureCorrelationOptions,
+) -> GooseResult<std::sync::Arc<CaptureCorrelationReport>> {
     if start.trim().is_empty() {
         return Err(GooseError::message("start is required"));
     }
@@ -169,14 +180,39 @@ pub fn run_capture_correlation_for_store(
     if start >= end {
         return Err(GooseError::message("start must be earlier than end"));
     }
+    // every metrics report of a refresh runs the same correlation over the same window (raw rows
+    // + decoded rows each time): kept 60 s while no frame arrives
+    let key = store.window_cache_key(start, end)?.map(|k| {
+        format!("{k}|{evidence_scope}|{}|{}", options.min_owned_captures_per_summary, options.require_owned_captures)
+    });
+    if let Some(key) = &key {
+        if let Ok(cache) = CORRELATION_CACHE.lock() {
+            if let Some((cached_key, at, report)) = cache.as_ref() {
+                if cached_key == key && at.elapsed().as_secs() < 60 {
+                    return Ok(report.clone());
+                }
+            }
+        }
+    }
     let raw_rows = store.raw_evidence_between(start, end)?;
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    Ok(run_capture_correlation_for_rows(
-        evidence_scope,
-        &raw_rows,
-        &decoded_rows,
-        options,
-    ))
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let report = std::sync::Arc::new(run_capture_correlation_for_rows(evidence_scope, &raw_rows, &decoded_rows, options));
+    drop(raw_rows);
+    if let Some(key) = key {
+        if let Ok(mut cache) = CORRELATION_CACHE.lock() {
+            *cache = Some((key, std::time::Instant::now(), report.clone()));
+        }
+    }
+    Ok(report)
+}
+
+static CORRELATION_CACHE: std::sync::Mutex<Option<(String, std::time::Instant, std::sync::Arc<CaptureCorrelationReport>)>> =
+    std::sync::Mutex::new(None);
+
+pub fn clear_correlation_cache() {
+    if let Ok(mut cache) = CORRELATION_CACHE.lock() {
+        *cache = None;
+    }
 }
 
 pub fn run_capture_correlation_for_rows(

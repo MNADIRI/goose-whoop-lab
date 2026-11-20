@@ -1935,12 +1935,44 @@ pub fn handle_bridge_request_json(request_json: &str) -> String {
 pub fn handle_bridge_request(request: BridgeRequest) -> BridgeResponse {
     let method = request.method.clone();
     let started = Instant::now();
+    let _interruptible = (request.args.get("interruptible").and_then(|v| v.as_bool()) == Some(true))
+        .then(crate::interrupt::InterruptibleScope::enter);
+    let compact = request.args.get("compact_arrays").and_then(|v| v.as_bool()) == Some(true);
     let mut response = handle_bridge_request_inner(request);
+    if compact {
+        if let Some(result) = response.result.as_mut() {
+            compact_large_arrays(result);
+        }
+    }
     response.timing = Some(BridgeTiming {
         method,
         method_elapsed_us: elapsed_us_u64(started),
     });
     response
+}
+
+/// Packet-derived input reports list one feature per frame (tens of thousands) while the app shows
+/// counts, the first feature and short daily lists: arrays over 200 entries keep their first and
+/// last 50, so less crosses the bridge and stays in the app's memory (0.8-1 GB on 20 Nov).
+fn compact_large_arrays(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            if items.len() > 200 {
+                let tail = items.split_off(items.len() - 50);
+                items.truncate(50);
+                items.extend(tail);
+            }
+            for item in items.iter_mut() {
+                compact_large_arrays(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                compact_large_arrays(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
@@ -2487,6 +2519,15 @@ fn handle_bridge_request_inner(request: BridgeRequest) -> BridgeResponse {
             .and_then(|args| crate::body_comp::import_healthkit(&args))
             .map(|value| bridge_ok(&request.request_id, value))
             .unwrap_or_else(|error| bridge_error(&request.request_id, "method_error", error)),
+        "cache.clear" => {
+            crate::store::clear_decoded_window_cache();
+            bridge_ok(&request.request_id, serde_json::json!({"cleared": true}))
+        }
+        "app.set_background" => {
+            let background = request.args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+            crate::interrupt::set_background(background);
+            bridge_ok(&request.request_id, serde_json::json!({"background": background}))
+        }
         "db.maintain" => request_args::<crate::db_maintenance::MaintainArgs>(&request)
             .and_then(|args| crate::db_maintenance::maintain(&args))
             .map(|value| bridge_ok(&request.request_id, value))

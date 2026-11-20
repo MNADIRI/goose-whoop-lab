@@ -58,7 +58,7 @@ final class WhoopLabAutoExport: ObservableObject {
   }
 
   func tick(now: Date = Date()) {
-    if autoHistoricalSync, let ble, ble.canSyncHistorical {
+    if autoHistoricalSync, let ble, ble.canStartPeriodicSync {
       let last = ble.lastHistoricalSyncCompletedAt ?? .distantPast
       if now.timeIntervalSince(last) >= Self.syncInterval {
         ble.record(source: "whoop-lab", title: "auto_sync.requested", body: "since_last=\(Int(now.timeIntervalSince(last)))s")

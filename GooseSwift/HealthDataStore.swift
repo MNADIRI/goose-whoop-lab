@@ -130,10 +130,12 @@ final class HealthDataStore: ObservableObject {
 
   /// whoop-lab: also re-run when the last extraction is older than `packetInputStaleInterval`,
   /// so new history shows up without relaunching the app.
-  static let packetInputStaleInterval: TimeInterval = 10 * 60
+  static let packetInputStaleInterval: TimeInterval = 15 * 60
+  /// development log hook (health.packet_inputs lines in goose-ble-live.log)
+  nonisolated(unsafe) static var diagnosticLog: ((String, String) -> Void)?
 
   /// whoop-lab: minimum spacing between extractions triggered by history syncs.
-  static let packetInputAfterSyncMinInterval: TimeInterval = 5 * 60
+  static let packetInputAfterSyncMinInterval: TimeInterval = 15 * 60
 
   func refreshPacketInputsIfNeeded() {
     let neverRun = packetInputReports.isEmpty && packetInputStatus == "No run"
@@ -263,12 +265,18 @@ final class HealthDataStore: ObservableObject {
         }
         self.packetInputIsRunning = false
         switch result {
-        case .success(let reports):
+        case .success(var reports):
+          if let t = reports.removeValue(forKey: "_timings") {
+            HealthDataStore.diagnosticLog?("run", "total=\(String(format: "%.1f", t["total_s"] as? Double ?? 0))s requests=\(t["requests"] ?? 0) slowest: \(t["slowest"] ?? "") memory: \(t["peak"] ?? "")")
+          }
           self.packetInputReports.merge(reports) { _, new in new }
           self.lastPacketInputRunAt = Date()
           self.packetInputsDirty = false
           self.packetInputStatus = "Bridge packet-derived inputs extracted"
         case .failure(let error):
+          if let t = HealthDataStore.lastPacketInputFailureTimings {
+            HealthDataStore.diagnosticLog?("run.stopped", "after=\(String(format: "%.1f", t["total_s"] as? Double ?? 0))s requests=\(t["requests"] ?? 0) slowest: \(t["slowest"] ?? "") error=\(t["error"] ?? "")")
+          }
           self.packetInputStatus = "Bridge input extraction blocked: \(HealthDataStore.shortError(error))"
         }
         completion?()

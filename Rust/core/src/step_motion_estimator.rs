@@ -7,7 +7,7 @@ use crate::{
     GooseError, GooseResult,
     capture_correlation::{
         CaptureCorrelationOptions, CaptureCorrelationReport,
-        DEFAULT_MIN_OWNED_CAPTURES_PER_SUMMARY, run_capture_correlation_for_store,
+        DEFAULT_MIN_OWNED_CAPTURES_PER_SUMMARY,
     },
     protocol::{
         DataPacketBodySummary, I16SeriesSummary, ParsedPayload, decode_hex_with_whitespace,
@@ -154,8 +154,8 @@ pub fn run_raw_motion_step_estimate_for_store(
 ) -> GooseResult<RawMotionStepEstimateReport> {
     validate_options(&options)?;
     let write_options = options.clone();
-    let decoded_rows = store.decoded_frames_between(start, end)?;
-    let correlation = run_capture_correlation_for_store(
+    let decoded_rows = store.decoded_frames_between_shared(start, end)?;
+    let correlation = crate::capture_correlation::run_capture_correlation_for_store_shared(
         store,
         database_path,
         start,

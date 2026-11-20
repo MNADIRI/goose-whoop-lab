@@ -57,10 +57,10 @@ fn records(store: &GooseStore, start_seconds: i64, end_seconds: i64) -> GooseRes
     Ok(store
         .k18_history_records(start_seconds, end_seconds)?
         .into_iter()
-        .filter_map(|(seconds, frame_id, json)| {
-            serde_json::from_str::<R18Json>(&json)
-                .ok()
-                .map(|r18| Record { seconds, frame_id, r18 })
+        .map(|(seconds, frame_id, rr_intervals_ms, skin_temperature_centi_c, band_state)| Record {
+            seconds,
+            frame_id,
+            r18: R18Json { rr_intervals_ms, skin_temperature_centi_c, band_state },
         })
         .collect())
 }

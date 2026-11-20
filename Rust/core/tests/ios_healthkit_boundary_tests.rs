@@ -172,14 +172,20 @@ fn ios_health_metric_display_filters_forbidden_metric_sources() {
     );
 }
 
+/// The app's Swift sources: `GooseSwift/` at the repository root in this fork, or
+/// `goose-swift/GooseSwift/` in the original goose layout.
 fn swift_source_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("core crate has parent")
         .parent()
-        .expect("goose project has parent")
-        .join("goose-swift")
-        .join("GooseSwift")
+        .expect("goose project has parent");
+    let fork = repo.join("GooseSwift");
+    if fork.is_dir() {
+        fork
+    } else {
+        repo.join("goose-swift").join("GooseSwift")
+    }
 }
 
 fn swift_source(root: &Path, filename: &str) -> String {

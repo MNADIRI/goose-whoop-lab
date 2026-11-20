@@ -320,6 +320,7 @@ final class GooseAppModel: ObservableObject {
     WeeklySummaryStore.shared.attach(labResults: labResults)
     NightOpticsController.shared.attach(ble: ble)
     DatabaseMaintenance.shared.attach(ble: ble, sport: sport, smartWake: smartWake)
+    HealthDataStore.diagnosticLog = { [weak ble] title, body in ble?.record(source: "health.packet_inputs", title: title, body: body) }
     // launched by iOS in the background (Bluetooth restore): no scene phase change will say so
     AppForegroundState.set(background: UIApplication.shared.applicationState == .background)
     NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { _ in AppForegroundState.set(background: true) }

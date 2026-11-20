@@ -6,7 +6,14 @@ extension GooseAppModel {
   func handleAppLifecycleChange(_ phase: String) {
     let power = Self.currentOvernightPowerState()
     ble.record(source: "app.lifecycle", title: "scene_phase", body: "\(phase) | \(power.summary)")
-    if phase == "active" { ble.reconnectOnForegroundIfNeeded() }
+    if phase == "active" {
+      ble.reconnectOnForegroundIfNeeded()
+      ble.syncOnForegroundIfStale()
+    }
+    if phase == "background" {
+      let ble = ble
+      DispatchQueue.global(qos: .utility).async { _ = ble.flushDiagnosticLogWrites() }
+    }
     guard overnightGuardActive else {
       return
     }
@@ -54,6 +61,12 @@ extension GooseAppModel {
       let seconds = Int(q.first { $0.name == "seconds" }?.value ?? "") ?? 70
       let mode = q.first { $0.name == "mode" }?.value == "B" ? "B" : "A"
       NightOpticsController.shared.testWindow(seconds: min(max(seconds, 20), 180), mode: mode)
+      return true
+    }
+    // development: gooseswift://sync-recovery-test?step=reack|session|reconnect
+    if ["gooseswift", "goose"].contains(url.scheme?.lowercased() ?? ""), url.host == "sync-recovery-test" {
+      let step = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "step" }?.value ?? "session"
+      ble.testSyncRecoveryStep(step)
       return true
     }
     // development: gooseswift://debug-stats?hours=24 -> Documents/GooseSwift/db-stats.json

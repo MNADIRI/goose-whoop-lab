@@ -57,6 +57,11 @@ extension GooseBLEClient {
     guard restingHeartRateWindowBPM.count >= Self.restingHeartRateMinimumSampleCount else {
       return
     }
+    // published once a minute: sort the 300-sample window only then, not at every beat
+    guard lastRestingHeartRateEstimateBPM == nil
+      || date.timeIntervalSince(lastRestingHeartRateEstimatePublishedAt) >= Self.restingHeartRateEstimatePublishInterval else {
+      return
+    }
 
     let estimate = Self.lowQuartileMeanBPM(from: restingHeartRateWindowBPM)
     guard estimate.isFinite, (20...240).contains(Int(estimate.rounded())) else {
@@ -276,36 +281,40 @@ extension GooseBLEClient {
     }
   }
 
+  /// Buffered: lines are written at most every 5 s or 64 KB through one open handle, without an
+  /// fsync per line (that pattern — open, write, fsync, close for each line — kept the storage busy
+  /// all night and earned a diskwrites_resource report on 20 Nov). Called on diagnosticLogQueue.
   func appendDiagnosticLogData(_ data: Data, to url: URL) {
-    do {
-      try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-      try Self.applyDiagnosticLogProtection(to: url.deletingLastPathComponent())
-      if !FileManager.default.fileExists(atPath: url.path) {
-        let created = FileManager.default.createFile(atPath: url.path, contents: nil)
-        if !created {
-          throw DiagnosticLogError.createFailed(url.path)
-        }
+    let writer = DiagnosticLogFileWriter.writer(for: url)
+    writer.buffer.append(data)
+    // in the background the app may be suspended within a second of a wake: write at once there
+    if writer.buffer.count >= DiagnosticLogFileWriter.flushBytes || AppForegroundState.isBackground {
+      flushDiagnosticLogWriter(writer, synchronize: false)
+    } else if !writer.flushScheduled {
+      writer.flushScheduled = true
+      diagnosticLogQueue.asyncAfter(deadline: .now() + DiagnosticLogFileWriter.flushDelay) { [weak self] in
+        writer.flushScheduled = false
+        self?.flushDiagnosticLogWriter(writer, synchronize: false)
       }
-      try Self.applyDiagnosticLogProtection(to: url)
-      let handle = try FileHandle(forWritingTo: url)
-      try handle.seekToEnd()
-      try handle.write(contentsOf: data)
-      try Self.synchronizeAndCloseDiagnosticLogHandle(handle)
+    }
+  }
+
+  func flushDiagnosticLogWriter(_ writer: DiagnosticLogFileWriter, synchronize: Bool) {
+    do {
+      try writer.flush(synchronize: synchronize)
     } catch {
-      logDiagnosticLogError(url: url, error: error)
+      writer.close()
+      logDiagnosticLogError(url: writer.url, error: error)
     }
   }
 
   func synchronizeDiagnosticLogFile(_ url: URL) -> String? {
-    guard FileManager.default.fileExists(atPath: url.path) else {
-      return nil
-    }
+    let writer = DiagnosticLogFileWriter.writer(for: url)
     do {
-      try Self.applyDiagnosticLogProtection(to: url)
-      let handle = try FileHandle(forUpdating: url)
-      try Self.synchronizeAndCloseDiagnosticLogHandle(handle)
+      try writer.flush(synchronize: true)
       return nil
     } catch {
+      writer.close()
       logDiagnosticLogError(url: url, error: error)
       return "\(url.lastPathComponent): \(String(describing: error))"
     }
@@ -426,7 +435,7 @@ extension GooseBLEClient {
       return true
     }
     // low-volume engines whose decisions must be checkable after the fact (a few lines an hour)
-    if ["sport", "night_optics", "db.maintenance", "smart_wake"].contains(source) {
+    if ["sport", "night_optics", "db.maintenance", "smart_wake", "health.packet_inputs"].contains(source) {
       return true
     }
     if source == "ble.high_frequency_sync" {
@@ -521,7 +530,7 @@ extension GooseBLEClient {
       return true
     }
     // engines whose decisions must be checkable in the file afterwards (a few lines an hour)
-    if ["sport", "night_optics", "db.maintenance", "smart_wake"].contains(message.source) {
+    if ["sport", "night_optics", "db.maintenance", "smart_wake", "health.packet_inputs"].contains(message.source) {
       return true
     }
     if message.source == "ble.high_frequency_sync" {
@@ -580,5 +589,82 @@ extension GooseBLEClient {
       return true
     }
     return false
+  }
+}
+
+/// One open diagnostic log file with its pending lines. Only touched on the client's
+/// diagnosticLogQueue. Past `maxBytes` the file becomes `<name>.prev.log` (the previous one is
+/// dropped) and a new file starts, so the log stays small enough to copy off the phone.
+final class DiagnosticLogFileWriter {
+  static let flushBytes = 64 << 10
+  static let flushDelay: TimeInterval = 5
+  static let maxBytes: UInt64 = 16 << 20
+  private static var writers: [URL: DiagnosticLogFileWriter] = [:]
+
+  static func writer(for url: URL) -> DiagnosticLogFileWriter {
+    if let w = writers[url] { return w }
+    let w = DiagnosticLogFileWriter(url: url)
+    writers[url] = w
+    return w
+  }
+
+  let url: URL
+  var buffer = Data()
+  var flushScheduled = false
+  private var handle: FileHandle?
+  private var size: UInt64 = 0
+
+  private init(url: URL) {
+    self.url = url
+  }
+
+  var previousURL: URL {
+    url.deletingPathExtension().appendingPathExtension("prev.log")
+  }
+
+  func flush(synchronize: Bool) throws {
+    if !buffer.isEmpty {
+      try open()
+      if size + UInt64(buffer.count) > Self.maxBytes {
+        try rotate()
+      }
+      try handle?.write(contentsOf: buffer)
+      size += UInt64(buffer.count)
+      buffer.removeAll(keepingCapacity: true)
+    }
+    if synchronize {
+      try handle?.synchronize()
+    }
+  }
+
+  func close() {
+    try? handle?.close()
+    handle = nil
+  }
+
+  private func open() throws {
+    guard handle == nil else { return }
+    try GooseBLEClient.prepareDiagnosticLogFile(at: url, directory: url.deletingLastPathComponent())
+    let h = try FileHandle(forUpdating: url)
+    size = try h.seekToEnd()
+    handle = h
+  }
+
+  /// the current file becomes the previous one; a file left far over the limit by an older build
+  /// keeps only its last `maxBytes`
+  private func rotate() throws {
+    let fm = FileManager.default
+    try? fm.removeItem(at: previousURL)
+    if size > Self.maxBytes * 2, let h = handle {
+      try h.seek(toOffset: size - Self.maxBytes)
+      let tail = h.readDataToEndOfFile()
+      fm.createFile(atPath: previousURL.path, contents: tail)
+      try h.truncate(atOffset: 0)
+      size = 0
+      return
+    }
+    close()
+    try fm.moveItem(at: url, to: previousURL)
+    try open()
   }
 }
